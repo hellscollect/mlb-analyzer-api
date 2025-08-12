@@ -103,8 +103,9 @@ def cold_streak_hitters():
 
             roster = get_team_roster(team_id)
             for p in roster:
-                if p.get("position", {}).get("type") != "Hitter":
-                    continue
+                pos_type = p.get("position", {}).get("type", "")
+if pos_type == "Pitcher":
+    continue
                 pid = p.get("person", {}).get("id")
                 pname = p.get("person", {}).get("fullName")
                 if not pid:
