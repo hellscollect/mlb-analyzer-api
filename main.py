@@ -62,7 +62,14 @@ def get_player_season_avg(player_id, season=None):
         return None
 
 
-def get_player_last_n_games(player_id, n=2, season=None):
+# ---- NEW: date parsing helper for game logs ----
+def _parse_ymd(dstr: str):
+    """Parse 'YYYY-MM-DD' into a date object."""
+    return datetime.strptime(dstr, "%Y-%m-%d").date()
+
+
+# ---- UPDATED: respect as_of_date and sort newest->oldest ----
+def get_player_last_n_games(player_id, n=2, season=None, as_of_date=None):
     if season is None:
         season = datetime.now(ZoneInfo("America/New_York")).year
     data = _get(f"{MLB_API}/people/{player_id}/stats", {
@@ -72,9 +79,17 @@ def get_player_last_n_games(player_id, n=2, season=None):
     })
     try:
         splits = data["stats"][0]["splits"]
-        return splits[:max(0, n)]
     except Exception:
         return []
+
+    # Only include games on or before the requested date
+    if as_of_date:
+        cutoff = _parse_ymd(as_of_date)
+        splits = [s for s in splits if _parse_ymd(s.get("date")) <= cutoff]
+
+    # Ensure we take the most recent N games
+    splits.sort(key=lambda s: s.get("date", ""), reverse=True)
+    return splits[:max(0, n)]
 
 
 def is_hitless(game_splits):
@@ -181,7 +196,8 @@ def cold_streak_hitters():
                     continue
                 counters["passed_avg"] += 1
 
-                glast = get_player_last_n_games(pid, n=last_n, season=season_year)
+                # ---- pass date_str so logs are evaluated as-of that date ----
+                glast = get_player_last_n_games(pid, n=last_n, season=season_year, as_of_date=date_str)
                 if glast:
                     counters["had_recent_gamelogs"] += 1
                 if not is_hitless(glast):
