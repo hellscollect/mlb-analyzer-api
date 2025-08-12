@@ -128,9 +128,84 @@ def cold_streak_hitters():
     debug = request.args.get("debug") == "1"
 
     # counters for debug
-    c = {
+    counters = {
         "games_total": 0,
         "teams_total": 0,
         "roster_players_total": 0,
         "non_pitchers": 0,
         "season_stat_available": 0,
+        "passed_avg": 0,
+        "had_recent_gamelogs": 0,
+        "passed_hitless": 0
+    }
+
+    sched = get_schedule(date_str)
+    games = [g for d in sched.get("dates", []) for g in d.get("games", [])]
+    counters["games_total"] = len(games)
+
+    results = []
+    season_year = datetime.now(ZoneInfo("America/New_York")).year
+
+    for g in games:
+        teams = g.get("teams", {})
+        for side in ("home", "away"):
+            t = teams.get(side, {})
+            team = t.get("team", {})
+            team_id = team.get("id")
+            team_name = team.get("name")
+            if not team_id:
+                continue
+            counters["teams_total"] += 1
+
+            roster = get_team_roster(team_id)
+            counters["roster_players_total"] += len(roster)
+
+            for p in roster:
+                # Include ALL non-pitchers: Catcher/Infielder/Outfielder etc.
+                pos_type = p.get("position", {}).get("type", "")
+                if pos_type == "Pitcher":
+                    continue
+                counters["non_pitchers"] += 1
+
+                pid = p.get("person", {}).get("id")
+                pname = p.get("person", {}).get("fullName")
+                if not pid:
+                    continue
+
+                avg = get_player_season_avg(pid, season_year)
+                if avg is None:
+                    continue
+                counters["season_stat_available"] += 1
+
+                if avg < min_avg:
+                    continue
+                counters["passed_avg"] += 1
+
+                glast = get_player_last_n_games(pid, n=last_n, season=season_year)
+                if glast:
+                    counters["had_recent_gamelogs"] += 1
+                if not is_hitless(glast):
+                    continue
+                counters["passed_hitless"] += 1
+
+                results.append({
+                    "player": pname,
+                    "team": team_name,
+                    "avg": avg,
+                    "recent_games": [
+                        {"date": gi.get("date"), "hits": int(gi.get("stat", {}).get("hits", 0))}
+                        for gi in glast
+                    ]
+                })
+
+    if debug:
+        return jsonify({"date": date_str, "min_avg": min_avg, "last_n": last_n,
+                        "counters": counters, "results": results})
+
+    return jsonify(results)
+
+
+if __name__ == "__main__":
+    # Render sets $PORT; default to 10000 if not present.
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
