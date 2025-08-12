@@ -29,7 +29,7 @@ def _get(url, params=None, timeout=30):
 
 
 def get_schedule(date_str):
-    # include probablePitcher so we can optionally filter by opposing pitcher ERA
+    # include probablePitcher for both hitter and pitcher endpoints
     return _get(f"{MLB_API}/schedule", {
         "sportId": 1,
         "date": date_str,
@@ -40,6 +40,14 @@ def get_schedule(date_str):
 def get_team_roster(team_id):
     data = _get(f"{MLB_API}/teams/{team_id}/roster")
     return data.get("roster", [])
+
+
+def get_person_name(person_id):
+    data = _get(f"{MLB_API}/people/{person_id}")
+    try:
+        return data["people"][0]["fullName"]
+    except Exception:
+        return str(person_id)
 
 
 def get_player_season_avg(player_id, season=None):
@@ -88,7 +96,7 @@ def _parse_ymd(dstr: str):
     return datetime.strptime(dstr, "%Y-%m-%d").date()
 
 
-# ---- game logs (respect as_of_date and sort newest->oldest) ----
+# ---- hitting game logs (respect as_of_date and sort newest->oldest) ----
 def get_player_last_n_games(player_id, n=2, season=None, as_of_date=None):
     if season is None:
         season = datetime.now(ZoneInfo("America/New_York")).year
@@ -108,6 +116,31 @@ def get_player_last_n_games(player_id, n=2, season=None, as_of_date=None):
 
     splits.sort(key=lambda s: s.get("date", ""), reverse=True)
     return splits[:max(0, n)]
+
+
+# ---- pitching game logs (starts only; respect as_of_date and sort newest->oldest) ----
+def get_pitcher_last_n_starts(player_id, n=2, season=None, as_of_date=None):
+    if season is None:
+        season = datetime.now(ZoneInfo("America/New_York")).year
+    data = _get(f"{MLB_API}/people/{player_id}/stats", {
+        "stats": "gameLog",
+        "group": "pitching",
+        "season": season
+    })
+    try:
+        splits = data["stats"][0]["splits"]
+    except Exception:
+        return []
+
+    # keep only starts
+    starts = [s for s in splits if int(s.get("stat", {}).get("gamesStarted", 0)) == 1]
+
+    if as_of_date:
+        cutoff = _parse_ymd(as_of_date)
+        starts = [s for s in starts if _parse_ymd(s.get("date")) <= cutoff]
+
+    starts.sort(key=lambda s: s.get("date", ""), reverse=True)
+    return starts[:max(0, n)]
 
 
 def is_hitless(game_splits):
@@ -144,12 +177,19 @@ def _opposing_probable_pitcher_id(game_obj, side):
     return pp.get("id")
 
 
+def _team_probable_pitcher_id(game_obj, side):
+    """Return this side's probable pitcher id if present."""
+    t = game_obj.get("teams", {}).get(side, {})
+    pp = t.get("probablePitcher") or {}
+    return pp.get("id")
+
+
 def _passes_pitcher_era_filter(game_obj, side, min_pitcher_era, season_year):
     if min_pitcher_era is None:
         return True
     pid = _opposing_probable_pitcher_id(game_obj, side)
     if not pid:
-        return False  # if you require ERA filter, skip games with no probable pitcher
+        return False  # if ERA filter requested but no probable pitcher, skip
     era = get_pitcher_season_era(pid, season_year)
     return (era is not None) and (era >= min_pitcher_era)
 
@@ -159,11 +199,11 @@ def cold_streak_hitters():
     """
     Hitters with season AVG >= min_avg and 0 hits in each of last_n games as-of 'date'.
     Query params:
-      - date: YYYY-MM-DD (default: today ET)
-      - min_avg: float (default: 0.275)
-      - last_n: int   (default: 2)
-      - min_pitcher_era: float (optional; require opposing probable pitcher ERA >= this)
-      - debug: 1 to return counters/diagnostics
+      - date (YYYY-MM-DD, default today ET)
+      - min_avg (default 0.275)
+      - last_n (default 2)
+      - min_pitcher_era (optional: opposing probable pitcher ERA must be >= this)
+      - debug=1 to include counters
     """
     date_str = request.args.get("date") or today_str_et()
     try:
@@ -255,11 +295,11 @@ def hot_streak_hitters():
     """
     Hitters with season AVG >= min_avg and >=1 hit in each of last_n games as-of 'date'.
     Query params:
-      - date: YYYY-MM-DD (default: today ET)
-      - min_avg: float (default: 0.275)
-      - last_n: int   (default: 2)
-      - min_pitcher_era: float (optional; require opposing probable pitcher ERA >= this)
-      - debug: 1 to return counters/diagnostics
+      - date (YYYY-MM-DD, default today ET)
+      - min_avg (default 0.275)
+      - last_n (default 2)
+      - min_pitcher_era (optional: opposing probable pitcher ERA must be >= this)
+      - debug=1 to include counters
     """
     date_str = request.args.get("date") or today_str_et()
     try:
@@ -343,6 +383,96 @@ def hot_streak_hitters():
         return jsonify({"date": date_str, "min_avg": min_avg, "last_n": last_n,
                         "min_pitcher_era": min_pitcher_era,
                         "counters": counters, "results": results})
+    return jsonify(results)
+
+
+@app.get("/pitcher_streaks")
+def pitcher_streaks():
+    """
+    Probable starters matching ERA and K filters over their last N starts as-of 'date'.
+    Query params:
+      - date (YYYY-MM-DD, default today ET)
+      - max_era (optional: require season ERA <= this value)
+      - min_strikeouts (optional int: each start must have >= this K)
+      - last_n (default 2)
+      - debug=1 to include counters
+    """
+    date_str = request.args.get("date") or today_str_et()
+    as_of = date_str
+    try:
+        last_n = int(request.args.get("last_n", 2))
+    except Exception:
+        last_n = 2
+    me_raw = request.args.get("max_era")
+    max_era = float(me_raw) if me_raw not in (None, "",) else None
+    try:
+        min_k = int(request.args.get("min_strikeouts", 0))
+    except Exception:
+        min_k = 0
+    debug = request.args.get("debug") == "1"
+
+    counters = {
+        "games_total": 0, "probables_checked": 0, "season_era_available": 0,
+        "passed_season_era": 0, "had_recent_starts": 0, "passed_min_k": 0
+    }
+
+    sched = get_schedule(date_str)
+    games = [g for d in sched.get("dates", []) for g in d.get("games", [])]
+    counters["games_total"] = len(games)
+
+    results = []
+    season_year = datetime.now(ZoneInfo("America/New_York")).year
+
+    for g in games:
+        for side in ("home", "away"):
+            pid = _team_probable_pitcher_id(g, side)
+            if not pid:
+                continue
+            counters["probables_checked"] += 1
+
+            era = get_pitcher_season_era(pid, season_year)
+            if era is None:
+                continue
+            counters["season_era_available"] += 1
+            if (max_era is not None) and (era > max_era):
+                continue
+            counters["passed_season_era"] += 1
+
+            starts = get_pitcher_last_n_starts(pid, n=last_n, season=season_year, as_of_date=as_of)
+            if starts:
+                counters["had_recent_starts"] += 1
+
+            # Must have at least last_n starts to evaluate strictly
+            if len(starts) < max(1, last_n):
+                continue
+
+            # Min K per start (if requested)
+            if min_k > 0:
+                if not all(int(s.get("stat", {}).get("strikeOuts", 0)) >= min_k for s in starts):
+                    continue
+                counters["passed_min_k"] += 1
+
+            # Build output
+            team_name = g.get("teams", {}).get(side, {}).get("team", {}).get("name")
+            pname = get_person_name(pid)
+            recent = []
+            for s in starts:
+                stat = s.get("stat", {})
+                recent.append({
+                    "date": s.get("date"),
+                    "inningsPitched": stat.get("inningsPitched"),
+                    "strikeOuts": int(stat.get("strikeOuts", 0)),
+                    "runs": int(stat.get("runs", stat.get("earnedRuns", 0)))
+                })
+
+            results.append({
+                "player": pname, "team": team_name, "era": era,
+                "recent_starts": recent
+            })
+
+    if debug:
+        return jsonify({"date": date_str, "last_n": last_n, "max_era": max_era,
+                        "min_strikeouts": min_k, "counters": counters, "results": results})
     return jsonify(results)
 
 
