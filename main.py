@@ -1,3 +1,5 @@
+# main.py — full file (paste this whole thing)
+
 import os
 import importlib
 import inspect
@@ -9,13 +11,36 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import pytz
 
+# NEW: ensure OpenAPI has servers for GPT Actions import
+from fastapi.openapi.utils import get_openapi
+
 APP_NAME = "MLB Analyzer API"
+
+# Read your public Render URL (no trailing slash), e.g. https://your-app.onrender.com
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 
 app = FastAPI(
     title=APP_NAME,
     version="1.0.3",
     description="Custom GPT + API for MLB streak analysis",
 )
+
+# Inject `servers` into OpenAPI so GPT Actions can import the spec
+def custom_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
+    schema = get_openapi(
+        title=app.title,
+        version=app.version,
+        description=app.description,
+        routes=app.routes,
+    )
+    if PUBLIC_BASE_URL:
+        schema["servers"] = [{"url": PUBLIC_BASE_URL}]
+    app.openapi_schema = schema
+    return app.openapi_schema
+
+app.openapi = custom_openapi
 
 # --- CORS ---
 app.add_middleware(
