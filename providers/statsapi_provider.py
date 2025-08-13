@@ -9,7 +9,6 @@ from datetime import date as date_cls
 
 import httpx
 
-# Default public MLB Stats API
 DEFAULT_BASE = "https://statsapi.mlb.com"
 
 
@@ -21,57 +20,38 @@ class StatsApiProvider:
       - /api/v1/schedule?date=YYYY-MM-DD&sportId=1
       - /api/v1/teams/{team_id}/roster?rosterType=active
       - /api/v1/people/{player_id}/stats?stats=season&group=hitting|pitching&season=YYYY
-
-    Exposes:
-      - _fetch_hitter_rows(date, limit=None, team=None)
-      - _fetch_pitcher_rows(date, limit=None, team=None)
-      - hot_streak_hitters(...)
-      - cold_streak_hitters(...)
-      - pitcher_streaks(...)
-      - cold_pitchers(...)
-      - slate_scan(...)
     """
 
     def __init__(self):
-        # Config/env
         self.base: str = (
             os.getenv("STATS_API_BASE")
             or os.getenv("DATA_API_BASE")
             or DEFAULT_BASE
         ).rstrip("/")
 
-        # Not required for public endpoints; present for parity with debug
         self.key: Optional[str] = os.getenv("STATS_API_KEY") or os.getenv("DATA_API_KEY") or None
 
-        # HTTP client config
         self._timeout = float(os.getenv("HTTP_TIMEOUT_SEC", "15"))
         self._limits = httpx.Limits(max_keepalive_connections=8, max_connections=16)
 
-        # Debug logging (set STATS_DEBUG=1 to enable)
         self._debug = (os.getenv("STATS_DEBUG", "0") in ("1", "true", "True", "YES", "yes"))
 
-        # Internal last statuses (handy when debugging)
         self._last_schedule_status: Optional[int] = None
         self._last_error: Optional[str] = None
 
-    # ------------- Logging -------------
+    # ------------- logging -------------
 
     def _log(self, *args: Any) -> None:
         if self._debug:
             print("[StatsApiProvider]", *args, file=sys.stderr)
 
-    # ------------- HTTP helpers -------------
+    # ------------- HTTP helper -------------
 
     def _get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """
-        GET helper. Returns {} on 400/404 to avoid blowing up the API.
-        Raises on other non-2xx statuses.
-        """
         url = f"{self.base}{path}"
         headers = {}
         if self.key:
             headers["Authorization"] = f"Bearer {self.key}"
-
         self._log("GET", url, "params=", params)
         with httpx.Client(timeout=self._timeout, limits=self._limits, headers=headers) as client:
             r = client.get(url, params=params)
@@ -79,18 +59,13 @@ class StatsApiProvider:
             if path.startswith("/api/v1/schedule"):
                 self._last_schedule_status = r.status_code
             if r.status_code in (400, 404):
-                # Treat "no data" as empty
                 return {}
             r.raise_for_status()
             return r.json()
 
-    # ------------- Core fetches -------------
+    # ------------- core fetches -------------
 
     def _teams_playing_on(self, d: date_cls) -> List[Dict[str, Any]]:
-        """
-        Returns unique list of teams (id, name) scheduled on date d.
-        Uses sportId=1 (MLB) which is required by StatsAPI for reliability.
-        """
         try:
             sch = self._get("/api/v1/schedule", {"date": d.isoformat(), "sportId": 1})
         except httpx.HTTPError as e:
@@ -113,7 +88,6 @@ class StatsApiProvider:
                 if t:
                     teams.append({"id": t.get("id"), "name": t.get("name")})
 
-        # De-dup by id
         uniq: Dict[int, Dict[str, Any]] = {}
         for t in teams:
             tid = t.get("id")
@@ -130,10 +104,6 @@ class StatsApiProvider:
         return roster
 
     def _player_season_stats(self, player_id: int, season_year: int, group: str) -> Dict[str, Any]:
-        """
-        group: "hitting" or "pitching"
-        Returns single stat dict for the season, or {}
-        """
         data = self._get(
             f"/api/v1/people/{player_id}/stats",
             {"stats": "season", "group": group, "season": season_year},
@@ -144,13 +114,9 @@ class StatsApiProvider:
         splits = stats[0].get("splits") or []
         return (splits[0].get("stat") if splits else {}) or {}
 
-    # ------------- Rows for /provider_raw -------------
+    # ------------- rows for provider_raw -------------
 
     def _fetch_hitter_rows(self, date: date_cls, limit: Optional[int] = None, team: Optional[str] = None) -> List[Dict[str, Any]]:
-        """
-        Returns season summary rows for hitters on teams scheduled that day.
-        No pre-filters other than optional team name substring filter.
-        """
         year = date.year
         rows: List[Dict[str, Any]] = []
         for t in self._teams_playing_on(date):
@@ -163,7 +129,6 @@ class StatsApiProvider:
                 pname = p.get("fullName")
                 if not pid:
                     continue
-                # Hitting stats
                 try:
                     stat = self._player_season_stats(pid, year, "hitting")
                 except Exception as e:
@@ -187,15 +152,12 @@ class StatsApiProvider:
         return rows
 
     def _fetch_pitcher_rows(self, date: date_cls, limit: Optional[int] = None, team: Optional[str] = None) -> List[Dict[str, Any]]:
-        """
-        Returns season summary rows for pitchers (position=P) on teams scheduled that day.
-        """
         year = date.year
         rows: List[Dict[str, Any]] = []
         for t in self._teams_playing_on(date):
             if team and team.lower() not in (t.get("name") or "").lower():
                 continue
-            roster = self._team_roster(t["id"])
+            roster = self._team_roster(t["id"])   # <-- fixed (was __team_roster)
             for r in roster:
                 p = r.get("person") or {}
                 pid = p.get("id")
@@ -205,7 +167,6 @@ class StatsApiProvider:
                 pos_abbr = (r.get("position") or {}).get("abbreviation", "")
                 if pos_abbr != "P":
                     continue
-                # Pitching stats
                 try:
                     stat = self._player_season_stats(pid, year, "pitching")
                 except Exception as e:
@@ -227,7 +188,7 @@ class StatsApiProvider:
         self._log("total pitcher rows:", len(rows))
         return rows
 
-    # ------------- Public endpoints (simplified heuristics) -------------
+    # ------------- public endpoints (simple heuristics) -------------
 
     def hot_streak_hitters(self, *, date: date_cls, min_avg: float, games: int, require_hit_each: bool, debug: bool) -> Dict[str, Any]:
         hitters = self._fetch_hitter_rows(date, limit=None, team=None)
@@ -280,7 +241,6 @@ class StatsApiProvider:
         return out
 
     def slate_scan(self, *, date: date_cls, debug: bool) -> Dict[str, Any]:
-        # Build via simple heuristics (season stats) so you get usable lists right away
         hot_hitters = self.hot_streak_hitters(date=date, min_avg=0.300, games=3, require_hit_each=True, debug=False)["items"]
         cold_hitters = self.cold_streak_hitters(date=date, min_avg=0.220, games=2, require_zero_hit_each=True, debug=False)["items"]
         ps = self.pitcher_streaks(date=date, hot_max_era=3.50, hot_min_ks_each=6, hot_last_starts=3,
@@ -293,7 +253,7 @@ class StatsApiProvider:
             "cold_hitters": cold_hitters,
             "hot_pitchers": hot_pitchers,
             "cold_pitchers": cold_pitchers,
-            "matchups": [],  # add logic later if desired
+            "matchups": [],
         }
         if debug:
             out["debug"] = {
@@ -303,6 +263,30 @@ class StatsApiProvider:
                 "error": self._last_error,
             }
         return out
+
+    # ------------- diagnostics -------------
+
+    def debug_schedule(self, *, date: date_cls) -> Dict[str, Any]:
+        """
+        Return the raw schedule payload & quick counts so we can see what MLB sent.
+        """
+        payload = self._get("/api/v1/schedule", {"date": date.isoformat(), "sportId": 1})
+        dates = payload.get("dates") or []
+        games = []
+        for dblock in dates:
+            games.extend(dblock.get("games", []) or [])
+        return {
+            "status": self._last_schedule_status,
+            "date": date.isoformat(),
+            "games_count": len(games),
+            "teams_sample": [
+                {
+                    "home": (g.get("homeTeam") or {}).get("name"),
+                    "away": (g.get("awayTeam") or {}).get("name"),
+                } for g in games[:5]
+            ],
+            "raw": payload
+        }
 
 
 # --------- helpers ---------
