@@ -33,11 +33,11 @@ class StatsApiProvider:
     """
     Provider backed by MLB's public StatsAPI (no auth).
     Env (optional):
-      STATSAPI_BASE = https://statsapi.mlb.com/api/v1          (default)
-      STATSAPI_SEASON = 2025                                   (defaults to date.year)
-      STATSAPI_HITTERS_PER_TEAM = 3                            (# of position players sampled per team)
+      STATSAPI_BASE = https://statsapi.mlb.com/api/v1    (default)
+      STATSAPI_SEASON = 2025                             (defaults to date.year)
+      STATSAPI_HITTERS_PER_TEAM = 3                      (# of position players sampled per team)
       STATSAPI_TIMEOUT = 10
-      STATSAPI_GAME_TYPE = R                                   (regular-season logs)
+      STATSAPI_GAME_TYPE = R                             (regular season)
     """
 
     def __init__(self):
@@ -45,7 +45,7 @@ class StatsApiProvider:
         self.season_override = os.getenv("STATSAPI_SEASON")
         self.hitters_per_team = int(os.getenv("STATSAPI_HITTERS_PER_TEAM", "3"))
         self.timeout = float(os.getenv("STATSAPI_TIMEOUT", "10"))
-        self.game_type = os.getenv("STATSAPI_GAME_TYPE", "R")  # R=regular, S=spring, etc.
+        self.game_type = os.getenv("STATSAPI_GAME_TYPE", "R")
         self.key = ""  # for /provider_raw debug parity
 
         self._session = requests.Session()
@@ -57,10 +57,13 @@ class StatsApiProvider:
         hitters = self.get_hitters(date)
         out: List[Dict[str, Any]] = []
         for h in hitters:
-            if (h.avg or 0.0) < min_avg: continue
+            if (h.avg or 0.0) < min_avg:
+                continue
             seq = list(h.last_n_hits_each_game or [])
-            if len(seq) < games: continue
-            if require_hit_each and not all((x or 0) >= 1 for x in seq[:games]): continue
+            if len(seq) < games:
+                continue
+            if require_hit_each and not all((x or 0) >= 1 for x in seq[:games]):
+                continue
             out.append(_to_dict(h))
         return {"items": out, "meta": {"count": len(out), "min_avg": min_avg, "games": games, "require_hit_each": require_hit_each}} if debug else out
 
@@ -69,11 +72,15 @@ class StatsApiProvider:
         hitters = self.get_hitters(date)
         out: List[Dict[str, Any]] = []
         for h in hitters:
-            if (h.avg or 0.0) < min_avg: continue
+            if (h.avg or 0.0) < min_avg:
+                continue
             seq = list(h.last_n_hits_each_game or [])
-            if len(seq) < games: continue
-            if require_zero_hit_each and not all((x or 0) == 0 for x in seq[:games]): continue
-            if require_zero_hit_each and (h.last_n_hitless_games or 0) < games: continue
+            if len(seq) < games:
+                continue
+            if require_zero_hit_each and not all((x or 0) == 0 for x in seq[:games]):
+                continue
+            if require_zero_hit_each and (h.last_n_hitless_games or 0) < games:
+                continue
             out.append(_to_dict(h))
         return {"items": out, "meta": {"count": len(out), "min_avg": min_avg, "games": games, "require_zero_hit_each": require_zero_hit_each}} if debug else out
 
@@ -91,7 +98,8 @@ class StatsApiProvider:
             if (p.era or 0.0) >= cold_min_era and len(ra) >= cold_last_starts and all((r or 0) >= cold_min_runs_each for r in ra[:cold_last_starts]):
                 cold.append(_to_dict(p))
         resp = {"hot_pitchers": hot, "cold_pitchers": cold}
-        if debug: resp["meta"] = {"counts": {"hot": len(hot), "cold": len(cold)}}
+        if debug:
+            resp["meta"] = {"counts": {"hot": len(hot), "cold": len(cold)}}
         return resp
 
     def cold_pitchers(self, date: _date, min_era: float = 4.60, min_runs_each: int = 3, last_starts: int = 2, debug: bool = False):
@@ -132,7 +140,8 @@ class StatsApiProvider:
             "cold_pitchers": cold_pitchers,
             "matchups": matchups,
         }
-        if debug: out["debug"] = {"counts": {k: len(out[k]) for k in out}}
+        if debug:
+            out["debug"] = {"counts": {k: len(out[k]) for k in out}}
         return out
 
     # ---------- Internal helpers ----------
@@ -151,30 +160,27 @@ class StatsApiProvider:
             print(f"[statsapi] GET {url} params={params} -> {type(e).__name__}: {e}")
             return {}
 
-    def _probables_maps(self, game_date: _date) -> Tuple[Dict[str, int], Dict[str, str]]:
-        sched = self._get("/schedule", {"sportId": 1, "date": game_date.isoformat(), "hydrate": "probablePitcher"})
-        opp_prob_by_team: Dict[str, int] = {}
-        opp_code_by_team: Dict[str, str] = {}
-        for d in sched.get("dates", []):
-            for g in d.get("games", []):
-                away = g.get("teams", {}).get("away", {})
-                home = g.get("teams", {}).get("home", {})
-                away_code = _team_code(away.get("team", {}) or {})
-                home_code = _team_code(home.get("team", {}) or {})
-                ap = (away.get("probablePitcher") or {}).get("id")
-                hp = (home.get("probablePitcher") or {}).get("id")
-                if away_code and hp:
-                    opp_prob_by_team[away_code] = int(hp)
-                    opp_code_by_team[away_code] = home_code
-                if home_code and ap:
-                    opp_prob_by_team[home_code] = int(ap)
-                    opp_code_by_team[home_code] = away_code
-        return opp_prob_by_team, opp_code_by_team
-
     # ---------- Raw fetches (StatsAPI) ----------
+    def _fetch_schedule(self, game_date: _date) -> Dict[str, Any]:
+        return self._get("/schedule", {"sportId": 1, "date": game_date.isoformat(), "hydrate": "probablePitcher"})
+
+    def _person_stats(self, pid: int, group: str, season: int) -> Dict[str, Any]:
+        """
+        Use the dedicated /people/{id}/stats endpoint to avoid hydrate quirks.
+        Example:
+          /people/545361/stats?stats=gameLog,season&group=hitting&season=2025&gameType=R
+        """
+        params = {
+            "stats": "gameLog,season",
+            "group": group,
+            "season": season,
+            "gameType": self.game_type,
+        }
+        return self._get(f"/people/{pid}/stats", params)
+
     def _fetch_pitcher_rows(self, game_date: _date, limit: Optional[int] = None, team: Optional[str] = None) -> Iterable[Dict[str, Any]]:
         season = self._season_of(game_date)
-        sched = self._get("/schedule", {"sportId": 1, "date": game_date.isoformat(), "hydrate": "probablePitcher"})
+        sched = self._fetch_schedule(game_date)
         entries: List[Tuple[int, str, str]] = []
         for d in sched.get("dates", []):
             for g in d.get("games", []):
@@ -188,33 +194,39 @@ class StatsApiProvider:
                     entries.append((int(ap), away_code, home_code))
                 if hp and (not team or team == home_code):
                     entries.append((int(hp), home_code, away_code))
-        if limit: entries = entries[:limit]
+        if limit:
+            entries = entries[:limit]
 
         rows: List[Dict[str, Any]] = []
         for pid, tcode, opp in entries:
-            # ✅ Correct hydrate: use stats=..., not type=...
-            hydrate = f"stats(group=pitching,stats=season,gameLog,season={season},gameType=[{self.game_type}])"
-            data = self._get(f"/people/{pid}", {"hydrate": hydrate})
-            ppl = (data.get("people") or [])
-            if not ppl: continue
-            person = ppl[0]
-            name = person.get("fullName") or person.get("firstLastName") or str(pid)
+            pdata = self._person_stats(pid, "pitching", season)
+            # parse name
+            name = str(pid)
+            # Some responses include people array with person name in "note", but with /stats it’s nested differently.
+            # Fallback: we can fetch /people/{pid} if name missing, but usually splits include player name.
+            try:
+                name = pdata.get("people", [{}])[0].get("fullName") or name
+            except Exception:
+                pass
+
             era = None
             ks_seq: List[int] = []
             ra_seq: List[int] = []
-            for s in person.get("stats", []):
-                stype = (s.get("type") or {}).get("displayName", "").lower()
-                group = (s.get("group") or {}).get("displayName", "").lower()
-                if group != "pitching": continue
+            for block in pdata.get("stats", []):
+                stype = (block.get("type") or {}).get("displayName", "").lower()
+                group = (block.get("group") or {}).get("displayName", "").lower()
+                if group != "pitching":
+                    continue
+                splits = block.get("splits") or []
                 if stype == "season":
-                    splits = s.get("splits") or []
                     if splits:
-                        era = _safe_float(splits[0].get("stat", {}).get("era"))
+                        era = _safe_float((splits[0].get("stat") or {}).get("era"))
                 elif stype == "gamelog":
-                    for sp in (s.get("splits") or [])[:5]:
+                    for sp in splits[:5]:
                         stat = sp.get("stat", {})
                         ks_seq.append(int(stat.get("strikeOuts", 0)))
                         ra_seq.append(int(stat.get("earnedRuns", 0)))
+
             rows.append({
                 "player_id": str(pid),
                 "name": name,
@@ -230,9 +242,24 @@ class StatsApiProvider:
 
     def _fetch_hitter_rows(self, game_date: _date, limit: Optional[int] = None, team: Optional[str] = None) -> Iterable[Dict[str, Any]]:
         season = self._season_of(game_date)
-        opp_prob_by_team, opp_code_by_team = self._probables_maps(game_date)
+        sched = self._fetch_schedule(game_date)
 
-        sched = self._get("/schedule", {"sportId": 1, "date": game_date.isoformat(), "hydrate": "probablePitcher"})
+        # Map team -> opponent probable pitcher id
+        opp_prob_by_team: Dict[str, int] = {}
+        for d in sched.get("dates", []):
+            for g in d.get("games", []):
+                away = g.get("teams", {}).get("away", {})
+                home = g.get("teams", {}).get("home", {})
+                away_code = _team_code(away.get("team", {}) or {})
+                home_code = _team_code(home.get("team", {}) or {})
+                ap = (away.get("probablePitcher") or {}).get("id")
+                hp = (home.get("probablePitcher") or {}).get("id")
+                if away_code and hp:
+                    opp_prob_by_team[away_code] = int(hp)
+                if home_code and ap:
+                    opp_prob_by_team[home_code] = int(ap)
+
+        # Build team list on slate
         teams: List[Tuple[int, str, str]] = []
         for d in sched.get("dates", []):
             for g in d.get("games", []):
@@ -252,40 +279,47 @@ class StatsApiProvider:
             roster = self._get(f"/teams/{tid}/roster", {"rosterType": "active", "season": season}).get("roster") or []
             picked = 0
             for r in roster:
-                if picked >= self.hitters_per_team: break
+                if picked >= self.hitters_per_team:
+                    break
                 pos_abbrev = ((r.get("position") or {}).get("abbreviation") or "").upper()
-                if pos_abbrev in ("P", "SP", "RP"): continue
+                if pos_abbrev in ("P", "SP", "RP"):
+                    continue
                 person = r.get("person") or {}
                 pid = person.get("id")
-                if not pid: continue
+                if not pid:
+                    continue
 
-                # ✅ Correct hydrate: stats=..., not type=...
-                hydrate = f"stats(group=hitting,stats=season,gameLog,season={season},gameType=[{self.game_type}])"
-                pdata = self._get(f"/people/{pid}", {"hydrate": hydrate})
-                ppl = (pdata.get("people") or [])
-                if not ppl: continue
-                p0 = ppl[0]
-                name = p0.get("fullName") or str(pid)
+                hdata = self._person_stats(pid, "hitting", season)
+                # try to get name
+                name = str(pid)
+                try:
+                    name = hdata.get("people", [{}])[0].get("fullName") or name
+                except Exception:
+                    pass
 
                 avg = None
                 hits_each: List[int] = []
                 hitless_streak = 0
-                for s in p0.get("stats", []):
-                    stype = (s.get("type") or {}).get("displayName", "").lower()
-                    group = (s.get("group") or {}).get("displayName", "").lower()
-                    if group != "hitting": continue
+                for block in hdata.get("stats", []):
+                    stype = (block.get("type") or {}).get("displayName", "").lower()
+                    group = (block.get("group") or {}).get("displayName", "").lower()
+                    if group != "hitting":
+                        continue
+                    splits = block.get("splits") or []
                     if stype == "season":
-                        splits = s.get("splits") or []
                         if splits:
-                            avg = _safe_float(splits[0].get("stat", {}).get("avg"))
+                            avg = _safe_float((splits[0].get("stat") or {}).get("avg"))
                     elif stype == "gamelog":
-                        for sp in (s.get("splits") or [])[:5]:
+                        for sp in splits[:5]:
                             stat = sp.get("stat", {})
                             hits = int(stat.get("hits", 0))
                             hits_each.append(hits)
+                        # leading-zero run = hitless streak
                         for h in hits_each:
-                            if h == 0: hitless_streak += 1
-                            else: break
+                            if h == 0:
+                                hitless_streak += 1
+                            else:
+                                break
 
                 rows.append({
                     "player_id": str(pid),
@@ -301,9 +335,12 @@ class StatsApiProvider:
                     "last_n_hitless_games": hitless_streak,
                 })
                 picked += 1
-            if limit and len(rows) >= limit: break
 
-        if limit: rows = rows[:limit]
+            if limit and len(rows) >= limit:
+                break
+
+        if limit:
+            rows = rows[:limit]
         return rows
 
     # ---------- Map to Pydantic ----------
