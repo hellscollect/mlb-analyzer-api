@@ -31,8 +31,9 @@ class StatsApiProvider:
 
         self.key: Optional[str] = os.getenv("STATS_API_KEY") or os.getenv("DATA_API_KEY") or None
 
-        self._timeout = float(os.getenv("HTTP_TIMEOUT_SEC", "15"))
-        self._limits = httpx.Limits(max_keepalive_connections=8, max_connections=16)
+        # Keep these conservative so tests don’t time out
+        self._timeout = float(os.getenv("HTTP_TIMEOUT_SEC", "12"))
+        self._limits = httpx.Limits(max_keepalive_connections=6, max_connections=12)
 
         self._debug = (os.getenv("STATS_DEBUG", "0") in ("1", "true", "True", "YES", "yes"))
 
@@ -64,7 +65,7 @@ class StatsApiProvider:
     # -------- core fetches --------
     def _teams_playing_on(self, d: date_cls) -> List[Dict[str, Any]]:
         """
-        FIXED: read teams from game['teams']['home']['team'] / ['away']['team'].
+        Read teams from game['teams']['home']['team'] / ['away']['team'].
         """
         try:
             sch = self._get("/api/v1/schedule", {"date": d.isoformat(), "sportId": 1})
@@ -247,6 +248,81 @@ class StatsApiProvider:
             out["debug"] = {"source": "statsapi", "base": self.base,
                             "last_schedule_status": self._last_schedule_status, "error": self._last_error}
         return out
+
+    # -------- ultra-light summary for GPT tests --------
+    def light_slate(self, *, date: date_cls, max_teams: int = 6, per_team: int = 2, debug: bool = True) -> Dict[str, Any]:
+        """
+        Fast, bounded calls:
+          - take up to `max_teams` from the day's schedule
+          - for each team, fetch roster once
+          - pick up to `per_team` hitters and `per_team` pitchers
+          - fetch each selected player's season stat once
+        Returns small counts & name samples to avoid payload/timeouts.
+        """
+        per_team = max(1, min(5, per_team))
+        max_teams = max(1, min(10, max_teams))
+
+        teams = self._teams_playing_on(date)
+        games_count = len(teams) // 2 if teams else 0
+        teams = teams[:max_teams]
+
+        year = date.year
+        hitters_samples: List[str] = []
+        pitchers_samples: List[str] = []
+
+        try:
+            for t in teams:
+                roster = self._team_roster(t["id"])
+                # Split hitters vs pitchers from roster
+                hitters = [r for r in roster if ((r.get("position") or {}).get("abbreviation")) != "P"]
+                pitchers = [r for r in roster if ((r.get("position") or {}).get("abbreviation")) == "P"]
+
+                for r in hitters[:per_team]:
+                    p = r.get("person") or {}
+                    pid = p.get("id")
+                    pname = p.get("fullName") or "Unknown"
+                    if pid:
+                        # one quick stat call (safe if it fails)
+                        try:
+                            _ = self._player_season_stats(pid, year, "hitting")
+                        except Exception as e:
+                            self._log("light_slate hitting stat err:", e)
+                        hitters_samples.append(pname)
+
+                for r in pitchers[:per_team]:
+                    p = r.get("person") or {}
+                    pid = p.get("id")
+                    pname = p.get("fullName") or "Unknown"
+                    if pid:
+                        try:
+                            _ = self._player_season_stats(pid, year, "pitching")
+                        except Exception as e:
+                            self._log("light_slate pitching stat err:", e)
+                        pitchers_samples.append(pname)
+        except Exception as e:
+            self._last_error = f"light_slate_error: {e}"
+            self._log(self._last_error)
+
+        result = {
+            "date": date.isoformat(),
+            "games_count_est": games_count,
+            "counts": {
+                "sampled_teams": len(teams),
+                "sampled_hitters": len(hitters_samples),
+                "sampled_pitchers": len(pitchers_samples),
+            },
+            "samples": {
+                "hitters": hitters_samples[:10],
+                "pitchers": pitchers_samples[:10],
+            },
+        }
+        if debug:
+            result["debug"] = {
+                "base": self.base,
+                "last_schedule_status": self._last_schedule_status,
+                "error": self._last_error,
+            }
+        return result
 
     # -------- diagnostics --------
     def debug_schedule(self, *, date: date_cls) -> Dict[str, Any]:
