@@ -1,467 +1,270 @@
-from __future__ import annotations
-from typing import List, Optional, Dict, Any, Tuple
-from datetime import datetime, timedelta, date as _date
-import importlib
 import os
+import importlib
+from datetime import datetime, timedelta, date as date_cls
+from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import FastAPI, Query
-from pydantic import BaseModel, Field
+from fastapi import FastAPI, Query, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+import pytz
 
-try:
-    # Python 3.9+ standard library
-    from zoneinfo import ZoneInfo
-except Exception:
-    ZoneInfo = None  # Fallback handled below
+APP_NAME = "MLB Analyzer API"
 
 app = FastAPI(
-    title="MLB Analyzer API",
-    version="1.6.3",
-    description="Hot/Cold hitters & pitchers with slate scan, matchup filters, relative dates, advanced filters, and timezone-aware dates."
+    title=APP_NAME,
+    version="1.0.0",
+    description="Custom GPT + API for MLB streak analysis",
 )
 
-# =========================
-# Timezone + Date Handling
-# =========================
+# --- CORS (open by default; tighten if needed) ---
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-DEFAULT_TZ = "America/New_York"
-
-def _safe_zoneinfo(tz_name: str):
-    if ZoneInfo is None:
-        # Should not happen on modern Python, but guard anyway
-        raise RuntimeError("zoneinfo not available in this Python runtime.")
+# ------------------
+# Provider loading
+# ------------------
+def load_provider() -> Tuple[Optional[Any], Optional[str], Optional[str]]:
+    """
+    Load provider from env MLB_PROVIDER = 'path.to.module:ClassName'
+    Falls back to providers.simple_provider:SimpleProvider if not set.
+    """
+    target = os.getenv("MLB_PROVIDER", "providers.simple_provider:SimpleProvider")
+    module_path, _, class_name = target.partition(":")
     try:
-        return ZoneInfo(tz_name)
-    except Exception:
-        return ZoneInfo(DEFAULT_TZ)
-
-def _today_in_tz(tz: str) -> _date:
-    z = _safe_zoneinfo(tz)
-    return datetime.now(z).date()
-
-def _parse_date(d: Optional[str], tz: str) -> _date:
-    """
-    Accepts: None, 'today', 'yesterday', 'tomorrow', or 'YYYY-MM-DD'.
-    Interprets relative words in the provided IANA timezone (default America/New_York).
-    Falls back to 'today' in tz on invalid input.
-    """
-    base_today = _today_in_tz(tz)
-    if not d:
-        return base_today
-    s = d.strip().lower()
-    if s in ("today",):
-        return base_today
-    if s in ("yesterday", "yday"):
-        return base_today - timedelta(days=1)
-    if s in ("tomorrow", "tmrw", "tmmr"):
-        return base_today + timedelta(days=1)
-    try:
-        return datetime.strptime(s, "%Y-%m-%d").date()
-    except Exception:
-        return base_today
-
-# =========================
-# Data Models
-# =========================
-
-class Hitter(BaseModel):
-    player_id: str
-    name: str
-    team: str
-    opponent_team: Optional[str] = None
-    probable_pitcher_id: Optional[str] = None
-    avg: float
-    obp: Optional[float] = None
-    slg: Optional[float] = None
-    last_n_games: int = 0
-    last_n_hits_each_game: List[int] = Field(default_factory=list)
-    last_n_hitless_games: int = 0
-
-class Pitcher(BaseModel):
-    player_id: str
-    name: str
-    team: str
-    opponent_team: Optional[str] = None
-    era: float
-    kbb: Optional[float] = None
-    k_per_start_last_n: List[int] = Field(default_factory=list)
-    runs_allowed_last_n: List[int] = Field(default_factory=list)
-    is_probable: bool = False
-
-class StreakResult(BaseModel):
-    debug: Dict[str, Any] = Field(default_factory=dict)
-    results: List[Dict[str, Any]] = Field(default_factory=list)
-
-class SlateScanResponse(BaseModel):
-    date: str
-    tz: str
-    debug: Dict[str, Any] = Field(default_factory=dict)
-    hot_hitters: List[Dict[str, Any]] = Field(default_factory=list)
-    cold_hitters: List[Dict[str, Any]] = Field(default_factory=list)
-    hot_pitchers: List[Dict[str, Any]] = Field(default_factory=list)
-    cold_pitchers: List[Dict[str, Any]] = Field(default_factory=list)
-    matchups: Dict[str, List[Dict[str, Any]]] = Field(default_factory=dict)
-
-class HealthResponse(BaseModel):
-    server_time_utc: str
-    date_in_tz: str
-    tz: str
-    provider_loaded: bool
-    provider_class: Optional[str] = None
-    note: Optional[str] = None
-
-# =================================
-# Data Provider (pluggable)
-# =================================
-
-class DataProvider:
-    """Interface / default no-op provider."""
-    def get_hitters(self, game_date: _date) -> List[Hitter]: return []
-    def get_pitchers(self, game_date: _date) -> List[Pitcher]: return []
-    def get_probable_pitchers_by_team(self, game_date: _date) -> Dict[str, Pitcher]:
-        return {p.team: p for p in self.get_pitchers(game_date) if p.is_probable}
-
-def _load_provider_from_env() -> Tuple[DataProvider, Dict[str, Any]]:
-    """
-    Dynamically load a provider using MLB_PROVIDER env var formatted as 'module.path:ClassName'.
-    Example: MLB_PROVIDER='myapp.data_provider:ProdProvider'
-    """
-    meta = {"env": os.environ.get("MLB_PROVIDER"), "loaded": False, "error": None, "class": None}
-    env_val = os.environ.get("MLB_PROVIDER")
-    if not env_val:
-        return DataProvider(), meta
-    try:
-        if ":" not in env_val:
-            raise ValueError("MLB_PROVIDER must be 'module.path:ClassName'")
-        module_name, class_name = env_val.split(":", 1)
-        mod = importlib.import_module(module_name)
-        cls = getattr(mod, class_name)
-        inst = cls()  # must be compatible with DataProvider interface
-        if not hasattr(inst, "get_hitters") or not hasattr(inst, "get_pitchers"):
-            raise TypeError("Loaded provider does not implement required methods.")
-        meta["loaded"] = True
-        meta["class"] = f"{module_name}:{class_name}"
-        return inst, meta
+        module = importlib.import_module(module_path)
+        provider_cls = getattr(module, class_name)
+        instance = provider_cls()
+        return instance, module_path, class_name
     except Exception as e:
-        meta["error"] = repr(e)
-        return DataProvider(), meta
+        # Return details; /health will reflect not loaded
+        return None, None, None
 
-_provider, _provider_meta = _load_provider_from_env()
+provider, provider_module, provider_class = load_provider()
 
-# =========================
-# Filtering Helpers
-# =========================
-
-def _passes_min(value: Optional[float], threshold: Optional[float]) -> bool:
-    return threshold is None or (value is not None and value >= threshold)
-
-def _passes_max(value: Optional[float], threshold: Optional[float]) -> bool:
-    return threshold is None or (value is not None and value <= threshold)
-
-def _serialize_hitter(h: Hitter) -> Dict[str, Any]:
-    return h.dict()
-
-def _serialize_pitcher(p: Pitcher) -> Dict[str, Any]:
-    return p.dict()
-
-# =========================
-# Business Logic
-# =========================
-
-def find_hot_hitters(
-    hitters: List[Hitter],
-    *,
-    avg_min: float,
-    last_n: int,
-    require_hits_each_game: bool = True,
-    obp_min: Optional[float] = None,
-    slg_min: Optional[float] = None,
-    debug: bool = False
-) -> Tuple[List[Hitter], Dict[str, Any]]:
-    dbg = {"scanned": len(hitters)}
-    pool = [h for h in hitters if h.avg >= avg_min]
-    dbg["after_avg"] = len(pool)
-    if require_hits_each_game and last_n > 0:
-        pool = [h for h in pool
-                if len(h.last_n_hits_each_game) >= last_n
-                and all(x >= 1 for x in h.last_n_hits_each_game[:last_n])]
-    dbg["after_hits"] = len(pool)
-    pool = [h for h in pool if _passes_min(h.obp, obp_min) and _passes_min(h.slg, slg_min)]
-    dbg["after_adv"] = len(pool)
-    return pool, dbg if debug else {}
-
-def find_cold_hitters(
-    hitters: List[Hitter], *,
-    avg_min: float,
-    last_n_hitless: int,
-    obp_max: Optional[float] = None,
-    slg_max: Optional[float] = None,
-    debug: bool = False
-) -> Tuple[List[Hitter], Dict[str, Any]]:
-    dbg = {"scanned": len(hitters)}
-    pool = [h for h in hitters if h.avg >= avg_min]
-    dbg["after_avg"] = len(pool)
-    if last_n_hitless > 0:
-        pool = [h for h in pool if h.last_n_hitless_games >= last_n_hitless]
-    dbg["after_hitless"] = len(pool)
-    pool = [h for h in pool if _passes_max(h.obp, obp_max) and _passes_max(h.slg, slg_max)]
-    dbg["after_adv"] = len(pool)
-    return pool, dbg if debug else {}
-
-def find_hot_pitchers(
-    pitchers: List[Pitcher], *,
-    era_max: float,
-    strikeouts_each_last_n: int,
-    kbb_min: Optional[float] = None,
-    debug: bool = False
-) -> Tuple[List[Pitcher], Dict[str, Any]]:
-    dbg = {"scanned": len(pitchers)}
-    pool = [p for p in pitchers if p.era <= era_max]
-    dbg["after_era"] = len(pool)
-    if strikeouts_each_last_n > 0:
-        pool = [p for p in pool
-                if len(p.k_per_start_last_n) >= strikeouts_each_last_n
-                and all(k >= 6 for k in p.k_per_start_last_n[:strikeouts_each_last_n])]
-    dbg["after_ks"] = len(pool)
-    pool = [p for p in pool if _passes_min(p.kbb, kbb_min)]
-    dbg["after_kbb"] = len(pool)
-    return pool, dbg if debug else {}
-
-def find_cold_pitchers(
-    pitchers: List[Pitcher], *,
-    era_min: float,
-    runs_allowed_each_last_n: int,
-    kbb_max: Optional[float] = None,
-    debug: bool = False
-) -> Tuple[List[Pitcher], Dict[str, Any]]:
-    dbg = {"scanned": len(pitchers)}
-    pool = [p for p in pitchers if p.era >= era_min]
-    dbg["after_era"] = len(pool)
-    if runs_allowed_each_last_n > 0:
-        pool = [p for p in pool
-                if len(p.runs_allowed_last_n) >= runs_allowed_each_last_n
-                and all(r >= 3 for r in p.runs_allowed_last_n[:runs_allowed_each_last_n])]
-    dbg["after_runs"] = len(pool)
-    pool = [p for p in pool if _passes_max(p.kbb, kbb_max)]
-    dbg["after_kbb"] = len(pool)
-    return pool, dbg if debug else {}
-
-# =========================
-# Matchup Builder
-# =========================
-
-def build_matchups(
-    *, date_obj: _date,
-    hot_hitters: List[Hitter],
-    cold_hitters: List[Hitter],
-    hot_pitchers: List[Pitcher],
-    cold_pitchers: List[Pitcher],
-) -> Dict[str, List[Dict[str, Any]]]:
-    cold_pitchers_by_id = {p.player_id: p for p in cold_pitchers}
-    hot_pitchers_by_id = {p.player_id: p for p in hot_pitchers}
-    probables_by_team = _provider.get_probable_pitchers_by_team(date_obj)
-
-    hh_vs_cp = []
-    for h in hot_hitters:
-        mp = None
-        if h.probable_pitcher_id and h.probable_pitcher_id in cold_pitchers_by_id:
-            mp = cold_pitchers_by_id[h.probable_pitcher_id]
-        elif h.opponent_team:
-            p = probables_by_team.get(h.opponent_team)
-            if p and p.player_id in cold_pitchers_by_id:
-                mp = cold_pitchers_by_id[p.player_id]
-        if mp:
-            hh_vs_cp.append({"hitter": _serialize_hitter(h), "pitcher": _serialize_pitcher(mp)})
-
-    hp_vs_ch = []
-    for h in cold_hitters:
-        mp = None
-        if h.probable_pitcher_id and h.probable_pitcher_id in hot_pitchers_by_id:
-            mp = hot_pitchers_by_id[h.probable_pitcher_id]
-        elif h.opponent_team:
-            p = probables_by_team.get(h.opponent_team)
-            if p and p.player_id in hot_pitchers_by_id:
-                mp = hot_pitchers_by_id[p.player_id]
-        if mp:
-            hp_vs_ch.append({"pitcher": _serialize_pitcher(mp), "hitter": _serialize_hitter(h)})
-
-    return {
-        "hot_hitters_vs_cold_pitchers": hh_vs_cp,
-        "hot_pitchers_vs_cold_hitters": hp_vs_ch
-    }
-
-# =========================
-# Endpoints
-# =========================
-
-@app.get("/health", response_model=HealthResponse, operation_id="getHealth")
-def health(tz: str = Query(DEFAULT_TZ, description="IANA timezone used for relative dates")):
+# ------------------
+# Utilities
+# ------------------
+def parse_date(d: Optional[str]) -> date_cls:
+    """
+    Accepts: today | yesterday | tomorrow | YYYY-MM-DD | None
+    Defaults to today (America/New_York).
+    """
+    tz = pytz.timezone("America/New_York")
+    now = datetime.now(tz).date()
+    if not d or d.lower() == "today":
+        return now
+    s = d.lower()
+    if s == "yesterday":
+        return now - timedelta(days=1)
+    if s == "tomorrow":
+        return now + timedelta(days=1)
+    # explicit date
     try:
-        date_tz = _today_in_tz(tz)
+        return datetime.strptime(d, "%Y-%m-%d").date()
     except Exception:
-        tz = DEFAULT_TZ
-        date_tz = _today_in_tz(tz)
-    return HealthResponse(
-        server_time_utc=datetime.utcnow().isoformat() + "Z",
-        date_in_tz=date_tz.isoformat(),
-        tz=tz,
-        provider_loaded=_provider_meta.get("loaded", False),
-        provider_class=_provider_meta.get("class"),
-        note=("Using default no-op provider; set MLB_PROVIDER='module:Class' to load your data layer."
-              if not _provider_meta.get("loaded") else None)
+        raise HTTPException(status_code=400, detail="Invalid date; use today|yesterday|tomorrow|YYYY-MM-DD")
+
+def safe_call(obj: Any, name: str, *args, **kwargs):
+    """
+    Call obj.name(*args, **kwargs) if it exists, else raise 501 so we don't mask wiring mistakes.
+    """
+    if obj is None:
+        raise HTTPException(status_code=503, detail="Provider not loaded")
+    fn = getattr(obj, name, None)
+    if not callable(fn):
+        raise HTTPException(status_code=501, detail=f"Provider does not implement {name}()")
+    return fn(*args, **kwargs)
+
+# ------------------
+# Models (minimal; keep responses flexible while wiring data)
+# ------------------
+class HealthResp(BaseModel):
+    ok: bool
+    provider_loaded: bool
+    provider_module: Optional[str]
+    provider_class: Optional[str]
+    now_local: str
+
+class SlateScanResp(BaseModel):
+    hot_hitters: List[Dict[str, Any]]
+    cold_hitters: List[Dict[str, Any]]
+    hot_pitchers: List[Dict[str, Any]]
+    cold_pitchers: List[Dict[str, Any]]
+    matchups: List[Dict[str, Any]]
+    debug: Optional[Dict[str, Any]] = None
+
+# ------------------
+# Health
+# ------------------
+@app.get("/health", response_model=HealthResp, operation_id="health")
+def health(tz: str = Query("America/New_York", description="IANA timezone for timestamp echo")):
+    try:
+        zone = pytz.timezone(tz)
+    except Exception:
+        zone = pytz.timezone("America/New_York")
+    now_str = datetime.now(zone).strftime("%Y-%m-%d %H:%M:%S %Z")
+    return HealthResp(
+        ok=True,
+        provider_loaded=provider is not None,
+        provider_module=provider_module,
+        provider_class=provider_class,
+        now_local=now_str,
     )
 
-@app.get("/hot_streak_hitters", response_model=StreakResult, operation_id="getHotStreakHitters")
-def hot_streak_hitters(
-    avg_min: float = Query(0.280, description="Minimum batting average"),
-    last_n: int = Query(3, description="Lookback games requiring ≥1 hit each"),
-    date: Optional[str] = Query(None, description="today|yesterday|tomorrow|YYYY-MM-DD"),
-    obp_min: Optional[float] = Query(None, description="Minimum OBP (optional)"),
-    slg_min: Optional[float] = Query(None, description="Minimum SLG (optional)"),
-    tz: str = Query(DEFAULT_TZ, description="IANA timezone for relative dates"),
-    debug: Optional[int] = Query(0, description="Set to 1 to return counters")
+# ------------------
+# NEW: Raw provider rows endpoint
+# ------------------
+@app.get(
+    "/provider_raw",
+    operation_id="provider_raw",
+    summary="Inspect raw rows from provider (temporary endpoint)",
+    description=(
+        "Returns raw hitter and pitcher rows straight from the provider's private "
+        "fetch methods, without mapping. Use this to learn the exact data shape "
+        "before wiring _map_hitter/_map_pitcher. This endpoint is temporary and "
+        "should be removed after mapping is complete."
+    ),
+)
+def provider_raw(
+    date: Optional[str] = Query(None, description="today|yesterday|tomorrow|YYYY-MM-DD (default: today)"),
+    limit: Optional[int] = Query(None, ge=1, le=5000, description="Optional soft cap if provider supports it"),
+    team: Optional[str] = Query(None, description="Optional team filter if provider supports it"),
+    debug: int = Query(0, ge=0, le=1, description="Include provider echo in response when 1"),
 ):
-    d = _parse_date(date, tz)
-    hitters = _provider.get_hitters(d)
-    filtered, dbg = find_hot_hitters(
-        hitters, avg_min=avg_min, last_n=last_n,
-        require_hits_each_game=True, obp_min=obp_min, slg_min=slg_min, debug=bool(debug)
-    )
-    out_dbg = {"counters": dbg}
-    if not _provider_meta.get("loaded"):
-        out_dbg["provider"] = _provider_meta
-    return StreakResult(debug=out_dbg if debug else {}, results=[_serialize_hitter(h) for h in filtered])
+    the_date = parse_date(date)
 
-@app.get("/cold_streak_hitters", response_model=StreakResult, operation_id="getColdStreakHitters")
-def cold_streak_hitters(
-    avg_min: float = Query(0.275, description="Minimum batting average"),
-    last_n_hitless: int = Query(2, description="Number of most recent games with 0 hits"),
-    date: Optional[str] = Query(None, description="today|yesterday|tomorrow|YYYY-MM-DD"),
-    obp_max: Optional[float] = Query(None, description="Maximum OBP (optional)"),
-    slg_max: Optional[float] = Query(None, description="Maximum SLG (optional)"),
-    tz: str = Query(DEFAULT_TZ, description="IANA timezone for relative dates"),
-    debug: Optional[int] = Query(0, description="Set to 1 to return counters")
-):
-    d = _parse_date(date, tz)
-    hitters = _provider.get_hitters(d)
-    filtered, dbg = find_cold_hitters(
-        hitters, avg_min=avg_min, last_n_hitless=last_n_hitless,
-        obp_max=obp_max, slg_max=slg_max, debug=bool(debug)
-    )
-    out_dbg = {"counters": dbg}
-    if not _provider_meta.get("loaded"):
-        out_dbg["provider"] = _provider_meta
-    return StreakResult(debug=out_dbg if debug else {}, results=[_serialize_hitter(h) for h in filtered])
+    # Call the provider's *private* fetches directly:
+    # Expected to exist in ProdProvider skeleton per your setup:
+    #   _fetch_hitter_rows(date=..., **kwargs)
+    #   _fetch_pitcher_rows(date=..., **kwargs)
+    hitters = safe_call(provider, "_fetch_hitter_rows", date=the_date, limit=limit, team=team)
+    pitchers = safe_call(provider, "_fetch_pitcher_rows", date=the_date, limit=limit, team=team)
 
-@app.get("/pitcher_streaks", response_model=StreakResult, operation_id="getPitcherStreaks")
-def pitcher_streaks(
-    era_max: float = Query(4.00, description="Maximum ERA to qualify as 'hot'"),
-    strikeouts_each_last_n: int = Query(3, description="Require ≥6 K in each of the last N starts"),
-    date: Optional[str] = Query(None, description="today|yesterday|tomorrow|YYYY-MM-DD"),
-    kbb_min: Optional[float] = Query(None, description="Minimum K/BB ratio (optional)"),
-    tz: str = Query(DEFAULT_TZ, description="IANA timezone for relative dates"),
-    debug: Optional[int] = Query(0, description="Set to 1 to return counters")
-):
-    d = _parse_date(date, tz)
-    pitchers = _provider.get_pitchers(d)
-    filtered, dbg = find_hot_pitchers(
-        pitchers, era_max=era_max, strikeouts_each_last_n=strikeouts_each_last_n,
-        kbb_min=kbb_min, debug=bool(debug)
-    )
-    out_dbg = {"counters": dbg}
-    if not _provider_meta.get("loaded"):
-        out_dbg["provider"] = _provider_meta
-    return StreakResult(debug=out_dbg if debug else {}, results=[_serialize_pitcher(p) for p in filtered])
-
-@app.get("/cold_pitchers", response_model=StreakResult, operation_id="getColdPitchers")
-def cold_pitchers(
-    era_min: float = Query(4.60, description="Minimum ERA to qualify as 'cold'"),
-    runs_allowed_each_last_n: int = Query(2, description="Require ≥3 ER in each of the last N starts"),
-    date: Optional[str] = Query(None, description="today|yesterday|tomorrow|YYYY-MM-DD"),
-    kbb_max: Optional[float] = Query(None, description="Maximum K/BB ratio (optional)"),
-    tz: str = Query(DEFAULT_TZ, description="IANA timezone for relative dates"),
-    debug: Optional[int] = Query(0, description="Set to 1 to return counters")
-):
-    d = _parse_date(date, tz)
-    pitchers = _provider.get_pitchers(d)
-    filtered, dbg = find_cold_pitchers(
-        pitchers, era_min=era_min, runs_allowed_each_last_n=runs_allowed_each_last_n,
-        kbb_max=kbb_max, debug=bool(debug)
-    )
-    out_dbg = {"counters": dbg}
-    if not _provider_meta.get("loaded"):
-        out_dbg["provider"] = _provider_meta
-    return StreakResult(debug=out_dbg if debug else {}, results=[_serialize_pitcher(p) for p in filtered])
-
-@app.get("/slate_scan", response_model=SlateScanResponse, operation_id="getSlateScan")
-def slate_scan(
-    hot_avg_min: float = Query(0.280, description="Hot hitters: minimum AVG"),
-    hot_last_n: int = Query(3, description="Hot hitters: require ≥1 hit each of last N"),
-    hot_obp_min: Optional[float] = Query(None, description="Hot hitters: minimum OBP"),
-    hot_slg_min: Optional[float] = Query(None, description="Hot hitters: minimum SLG"),
-    cold_avg_min: float = Query(0.275, description="Cold hitters: minimum AVG"),
-    cold_last_n_hitless: int = Query(2, description="Cold hitters: consecutive 0-hit games (N)"),
-    cold_obp_max: Optional[float] = Query(None, description="Cold hitters: maximum OBP"),
-    cold_slg_max: Optional[float] = Query(None, description="Cold hitters: maximum SLG"),
-    hot_era_max: float = Query(4.00, description="Hot pitchers: maximum ERA"),
-    hot_ks_each_last_n: int = Query(3, description="Hot pitchers: require ≥6 K each of last N starts"),
-    hot_kbb_min: Optional[float] = Query(None, description="Hot pitchers: minimum K/BB"),
-    cold_era_min: float = Query(4.60, description="Cold pitchers: minimum ERA"),
-    cold_runs_each_last_n: int = Query(2, description="Cold pitchers: require ≥3 ER each of last N starts"),
-    cold_kbb_max: Optional[float] = Query(None, description="Cold pitchers: maximum K/BB"),
-    date: Optional[str] = Query(None, description="today|yesterday|tomorrow|YYYY-MM-DD"),
-    tz: str = Query(DEFAULT_TZ, description="IANA timezone for relative dates"),
-    debug: Optional[int] = Query(0, description="Set to 1 to include counters")
-):
-    d = _parse_date(date, tz)
-    hitters = _provider.get_hitters(d)
-    pitchers = _provider.get_pitchers(d)
-
-    hh, dbg_hh = find_hot_hitters(
-        hitters, avg_min=hot_avg_min, last_n=hot_last_n,
-        require_hits_each_game=True, obp_min=hot_obp_min, slg_min=hot_slg_min, debug=bool(debug)
-    )
-    ch, dbg_ch = find_cold_hitters(
-        hitters, avg_min=cold_avg_min, last_n_hitless=cold_last_n_hitless,
-        obp_max=cold_obp_max, slg_max=cold_slg_max, debug=bool(debug)
-    )
-    hp, dbg_hp = find_hot_pitchers(
-        pitchers, era_max=hot_era_max, strikeouts_each_last_n=hot_ks_each_last_n,
-        kbb_min=hot_kbb_min, debug=bool(debug)
-    )
-    cp, dbg_cp = find_cold_pitchers(
-        pitchers, era_min=cold_era_min, runs_allowed_each_last_n=cold_runs_each_last_n,
-        kbb_max=cold_kbb_max, debug=bool(debug)
-    )
-
-    matchups = build_matchups(
-        date_obj=d, hot_hitters=hh, cold_hitters=ch, hot_pitchers=hp, cold_pitchers=cp
-    )
-
-    dbg_payload: Dict[str, Any] = {}
-    if debug:
-        dbg_payload = {
-            "hot_hitters": dbg_hh,
-            "cold_hitters": dbg_ch,
-            "hot_pitchers": dbg_hp,
-            "cold_pitchers": dbg_cp
+    out = {
+        "meta": {
+            "provider_module": provider_module,
+            "provider_class": provider_class,
+            "date": the_date.isoformat(),
+        },
+        "hitters_raw": hitters,
+        "pitchers_raw": pitchers,
+    }
+    if debug == 1:
+        out["debug"] = {
+            "args": {"date": the_date.isoformat(), "limit": limit, "team": team},
+            "notes": "Direct pass-through of provider private fetch methods.",
         }
-        if not _provider_meta.get("loaded"):
-            dbg_payload["provider"] = _provider_meta
+    return out
 
-    return SlateScanResponse(
-        date=d.isoformat(),
-        tz=tz,
-        debug=dbg_payload,
-        hot_hitters=[_serialize_hitter(x) for x in hh],
-        cold_hitters=[_serialize_hitter(x) for x in ch],
-        hot_pitchers=[_serialize_pitcher(x) for x in hp],
-        cold_pitchers=[_serialize_pitcher(x) for x in cp],
-        matchups=matchups
+# ------------------
+# Existing endpoints (kept stable; thin wrappers)
+# ------------------
+
+@app.get("/hot_streak_hitters", operation_id="hot_streak_hitters")
+def hot_streak_hitters(
+    date: Optional[str] = Query(None, description="today|yesterday|tomorrow|YYYY-MM-DD (default: today)"),
+    min_avg: float = Query(0.280, description="Minimum AVG threshold over the window"),
+    games: int = Query(3, ge=1, description="Window size in games"),
+    require_hit_each: int = Query(1, ge=0, le=1, description="1 requires ≥1 hit in each game"),
+    debug: int = Query(0, ge=0, le=1, description="Include debug block"),
+):
+    the_date = parse_date(date)
+    return safe_call(
+        provider, "hot_streak_hitters",
+        date=the_date,
+        min_avg=min_avg,
+        games=games,
+        require_hit_each=bool(require_hit_each),
+        debug=bool(debug),
     )
 
-# =========================
-# Local / Render entrypoint
-# =========================
+@app.get("/cold_streak_hitters", operation_id="cold_streak_hitters")
+def cold_streak_hitters(
+    date: Optional[str] = Query(None),
+    min_avg: float = Query(0.275, description="Minimum seasonal AVG to consider (filters only ‘capable’ hitters)"),
+    games: int = Query(2, ge=1, description="Window size in games"),
+    require_zero_hit_each: int = Query(1, ge=0, le=1, description="1 requires 0 hits in each game"),
+    debug: int = Query(0, ge=0, le=1),
+):
+    the_date = parse_date(date)
+    return safe_call(
+        provider, "cold_streak_hitters",
+        date=the_date,
+        min_avg=min_avg,
+        games=games,
+        require_zero_hit_each=bool(require_zero_hit_each),
+        debug=bool(debug),
+    )
+
+@app.get("/pitcher_streaks", operation_id="pitcher_streaks")
+def pitcher_streaks(
+    date: Optional[str] = Query(None),
+    hot_max_era: float = Query(4.00, description="Hot: ERA ≤ this over last N starts"),
+    hot_min_ks_each: int = Query(6, ge=0, description="Hot: Ks in each of last N starts"),
+    hot_last_starts: int = Query(3, ge=1, description="Hot: count of recent starts"),
+    cold_min_era: float = Query(4.60, description="Cold: ERA ≥ this over last N starts"),
+    cold_min_runs_each: int = Query(3, ge=0, description="Cold: runs allowed in each of last N starts"),
+    cold_last_starts: int = Query(2, ge=1, description="Cold: count of recent starts"),
+    debug: int = Query(0, ge=0, le=1),
+):
+    the_date = parse_date(date)
+    return safe_call(
+        provider, "pitcher_streaks",
+        date=the_date,
+        hot_max_era=hot_max_era,
+        hot_min_ks_each=hot_min_ks_each,
+        hot_last_starts=hot_last_starts,
+        cold_min_era=cold_min_era,
+        cold_min_runs_each=cold_min_runs_each,
+        cold_last_starts=cold_last_starts,
+        debug=bool(debug),
+    )
+
+@app.get("/cold_pitchers", operation_id="cold_pitchers")
+def cold_pitchers(
+    date: Optional[str] = Query(None),
+    min_era: float = Query(4.60),
+    min_runs_each: int = Query(3, ge=0),
+    last_starts: int = Query(2, ge=1),
+    debug: int = Query(0, ge=0, le=1),
+):
+    the_date = parse_date(date)
+    return safe_call(
+        provider, "cold_pitchers",
+        date=the_date,
+        min_era=min_era,
+        min_runs_each=min_runs_each,
+        last_starts=last_starts,
+        debug=bool(debug),
+    )
+
+@app.get("/slate_scan", response_model=SlateScanResp, operation_id="slate_scan")
+def slate_scan(
+    date: Optional[str] = Query(None),
+    debug: int = Query(0, ge=0, le=1, description="Set to 1 for provider debug echo"),
+):
+    the_date = parse_date(date)
+    resp = safe_call(provider, "slate_scan", date=the_date, debug=bool(debug))
+    # Ensure structure is consistent even if provider returns partials
+    out = {
+        "hot_hitters": resp.get("hot_hitters", []),
+        "cold_hitters": resp.get("cold_hitters", []),
+        "hot_pitchers": resp.get("hot_pitchers", []),
+        "cold_pitchers": resp.get("cold_pitchers", []),
+        "matchups": resp.get("matchups", []),
+    }
+    if debug == 1:
+        out["debug"] = resp.get("debug", {"note": "No debug payload from provider"})
+    return out
+
+# ------------
+# Local dev
+# ------------
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=True)
