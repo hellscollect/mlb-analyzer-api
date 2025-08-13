@@ -1,4 +1,3 @@
-flask
-requests
-backports.zoneinfo; python_version < "3.9"
-gunicorn
+fastapi==0.115.0
+uvicorn==0.30.1
+pydantic==2.8.2
