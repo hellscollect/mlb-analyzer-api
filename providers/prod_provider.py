@@ -2,7 +2,7 @@
 from __future__ import annotations
 from datetime import date as _date
 from typing import Dict, List, Any, Iterable, Optional
-from main import Hitter, Pitcher
+from models import Hitter, Pitcher  # ⟵ moved here to avoid circular import
 
 class ProdProvider:
     """
