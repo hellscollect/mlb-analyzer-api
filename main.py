@@ -18,7 +18,7 @@ APP_NAME = "MLB Analyzer API"
 
 app = FastAPI(
     title=APP_NAME,
-    version="1.0.6",
+    version="1.0.7",
     description="Custom GPT + API for MLB streak analysis",
 )
 
@@ -181,6 +181,12 @@ class DateOnlyReq(BaseModel):
     date: Optional[str] = None
     debug: int = 0
 
+class SlateScanReq(BaseModel):
+    date: Optional[str] = None
+    max_teams: int = 16
+    per_team: int = 8
+    debug: int = 1
+
 # Lightweight smoke test
 class SmokeReq(BaseModel):
     date: Optional[str] = None
@@ -306,10 +312,12 @@ def cold_pitchers(
 @app.get("/slate_scan", response_model=SlateScanResp, operation_id="slate_scan")
 def slate_scan(
     date: Optional[str] = Query(None),
+    max_teams: int = Query(16, ge=2, le=30),
+    per_team: int = Query(8, ge=1, le=15),
     debug: int = Query(0, ge=0, le=1),
 ):
     the_date = parse_date(date)
-    resp = safe_call(provider, "slate_scan", date=the_date, debug=bool(debug))
+    resp = safe_call(provider, "slate_scan", date=the_date, max_teams=max_teams, per_team=per_team, debug=bool(debug))
     out = {
         "hot_hitters": resp.get("hot_hitters", []),
         "cold_hitters": resp.get("cold_hitters", []),
@@ -379,9 +387,10 @@ def cold_pitchers_post(body: ColdPitchersReq):
         last_starts=body.last_starts, debug=bool(body.debug))
 
 @app.post("/slate_scan_post", response_model=SlateScanResp, operation_id="slate_scan_post")
-def slate_scan_post(body: DateOnlyReq):
+def slate_scan_post(body: SlateScanReq):
     the_date = parse_date(body.date)
-    resp = safe_call(provider, "slate_scan", date=the_date, debug=bool(body.debug))
+    resp = safe_call(provider, "slate_scan",
+        date=the_date, max_teams=body.max_teams, per_team=body.per_team, debug=bool(body.debug))
     out = {
         "hot_hitters": resp.get("hot_hitters", []),
         "cold_hitters": resp.get("cold_hitters", []),
