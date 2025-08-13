@@ -4,6 +4,10 @@ import os
 from datetime import date as _date
 from typing import Dict, List, Any, Iterable, Optional, Tuple
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 from models import Hitter, Pitcher
 
 # ----- tiny helpers -----
@@ -33,23 +37,42 @@ class StatsApiProvider:
     """
     Provider backed by MLB's public StatsAPI (no auth).
     Env (optional):
-      STATSAPI_BASE = https://statsapi.mlb.com/api/v1    (default)
-      STATSAPI_SEASON = 2025                             (defaults to date.year)
-      STATSAPI_HITTERS_PER_TEAM = 3                      (# of position players sampled per team)
-      STATSAPI_TIMEOUT = 10
-      STATSAPI_GAME_TYPE = R                             (regular season)
+      STATSAPI_BASE = https://statsapi.mlb.com/api/v1         (default)
+      STATSAPI_SEASON = 2025                                  (defaults to date.year)
+      STATSAPI_HITTERS_PER_TEAM = 3                           (how many hitters sampled per team)
+      STATSAPI_TIMEOUT = 6                                    (seconds per upstream call)
+      STATSAPI_MAX_WORKERS = 10                               (concurrent calls cap)
+      STATSAPI_GAME_TYPE = R                                  (regular season)
+      STATSAPI_GAME_LOG_N = 5                                 (how many recent games to read)
     """
 
     def __init__(self):
         self.base = (os.getenv("STATSAPI_BASE") or "https://statsapi.mlb.com/api/v1").rstrip("/")
         self.season_override = os.getenv("STATSAPI_SEASON")
         self.hitters_per_team = int(os.getenv("STATSAPI_HITTERS_PER_TEAM", "3"))
-        self.timeout = float(os.getenv("STATSAPI_TIMEOUT", "10"))
+        self.timeout = float(os.getenv("STATSAPI_TIMEOUT", "6"))
+        self.max_workers = int(os.getenv("STATSAPI_MAX_WORKERS", "10"))
         self.game_type = os.getenv("STATSAPI_GAME_TYPE", "R")
-        self.key = ""  # for /provider_raw debug parity
+        self.game_log_n = int(os.getenv("STATSAPI_GAME_LOG_N", "5"))
+        self.key = ""  # parity with /provider_raw debug
 
         self._session = requests.Session()
         self._session.headers.update({"User-Agent": "mlb-analyzer/1.0"})
+        retry = Retry(
+            total=3,
+            read=3,
+            connect=3,
+            backoff_factor=0.3,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["GET"],
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(max_retries=retry, pool_connections=100, pool_maxsize=100)
+        self._session.mount("https://", adapter)
+        self._session.mount("http://", adapter)
+
+        # simple in-process caches for names to avoid extra calls on same id
+        self._name_cache: Dict[int, str] = {}
 
     # ---------- Public methods used by main.py ----------
     def hot_streak_hitters(self, date: _date, min_avg: float = 0.280, games: int = 3,
@@ -112,6 +135,7 @@ class StatsApiProvider:
         return {"items": out, "meta": {"count": len(out), "min_era": min_era, "min_runs_each": min_runs_each, "last_starts": last_starts}} if debug else out
 
     def slate_scan(self, date: _date, debug: bool = False):
+        # fan-out occurs in get_hitters/get_pitchers, which are now concurrent + retried
         hot_hitters = self.hot_streak_hitters(date, debug=False)
         cold_hitters = self.cold_streak_hitters(date, debug=False)
         streaks = self.pitcher_streaks(date, debug=False)
@@ -160,16 +184,11 @@ class StatsApiProvider:
             print(f"[statsapi] GET {url} params={params} -> {type(e).__name__}: {e}")
             return {}
 
-    # ---------- Raw fetches (StatsAPI) ----------
     def _fetch_schedule(self, game_date: _date) -> Dict[str, Any]:
         return self._get("/schedule", {"sportId": 1, "date": game_date.isoformat(), "hydrate": "probablePitcher"})
 
     def _person_stats(self, pid: int, group: str, season: int) -> Dict[str, Any]:
-        """
-        Use the dedicated /people/{id}/stats endpoint to avoid hydrate quirks.
-        Example:
-          /people/545361/stats?stats=gameLog,season&group=hitting&season=2025&gameType=R
-        """
+        # Dedicated stats endpoint avoids hydrate pitfalls
         params = {
             "stats": "gameLog,season",
             "group": group,
@@ -178,6 +197,99 @@ class StatsApiProvider:
         }
         return self._get(f"/people/{pid}/stats", params)
 
+    def _person_name(self, pid: int) -> str:
+        if pid in self._name_cache:
+            return self._name_cache[pid]
+        data = self._get(f"/people/{pid}", {})
+        name = (data.get("people") or [{}])[0].get("fullName") or str(pid)
+        self._name_cache[pid] = name
+        return name
+
+    # ------------- concurrent row builders -------------
+    def _build_pitcher_row(self, pid: int, tcode: str, opp_code: str, season: int) -> Optional[Dict[str, Any]]:
+        try:
+            pdata = self._person_stats(pid, "pitching", season)
+            name = (pdata.get("people") or [{}])[0].get("fullName") or self._person_name(pid)
+
+            era = None
+            ks_seq: List[int] = []
+            ra_seq: List[int] = []
+            for block in pdata.get("stats", []):
+                stype = (block.get("type") or {}).get("displayName", "").lower()
+                group = (block.get("group") or {}).get("displayName", "").lower()
+                if group != "pitching":
+                    continue
+                splits = block.get("splits") or []
+                if stype == "season":
+                    if splits:
+                        era = _safe_float((splits[0].get("stat") or {}).get("era"))
+                elif stype == "gamelog":
+                    for sp in splits[: self.game_log_n]:
+                        stat = sp.get("stat", {})
+                        ks_seq.append(int(stat.get("strikeOuts", 0)))
+                        ra_seq.append(int(stat.get("earnedRuns", 0)))
+
+            return {
+                "player_id": str(pid),
+                "name": name,
+                "team": tcode,
+                "opponent_team": opp_code,
+                "era": era if era is not None else 0.0,
+                "kbb": None,
+                "k_per_start_last_n": ks_seq,
+                "runs_allowed_last_n": ra_seq,
+                "is_probable": True,
+            }
+        except Exception as e:
+            print(f"[statsapi] pitcher row build {pid} -> {type(e).__name__}: {e}")
+            return None
+
+    def _build_hitter_row(self, pid: int, tcode: str, opp_code: str, opp_prob_pid: Optional[int], season: int) -> Optional[Dict[str, Any]]:
+        try:
+            hdata = self._person_stats(pid, "hitting", season)
+            name = (hdata.get("people") or [{}])[0].get("fullName") or self._person_name(pid)
+
+            avg = None
+            hits_each: List[int] = []
+            hitless_streak = 0
+            for block in hdata.get("stats", []):
+                stype = (block.get("type") or {}).get("displayName", "").lower()
+                group = (block.get("group") or {}).get("displayName", "").lower()
+                if group != "hitting":
+                    continue
+                splits = block.get("splits") or []
+                if stype == "season":
+                    if splits:
+                        avg = _safe_float((splits[0].get("stat") or {}).get("avg"))
+                elif stype == "gamelog":
+                    for sp in splits[: self.game_log_n]:
+                        stat = sp.get("stat", {})
+                        hits = int(stat.get("hits", 0))
+                        hits_each.append(hits)
+                    for h in hits_each:
+                        if h == 0:
+                            hitless_streak += 1
+                        else:
+                            break
+
+            return {
+                "player_id": str(pid),
+                "name": name,
+                "team": tcode,
+                "opponent_team": opp_code,
+                "probable_pitcher_id": str(opp_prob_pid) if opp_prob_pid else None,
+                "avg": avg if avg is not None else 0.0,
+                "obp": None,
+                "slg": None,
+                "last_n_games": len(hits_each),
+                "last_n_hits_each_game": hits_each,
+                "last_n_hitless_games": hitless_streak,
+            }
+        except Exception as e:
+            print(f"[statsapi] hitter row build {pid} -> {type(e).__name__}: {e}")
+            return None
+
+    # ---------- Raw fetches (StatsAPI) ----------
     def _fetch_pitcher_rows(self, game_date: _date, limit: Optional[int] = None, team: Optional[str] = None) -> Iterable[Dict[str, Any]]:
         season = self._season_of(game_date)
         sched = self._fetch_schedule(game_date)
@@ -198,46 +310,12 @@ class StatsApiProvider:
             entries = entries[:limit]
 
         rows: List[Dict[str, Any]] = []
-        for pid, tcode, opp in entries:
-            pdata = self._person_stats(pid, "pitching", season)
-            # parse name
-            name = str(pid)
-            # Some responses include people array with person name in "note", but with /stats it’s nested differently.
-            # Fallback: we can fetch /people/{pid} if name missing, but usually splits include player name.
-            try:
-                name = pdata.get("people", [{}])[0].get("fullName") or name
-            except Exception:
-                pass
-
-            era = None
-            ks_seq: List[int] = []
-            ra_seq: List[int] = []
-            for block in pdata.get("stats", []):
-                stype = (block.get("type") or {}).get("displayName", "").lower()
-                group = (block.get("group") or {}).get("displayName", "").lower()
-                if group != "pitching":
-                    continue
-                splits = block.get("splits") or []
-                if stype == "season":
-                    if splits:
-                        era = _safe_float((splits[0].get("stat") or {}).get("era"))
-                elif stype == "gamelog":
-                    for sp in splits[:5]:
-                        stat = sp.get("stat", {})
-                        ks_seq.append(int(stat.get("strikeOuts", 0)))
-                        ra_seq.append(int(stat.get("earnedRuns", 0)))
-
-            rows.append({
-                "player_id": str(pid),
-                "name": name,
-                "team": tcode,
-                "opponent_team": opp,
-                "era": era if era is not None else 0.0,
-                "kbb": None,
-                "k_per_start_last_n": ks_seq,
-                "runs_allowed_last_n": ra_seq,
-                "is_probable": True,
-            })
+        with ThreadPoolExecutor(max_workers=self.max_workers) as ex:
+            futs = [ex.submit(self._build_pitcher_row, pid, tcode, opp, season) for pid, tcode, opp in entries]
+            for fut in as_completed(futs):
+                row = fut.result()
+                if row:
+                    rows.append(row)
         return rows
 
     def _fetch_hitter_rows(self, game_date: _date, limit: Optional[int] = None, team: Optional[str] = None) -> Iterable[Dict[str, Any]]:
@@ -274,7 +352,8 @@ class StatsApiProvider:
                 if home_id and (not team or team == home_code):
                     teams.append((int(home_id), home_code, away_code))
 
-        rows: List[Dict[str, Any]] = []
+        # Gather hitter player IDs to fetch (skip pitchers)
+        tasks: List[Tuple[int, str, str, Optional[int]]] = []
         for tid, tcode, opp_code in teams:
             roster = self._get(f"/teams/{tid}/roster", {"rosterType": "active", "season": season}).get("roster") or []
             picked = 0
@@ -288,59 +367,18 @@ class StatsApiProvider:
                 pid = person.get("id")
                 if not pid:
                     continue
-
-                hdata = self._person_stats(pid, "hitting", season)
-                # try to get name
-                name = str(pid)
-                try:
-                    name = hdata.get("people", [{}])[0].get("fullName") or name
-                except Exception:
-                    pass
-
-                avg = None
-                hits_each: List[int] = []
-                hitless_streak = 0
-                for block in hdata.get("stats", []):
-                    stype = (block.get("type") or {}).get("displayName", "").lower()
-                    group = (block.get("group") or {}).get("displayName", "").lower()
-                    if group != "hitting":
-                        continue
-                    splits = block.get("splits") or []
-                    if stype == "season":
-                        if splits:
-                            avg = _safe_float((splits[0].get("stat") or {}).get("avg"))
-                    elif stype == "gamelog":
-                        for sp in splits[:5]:
-                            stat = sp.get("stat", {})
-                            hits = int(stat.get("hits", 0))
-                            hits_each.append(hits)
-                        # leading-zero run = hitless streak
-                        for h in hits_each:
-                            if h == 0:
-                                hitless_streak += 1
-                            else:
-                                break
-
-                rows.append({
-                    "player_id": str(pid),
-                    "name": name,
-                    "team": tcode,
-                    "opponent_team": opp_code,
-                    "probable_pitcher_id": str(opp_prob_by_team.get(tcode)) if opp_prob_by_team.get(tcode) else None,
-                    "avg": avg if avg is not None else 0.0,
-                    "obp": None,
-                    "slg": None,
-                    "last_n_games": len(hits_each),
-                    "last_n_hits_each_game": hits_each,
-                    "last_n_hitless_games": hitless_streak,
-                })
+                tasks.append((int(pid), tcode, opp_code, opp_prob_by_team.get(tcode)))
                 picked += 1
-
-            if limit and len(rows) >= limit:
+            if limit and len(tasks) >= limit:
                 break
 
-        if limit:
-            rows = rows[:limit]
+        rows: List[Dict[str, Any]] = []
+        with ThreadPoolExecutor(max_workers=self.max_workers) as ex:
+            futs = [ex.submit(self._build_hitter_row, pid, tcode, opp, opp_pid, season) for pid, tcode, opp, opp_pid in tasks[: (limit or len(tasks))]]
+            for fut in as_completed(futs):
+                row = fut.result()
+                if row:
+                    rows.append(row)
         return rows
 
     # ---------- Map to Pydantic ----------
