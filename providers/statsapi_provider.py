@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import sys
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from datetime import date as date_cls
 
 import httpx
@@ -62,7 +62,7 @@ class StatsApiProvider:
             r.raise_for_status()
             return r.json()
 
-    # -------- core fetches --------
+    # -------- schedule & roster --------
     def _teams_playing_on(self, d: date_cls) -> List[Dict[str, Any]]:
         """
         Read teams from game['teams']['home']['team'] / ['away']['team'].
@@ -118,7 +118,76 @@ class StatsApiProvider:
         splits = stats[0].get("splits") or []
         return (splits[0].get("stat") if splits else {}) or {}
 
-    # -------- rows for provider_raw --------
+    # -------- helpers to bound work --------
+    def _sampled_roster_rows(
+        self,
+        *,
+        date: date_cls,
+        max_teams: int,
+        per_team: int
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """
+        Returns (hitter_rows, pitcher_rows) bounded by `max_teams` and `per_team` each.
+        """
+        year = date.year
+        hitters_rows: List[Dict[str, Any]] = []
+        pitchers_rows: List[Dict[str, Any]] = []
+
+        teams = self._teams_playing_on(date)[:max_teams]
+        for t in teams:
+            roster = self._team_roster(t["id"])
+
+            hitters = [r for r in roster if ((r.get("position") or {}).get("abbreviation")) != "P"][:per_team]
+            pitchers = [r for r in roster if ((r.get("position") or {}).get("abbreviation")) == "P"][:per_team]
+
+            for r in hitters:
+                p = r.get("person") or {}
+                pid = p.get("id")
+                pname = p.get("fullName")
+                if not pid:
+                    continue
+                try:
+                    stat = self._player_season_stats(pid, year, "hitting")
+                except Exception as e:
+                    self._log("hitting stat error:", e)
+                    stat = {}
+                hitters_rows.append({
+                    "player_id": pid,
+                    "player_name": pname,
+                    "team_id": t["id"],
+                    "team_name": t["name"],
+                    "avg": _safe_float(stat.get("avg")),
+                    "ops": _safe_float(stat.get("ops")),
+                    "hr": _safe_int(stat.get("homeRuns")),
+                    "rbi": _safe_int(stat.get("rbi")),
+                    "gamesPlayed": _safe_int(stat.get("gamesPlayed")),
+                })
+
+            for r in pitchers:
+                p = r.get("person") or {}
+                pid = p.get("id")
+                pname = p.get("fullName")
+                if not pid:
+                    continue
+                try:
+                    stat = self._player_season_stats(pid, year, "pitching")
+                except Exception as e:
+                    self._log("pitching stat error:", e)
+                    stat = {}
+                pitchers_rows.append({
+                    "player_id": pid,
+                    "player_name": pname,
+                    "team_id": t["id"],
+                    "team_name": t["name"],
+                    "era": _safe_float(stat.get("era")),
+                    "so": _safe_int(stat.get("strikeOuts")),
+                    "whip": _safe_float(stat.get("whip")),
+                    "gamesStarted": _safe_int(stat.get("gamesStarted")),
+                })
+
+        return hitters_rows, pitchers_rows
+
+    # -------- rows for provider_raw (unbounded legacy) --------
     def _fetch_hitter_rows(self, date: date_cls, limit: Optional[int] = None, team: Optional[str] = None) -> List[Dict[str, Any]]:
         year = date.year
         rows: List[Dict[str, Any]] = []
@@ -230,34 +299,47 @@ class StatsApiProvider:
                             "last_schedule_status": self._last_schedule_status, "error": self._last_error}
         return out
 
-    def slate_scan(self, *, date: date_cls, debug: bool) -> Dict[str, Any]:
-        hot_hitters = self.hot_streak_hitters(date=date, min_avg=0.300, games=3, require_hit_each=True, debug=False)["items"]
-        cold_hitters = self.cold_streak_hitters(date=date, min_avg=0.220, games=2, require_zero_hit_each=True, debug=False)["items"]
-        ps = self.pitcher_streaks(date=date, hot_max_era=3.50, hot_min_ks_each=6, hot_last_starts=3,
-                                  cold_min_era=4.60, cold_min_runs_each=3, cold_last_starts=2, debug=False)
-        hot_pitchers = ps["hot"]
-        cold_pitchers = ps["cold"]
+    def slate_scan(self, *, date: date_cls, max_teams: int = 16, per_team: int = 8, debug: bool = False) -> Dict[str, Any]:
+        """
+        BOUNDED full-slate scan: caps team count and players per team to avoid timeouts and huge payloads.
+        """
+        per_team = max(1, min(15, per_team))
+        max_teams = max(2, min(30, max_teams))
+
+        hitters_rows, pitchers_rows = self._sampled_roster_rows(date=date, max_teams=max_teams, per_team=per_team)
+
+        # Simple heuristics (season-based stand-ins for "streaks")
+        hot_hitters = [h for h in hitters_rows if (h.get("avg") or 0.0) >= 0.300]
+        cold_hitters = [h for h in hitters_rows if (h.get("avg") or 1.0) < 0.220]
+
+        hot_pitchers = [p for p in pitchers_rows if (p.get("era") or 99.9) <= 3.50]
+        cold_pitchers = [p for p in pitchers_rows if (p.get("era") or 0.0) >= 4.60]
+
         out: Dict[str, Any] = {
             "hot_hitters": hot_hitters,
             "cold_hitters": cold_hitters,
             "hot_pitchers": hot_pitchers,
             "cold_pitchers": cold_pitchers,
-            "matchups": [],  # expand later if you want
+            "matchups": [],  # expand if desired later
         }
         if debug:
-            out["debug"] = {"source": "statsapi", "base": self.base,
-                            "last_schedule_status": self._last_schedule_status, "error": self._last_error}
+            out["debug"] = {
+                "source": "statsapi",
+                "base": self.base,
+                "last_schedule_status": self._last_schedule_status,
+                "error": self._last_error,
+                "limits": {"max_teams": max_teams, "per_team": per_team},
+                "counts": {
+                    "hitters_rows": len(hitters_rows),
+                    "pitchers_rows": len(pitchers_rows),
+                }
+            }
         return out
 
     # -------- ultra-light summary for GPT tests --------
     def light_slate(self, *, date: date_cls, max_teams: int = 6, per_team: int = 2, debug: bool = True) -> Dict[str, Any]:
         """
-        Fast, bounded calls:
-          - take up to `max_teams` from the day's schedule
-          - for each team, fetch roster once
-          - pick up to `per_team` hitters and `per_team` pitchers
-          - fetch each selected player's season stat once
-        Returns small counts & name samples to avoid payload/timeouts.
+        Fast, bounded calls returning just name samples.
         """
         per_team = max(1, min(5, per_team))
         max_teams = max(1, min(10, max_teams))
@@ -273,7 +355,6 @@ class StatsApiProvider:
         try:
             for t in teams:
                 roster = self._team_roster(t["id"])
-                # Split hitters vs pitchers from roster
                 hitters = [r for r in roster if ((r.get("position") or {}).get("abbreviation")) != "P"]
                 pitchers = [r for r in roster if ((r.get("position") or {}).get("abbreviation")) == "P"]
 
@@ -282,7 +363,6 @@ class StatsApiProvider:
                     pid = p.get("id")
                     pname = p.get("fullName") or "Unknown"
                     if pid:
-                        # one quick stat call (safe if it fails)
                         try:
                             _ = self._player_season_stats(pid, year, "hitting")
                         except Exception as e:
