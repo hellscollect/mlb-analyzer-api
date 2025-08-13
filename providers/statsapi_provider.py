@@ -192,8 +192,8 @@ class StatsApiProvider:
 
         rows: List[Dict[str, Any]] = []
         for pid, tcode, opp in entries:
-            # IMPORTANT: include gameType=[R] and sportId=1 so game logs populate
-            hydrate = f"stats(group=pitching,type=season,gameLog,season={season},gameType=[{self.game_type}],sportId=1)"
+            # ✅ Correct hydrate: use stats=..., not type=...
+            hydrate = f"stats(group=pitching,stats=season,gameLog,season={season},gameType=[{self.game_type}])"
             data = self._get(f"/people/{pid}", {"hydrate": hydrate})
             ppl = (data.get("people") or [])
             if not ppl: continue
@@ -259,7 +259,8 @@ class StatsApiProvider:
                 pid = person.get("id")
                 if not pid: continue
 
-                hydrate = f"stats(group=hitting,type=season,gameLog,season={season},gameType=[{self.game_type}],sportId=1)"
+                # ✅ Correct hydrate: stats=..., not type=...
+                hydrate = f"stats(group=hitting,stats=season,gameLog,season={season},gameType=[{self.game_type}])"
                 pdata = self._get(f"/people/{pid}", {"hydrate": hydrate})
                 ppl = (pdata.get("people") or [])
                 if not ppl: continue
