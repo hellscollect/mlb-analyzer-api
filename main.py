@@ -13,7 +13,7 @@ APP_NAME = "MLB Analyzer API"
 
 app = FastAPI(
     title=APP_NAME,
-    version="1.0.2",
+    version="1.0.3",
     description="Custom GPT + API for MLB streak analysis",
 )
 
@@ -93,30 +93,21 @@ def _smart_call_fetch(method_name: str, the_date: date_cls, limit: Optional[int]
     sig = inspect.signature(fn)
     params = sig.parameters
 
-    # Build kwargs based on what the function actually accepts
     kwargs = {}
-    date_param_name = None
-    if "date" in params:
-        date_param_name = "date"
-    elif "game_date" in params:
-        date_param_name = "game_date"
-
+    date_param_name = "date" if "date" in params else ("game_date" if "game_date" in params else None)
     if date_param_name:
         kwargs[date_param_name] = the_date
-
     if "limit" in params and limit is not None:
         kwargs["limit"] = limit
     if "team" in params and team is not None:
         kwargs["team"] = team
 
     try:
-        if date_param_name or (not params):  # has a named date param or no params
+        if date_param_name or (not params):
             return fn(**kwargs)
         else:
-            # No named date parameter; try positional first arg as date
             return fn(the_date, **kwargs)
     except TypeError:
-        # Final fallback attempts
         try:
             return fn(the_date)
         except Exception as e:
@@ -163,7 +154,7 @@ def health(tz: str = Query("America/New_York", description="IANA timezone for ti
     )
 
 # ------------------
-# NEW: Raw provider rows endpoint
+# Raw provider rows endpoint (with richer debug)
 # ------------------
 @app.get(
     "/provider_raw",
@@ -190,11 +181,19 @@ def provider_raw(
         "pitchers_raw": pitchers,
     }
     if debug == 1:
+        # Safely expose provider config without secrets
+        provider_base = getattr(provider, "base", None)
+        provider_key_present = bool(getattr(provider, "key", "") or os.getenv("DATA_API_KEY"))
         out["debug"] = {
             "notes": "Called provider private fetches with signature-aware kwargs.",
             "hitter_fetch_params": list(inspect.signature(getattr(provider, "_fetch_hitter_rows")).parameters.keys()) if hasattr(provider, "_fetch_hitter_rows") else None,
             "pitcher_fetch_params": list(inspect.signature(getattr(provider, "_fetch_pitcher_rows")).parameters.keys()) if hasattr(provider, "_fetch_pitcher_rows") else None,
-            "requested_args": {"date": the_date.isoformat(), "limit": limit, "team": team}
+            "requested_args": {"date": the_date.isoformat(), "limit": limit, "team": team},
+            "provider_config": {
+                "fake_mode": os.getenv("PROD_USE_FAKE", "0") in ("1", "true", "True", "YES", "yes"),
+                "data_api_base": provider_base or "(unset)",
+                "has_api_key": provider_key_present,
+            }
         }
     return out
 
