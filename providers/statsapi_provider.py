@@ -39,14 +39,12 @@ class StatsApiProvider:
         self._last_schedule_status: Optional[int] = None
         self._last_error: Optional[str] = None
 
-    # ------------- logging -------------
-
+    # -------- logging --------
     def _log(self, *args: Any) -> None:
         if self._debug:
             print("[StatsApiProvider]", *args, file=sys.stderr)
 
-    # ------------- HTTP helper -------------
-
+    # -------- HTTP helper --------
     def _get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         url = f"{self.base}{path}"
         headers = {}
@@ -63,9 +61,11 @@ class StatsApiProvider:
             r.raise_for_status()
             return r.json()
 
-    # ------------- core fetches -------------
-
+    # -------- core fetches --------
     def _teams_playing_on(self, d: date_cls) -> List[Dict[str, Any]]:
+        """
+        FIXED: read teams from game['teams']['home']['team'] / ['away']['team'].
+        """
         try:
             sch = self._get("/api/v1/schedule", {"date": d.isoformat(), "sportId": 1})
         except httpx.HTTPError as e:
@@ -83,10 +83,13 @@ class StatsApiProvider:
 
         teams: List[Dict[str, Any]] = []
         for g in games:
-            for side in ("home", "away"):
-                t = g.get(f"{side}Team") or {}
-                if t:
-                    teams.append({"id": t.get("id"), "name": t.get("name")})
+            teams_node = g.get("teams") or {}
+            home_team = ((teams_node.get("home") or {}).get("team")) or {}
+            away_team = ((teams_node.get("away") or {}).get("team")) or {}
+            if home_team:
+                teams.append({"id": home_team.get("id"), "name": home_team.get("name")})
+            if away_team:
+                teams.append({"id": away_team.get("id"), "name": away_team.get("name")})
 
         uniq: Dict[int, Dict[str, Any]] = {}
         for t in teams:
@@ -114,8 +117,7 @@ class StatsApiProvider:
         splits = stats[0].get("splits") or []
         return (splits[0].get("stat") if splits else {}) or {}
 
-    # ------------- rows for provider_raw -------------
-
+    # -------- rows for provider_raw --------
     def _fetch_hitter_rows(self, date: date_cls, limit: Optional[int] = None, team: Optional[str] = None) -> List[Dict[str, Any]]:
         year = date.year
         rows: List[Dict[str, Any]] = []
@@ -157,7 +159,7 @@ class StatsApiProvider:
         for t in self._teams_playing_on(date):
             if team and team.lower() not in (t.get("name") or "").lower():
                 continue
-            roster = self._team_roster(t["id"])   # <-- fixed (was __team_roster)
+            roster = self._team_roster(t["id"])
             for r in roster:
                 p = r.get("person") or {}
                 pid = p.get("id")
@@ -188,18 +190,14 @@ class StatsApiProvider:
         self._log("total pitcher rows:", len(rows))
         return rows
 
-    # ------------- public endpoints (simple heuristics) -------------
-
+    # -------- public endpoints (simple heuristics) --------
     def hot_streak_hitters(self, *, date: date_cls, min_avg: float, games: int, require_hit_each: bool, debug: bool) -> Dict[str, Any]:
         hitters = self._fetch_hitter_rows(date, limit=None, team=None)
         hot = [h for h in hitters if (h.get("avg") or 0.0) >= float(min_avg)]
         out: Dict[str, Any] = {"items": hot}
         if debug:
-            out["debug"] = {
-                "note": "Heuristic = season AVG >= min_avg",
-                "last_schedule_status": self._last_schedule_status,
-                "error": self._last_error,
-            }
+            out["debug"] = {"note": "Heuristic = season AVG >= min_avg",
+                            "last_schedule_status": self._last_schedule_status, "error": self._last_error}
         return out
 
     def cold_streak_hitters(self, *, date: date_cls, min_avg: float, games: int, require_zero_hit_each: bool, debug: bool) -> Dict[str, Any]:
@@ -207,11 +205,8 @@ class StatsApiProvider:
         cold = [h for h in hitters if (h.get("avg") or 1.0) < float(min_avg)]
         out: Dict[str, Any] = {"items": cold}
         if debug:
-            out["debug"] = {
-                "note": "Heuristic = season AVG < min_avg",
-                "last_schedule_status": self._last_schedule_status,
-                "error": self._last_error,
-            }
+            out["debug"] = {"note": "Heuristic = season AVG < min_avg",
+                            "last_schedule_status": self._last_schedule_status, "error": self._last_error}
         return out
 
     def pitcher_streaks(self, *, date: date_cls, hot_max_era: float, hot_min_ks_each: int, hot_last_starts: int,
@@ -221,11 +216,8 @@ class StatsApiProvider:
         cold = [p for p in pitchers if (p.get("era") or 0.0) >= float(cold_min_era)]
         out: Dict[str, Any] = {"hot": hot, "cold": cold}
         if debug:
-            out["debug"] = {
-                "note": "Heuristic = hot ERA ≤ hot_max_era; cold ERA ≥ cold_min_era",
-                "last_schedule_status": self._last_schedule_status,
-                "error": self._last_error,
-            }
+            out["debug"] = {"note": "Heuristic = hot ERA ≤ hot_max_era; cold ERA ≥ cold_min_era",
+                            "last_schedule_status": self._last_schedule_status, "error": self._last_error}
         return out
 
     def cold_pitchers(self, *, date: date_cls, min_era: float, min_runs_each: int, last_starts: int, debug: bool) -> Dict[str, Any]:
@@ -233,11 +225,8 @@ class StatsApiProvider:
         cold = [p for p in pitchers if (p.get("era") or 0.0) >= float(min_era)]
         out: Dict[str, Any] = {"items": cold}
         if debug:
-            out["debug"] = {
-                "note": "Heuristic = season ERA ≥ min_era",
-                "last_schedule_status": self._last_schedule_status,
-                "error": self._last_error,
-            }
+            out["debug"] = {"note": "Heuristic = season ERA ≥ min_era",
+                            "last_schedule_status": self._last_schedule_status, "error": self._last_error}
         return out
 
     def slate_scan(self, *, date: date_cls, debug: bool) -> Dict[str, Any]:
@@ -247,49 +236,41 @@ class StatsApiProvider:
                                   cold_min_era=4.60, cold_min_runs_each=3, cold_last_starts=2, debug=False)
         hot_pitchers = ps["hot"]
         cold_pitchers = ps["cold"]
-
         out: Dict[str, Any] = {
             "hot_hitters": hot_hitters,
             "cold_hitters": cold_hitters,
             "hot_pitchers": hot_pitchers,
             "cold_pitchers": cold_pitchers,
-            "matchups": [],
+            "matchups": [],  # expand later if you want
         }
         if debug:
-            out["debug"] = {
-                "source": "statsapi",
-                "base": self.base,
-                "last_schedule_status": self._last_schedule_status,
-                "error": self._last_error,
-            }
+            out["debug"] = {"source": "statsapi", "base": self.base,
+                            "last_schedule_status": self._last_schedule_status, "error": self._last_error}
         return out
 
-    # ------------- diagnostics -------------
-
+    # -------- diagnostics --------
     def debug_schedule(self, *, date: date_cls) -> Dict[str, Any]:
-        """
-        Return the raw schedule payload & quick counts so we can see what MLB sent.
-        """
         payload = self._get("/api/v1/schedule", {"date": date.isoformat(), "sportId": 1})
         dates = payload.get("dates") or []
         games = []
         for dblock in dates:
             games.extend(dblock.get("games", []) or [])
+        teams_sample = []
+        for g in games[:5]:
+            teams_node = g.get("teams") or {}
+            home = ((teams_node.get("home") or {}).get("team") or {}).get("name")
+            away = ((teams_node.get("away") or {}).get("team") or {}).get("name")
+            teams_sample.append({"home": home, "away": away})
         return {
             "status": self._last_schedule_status,
             "date": date.isoformat(),
             "games_count": len(games),
-            "teams_sample": [
-                {
-                    "home": (g.get("homeTeam") or {}).get("name"),
-                    "away": (g.get("awayTeam") or {}).get("name"),
-                } for g in games[:5]
-            ],
-            "raw": payload
+            "teams_sample": teams_sample,
+            "raw": payload,
         }
 
 
-# --------- helpers ---------
+# -------- helpers --------
 def _safe_float(v: Any) -> Optional[float]:
     try:
         if v is None or v == "":
