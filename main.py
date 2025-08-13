@@ -1,283 +1,235 @@
-import os
+from __future__ import annotations
+
 import importlib
 import inspect
-from datetime import datetime, timedelta, date as date_cls
-from typing import Any, Dict, List, Optional, Tuple
+import os
+from datetime import date as _date, datetime, timedelta
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
-from fastapi import FastAPI, Query, HTTPException
+import pytz
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import pytz
 
-APP_NAME = "MLB Analyzer API"
+# IMPORTANT: models live in models.py to avoid circular imports
+from models import Hitter, Pitcher
 
+APP_VERSION = "1.0.5"  # accepts bool OR int flags in query params
+
+# ---------- FastAPI app ----------
 app = FastAPI(
-    title=APP_NAME,
-    version="1.0.3",
-    description="Custom GPT + API for MLB streak analysis",
+    title="MLB Analyzer API",
+    version=APP_VERSION,
+    docs_url="/docs",
+    redoc_url="/redoc",
 )
 
-# --- CORS ---
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "OPTIONS"],
     allow_headers=["*"],
 )
 
-# ------------------
-# Provider loading
-# ------------------
-_last_provider_error: Optional[str] = None
-
-def load_provider() -> Tuple[Optional[Any], Optional[str], Optional[str]]:
-    """
-    Load provider from env MLB_PROVIDER = 'path.to.module:ClassName'
-    Falls back to providers.simple_provider:SimpleProvider if not set.
-    """
-    global _last_provider_error
-    target = os.getenv("MLB_PROVIDER", "providers.simple_provider:SimpleProvider")
-    module_path, _, class_name = target.partition(":")
+# ---------- helpers ----------
+def _now_in_tz(tz: str) -> datetime:
     try:
-        module = importlib.import_module(module_path)
-        provider_cls = getattr(module, class_name)
-        instance = provider_cls()
-        _last_provider_error = None
-        return instance, module_path, class_name
-    except Exception as e:
-        _last_provider_error = f"{type(e).__name__}: {e}"
-        print(f"[provider-load-error] MLB_PROVIDER='{target}' -> {_last_provider_error}")
-        return None, None, None
+        tzobj = pytz.timezone(tz)
+    except Exception:
+        tzobj = pytz.timezone("America/New_York")
+    return datetime.now(tzobj)
 
-provider, provider_module, provider_class = load_provider()
-
-# ------------------
-# Utilities
-# ------------------
-def parse_date(d: Optional[str]) -> date_cls:
-    tz = pytz.timezone("America/New_York")
-    now = datetime.now(tz).date()
-    if not d or d.lower() == "today":
-        return now
-    s = d.lower()
+def _parse_date(s: str, tz: str = "America/New_York") -> _date:
+    s = (s or "").strip().lower()
+    now = _now_in_tz(tz)
+    if s in ("today", ""):
+        return now.date()
     if s == "yesterday":
-        return now - timedelta(days=1)
+        return (now - timedelta(days=1)).date()
     if s == "tomorrow":
-        return now + timedelta(days=1)
+        return (now + timedelta(days=1)).date()
     try:
-        return datetime.strptime(d, "%Y-%m-%d").date()
+        return datetime.strptime(s, "%Y-%m-%d").date()
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid date; use today|yesterday|tomorrow|YYYY-MM-DD")
 
-def safe_call(obj: Any, name: str, *args, **kwargs):
-    if obj is None:
-        raise HTTPException(status_code=503, detail=f"Provider not loaded: {_last_provider_error or 'unknown error'}")
-    fn = getattr(obj, name, None)
-    if not callable(fn):
-        raise HTTPException(status_code=501, detail=f"Provider does not implement {name}()")
-    return fn(*args, **kwargs)
+def _as_bool(v: Union[bool, int, str, None], default: bool = False) -> bool:
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, int):
+        return v != 0
+    if isinstance(v, str):
+        t = v.strip().lower()
+        return t in {"1", "true", "t", "yes", "y", "on"}
+    return default
 
-def _smart_call_fetch(method_name: str, the_date: date_cls, limit: Optional[int], team: Optional[str]):
-    """
-    Call provider private fetch with whatever parameters it supports.
-    Tries kwargs ('date' or 'game_date', 'limit', 'team'); falls back to positional.
-    """
-    if provider is None:
-        raise HTTPException(status_code=503, detail="Provider not loaded")
+def _provider_path_and_class() -> Tuple[str, str]:
+    env = os.getenv("MLB_PROVIDER", "").strip()
+    if ":" in env:
+        module_path, class_name = env.split(":", 1)
+        return module_path.strip(), class_name.strip()
+    # sane default
+    return "providers.statsapi_provider", "StatsApiProvider"
 
-    fn = getattr(provider, method_name, None)
-    if not callable(fn):
-        raise HTTPException(status_code=501, detail=f"Provider does not implement {method_name}()")
-
-    sig = inspect.signature(fn)
-    params = sig.parameters
-
-    kwargs = {}
-    date_param_name = "date" if "date" in params else ("game_date" if "game_date" in params else None)
-    if date_param_name:
-        kwargs[date_param_name] = the_date
-    if "limit" in params and limit is not None:
-        kwargs["limit"] = limit
-    if "team" in params and team is not None:
-        kwargs["team"] = team
-
+def _load_provider() -> Tuple[Optional[Any], Optional[str]]:
+    module_path, class_name = _provider_path_and_class()
     try:
-        if date_param_name or (not params):
-            return fn(**kwargs)
-        else:
-            return fn(the_date, **kwargs)
-    except TypeError:
-        try:
-            return fn(the_date)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Error calling {method_name}: {type(e).__name__}: {e}")
+        mod = importlib.import_module(module_path)
+        cls = getattr(mod, class_name)
+        return cls(), None
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error calling {method_name}: {type(e).__name__}: {e}")
+        print(f"[provider-load-error] MLB_PROVIDER='{module_path}:{class_name}' -> {type(e).__name__}: {e}")
+        return None, f"{type(e).__name__}: {e}"
 
-# ------------------
-# Models
-# ------------------
+# single provider instance
+PROVIDER, PROVIDER_ERR = _load_provider()
+
+def _ensure_provider():
+    if PROVIDER is None:
+        raise HTTPException(status_code=500, detail=f"Provider failed to load: {PROVIDER_ERR}")
+
+def _limit_kwargs(func, **kwargs) -> Dict[str, Any]:
+    """Pass only supported kwargs by inspecting signature names."""
+    try:
+        params = set(inspect.signature(func).parameters.keys())
+        return {k: v for k, v in kwargs.items() if k in params}
+    except Exception:
+        return kwargs
+
+# ---------- API models for responses (thin wrappers) ----------
 class HealthResp(BaseModel):
     ok: bool
     provider_loaded: bool
-    provider_module: Optional[str]
-    provider_class: Optional[str]
+    provider_module: Optional[str] = None
+    provider_class: Optional[str] = None
     provider_error: Optional[str] = None
     now_local: str
 
-class SlateScanResp(BaseModel):
-    hot_hitters: List[Dict[str, Any]]
-    cold_hitters: List[Dict[str, Any]]
-    hot_pitchers: List[Dict[str, Any]]
-    cold_pitchers: List[Dict[str, Any]]
-    matchups: List[Dict[str, Any]]
-    debug: Optional[Dict[str, Any]] = None
-
-# ------------------
-# Health
-# ------------------
-@app.get("/health", response_model=HealthResp, operation_id="health")
-def health(tz: str = Query("America/New_York", description="IANA timezone for timestamp echo")):
-    try:
-        zone = pytz.timezone(tz)
-    except Exception:
-        zone = pytz.timezone("America/New_York")
-    now_str = datetime.now(zone).strftime("%Y-%m-%d %H:%M:%S %Z")
+# ---------- endpoints ----------
+@app.get("/health", response_model=HealthResp)
+def health(tz: str = Query(default="America/New_York")):
+    now_local = _now_in_tz(tz).strftime("%Y-%m-%d %H:%M:%S %Z")
+    module_path, class_name = _provider_path_and_class()
     return HealthResp(
         ok=True,
-        provider_loaded=provider is not None,
-        provider_module=provider_module,
-        provider_class=provider_class,
-        provider_error=_last_provider_error,
-        now_local=now_str,
+        provider_loaded=PROVIDER is not None,
+        provider_module=module_path if PROVIDER else None,
+        provider_class=class_name if PROVIDER else None,
+        provider_error=PROVIDER_ERR,
+        now_local=now_local,
     )
 
-# ------------------
-# Raw provider rows endpoint (with richer debug)
-# ------------------
-@app.get(
-    "/provider_raw",
-    operation_id="provider_raw",
-    summary="Inspect raw rows from provider (temporary endpoint)",
-    description="Returns raw hitter and pitcher rows straight from the provider's private fetch methods, without mapping."
-)
+@app.get("/provider_raw")
 def provider_raw(
-    date: Optional[str] = Query(None),
-    limit: Optional[int] = Query(None, ge=1, le=5000),
+    date: str = Query(..., description="today|yesterday|tomorrow|YYYY-MM-DD"),
+    limit: Optional[int] = Query(None, ge=1, le=100),
     team: Optional[str] = Query(None),
-    debug: int = Query(0, ge=0, le=1),
+    debug: Union[bool, int] = Query(False, description="true/false or 1/0"),
 ):
-    the_date = parse_date(date)
-    hitters = _smart_call_fetch("_fetch_hitter_rows", the_date, limit, team)
-    pitchers = _smart_call_fetch("_fetch_pitcher_rows", the_date, limit, team)
-    out = {
-        "meta": {
-            "provider_module": provider_module,
-            "provider_class": provider_class,
-            "date": the_date.isoformat(),
-        },
-        "hitters_raw": hitters,
-        "pitchers_raw": pitchers,
-    }
-    if debug == 1:
-        # Safely expose provider config without secrets
-        provider_base = getattr(provider, "base", None)
-        provider_key_present = bool(getattr(provider, "key", "") or os.getenv("DATA_API_KEY"))
-        out["debug"] = {
+    _ensure_provider()
+    gdate = _parse_date(date)
+    hitters_raw: Iterable[Dict[str, Any]] = []
+    pitchers_raw: Iterable[Dict[str, Any]] = []
+
+    # call private fetches if present
+    if hasattr(PROVIDER, "_fetch_hitter_rows"):
+        fn = getattr(PROVIDER, "_fetch_hitter_rows")
+        hitters_raw = list(fn(**_limit_kwargs(fn, game_date=gdate, limit=limit, team=team)))
+    if hasattr(PROVIDER, "_fetch_pitcher_rows"):
+        fn = getattr(PROVIDER, "_fetch_pitcher_rows")
+        pitchers_raw = list(fn(**_limit_kwargs(fn, game_date=gdate, limit=limit, team=team)))
+
+    module_path, class_name = _provider_path_and_class()
+    return {
+        "meta": {"provider_module": module_path, "provider_class": class_name, "date": gdate.isoformat()},
+        "hitters_raw": hitters_raw,
+        "pitchers_raw": pitchers_raw,
+        "debug": {
             "notes": "Called provider private fetches with signature-aware kwargs.",
-            "hitter_fetch_params": list(inspect.signature(getattr(provider, "_fetch_hitter_rows")).parameters.keys()) if hasattr(provider, "_fetch_hitter_rows") else None,
-            "pitcher_fetch_params": list(inspect.signature(getattr(provider, "_fetch_pitcher_rows")).parameters.keys()) if hasattr(provider, "_fetch_pitcher_rows") else None,
-            "requested_args": {"date": the_date.isoformat(), "limit": limit, "team": team},
-            "provider_config": {
-                "fake_mode": os.getenv("PROD_USE_FAKE", "0") in ("1", "true", "True", "YES", "yes"),
-                "data_api_base": provider_base or "(unset)",
-                "has_api_key": provider_key_present,
-            }
-        }
-    return out
+            "hitter_fetch_params": list(inspect.signature(getattr(PROVIDER, "_fetch_hitter_rows")).parameters.keys()) if hasattr(PROVIDER, "_fetch_hitter_rows") else [],
+            "pitcher_fetch_params": list(inspect.signature(getattr(PROVIDER, "_fetch_pitcher_rows")).parameters.keys()) if hasattr(PROVIDER, "_fetch_pitcher_rows") else [],
+            "requested_args": {"date": gdate.isoformat(), "limit": limit, "team": team},
+            "provider_config": getattr(PROVIDER, "__dict__", {}),
+        } if _as_bool(debug) else None,
+    }
 
-# ------------------
-# Existing endpoints
-# ------------------
-@app.get("/hot_streak_hitters", operation_id="hot_streak_hitters")
+@app.get("/hot_streak_hitters")
 def hot_streak_hitters(
-    date: Optional[str] = Query(None),
-    min_avg: float = Query(0.280),
-    games: int = Query(3, ge=1),
-    require_hit_each: int = Query(1, ge=0, le=1),
-    debug: int = Query(0, ge=0, le=1),
+    date: str = Query(...),
+    min_avg: float = Query(0.28),
+    games: int = Query(3, ge=1, le=10),
+    require_hit_each: Union[bool, int] = Query(True, description="true/false or 1/0"),
+    debug: Union[bool, int] = Query(False, description="true/false or 1/0"),
 ):
-    the_date = parse_date(date)
-    return safe_call(provider, "hot_streak_hitters",
-        date=the_date, min_avg=min_avg, games=games,
-        require_hit_each=bool(require_hit_each), debug=bool(debug))
+    _ensure_provider()
+    gdate = _parse_date(date)
+    return PROVIDER.hot_streak_hitters(
+        gdate, min_avg=min_avg, games=games, require_hit_each=_as_bool(require_hit_each), debug=_as_bool(debug)
+    )
 
-@app.get("/cold_streak_hitters", operation_id="cold_streak_hitters")
+@app.get("/cold_streak_hitters")
 def cold_streak_hitters(
-    date: Optional[str] = Query(None),
+    date: str = Query(...),
     min_avg: float = Query(0.275),
-    games: int = Query(2, ge=1),
-    require_zero_hit_each: int = Query(1, ge=0, le=1),
-    debug: int = Query(0, ge=0, le=1),
+    games: int = Query(2, ge=1, le=10),
+    require_zero_hit_each: Union[bool, int] = Query(True, description="true/false or 1/0"),
+    debug: Union[bool, int] = Query(False, description="true/false or 1/0"),
 ):
-    the_date = parse_date(date)
-    return safe_call(provider, "cold_streak_hitters",
-        date=the_date, min_avg=min_avg, games=games,
-        require_zero_hit_each=bool(require_zero_hit_each), debug=bool(debug))
+    _ensure_provider()
+    gdate = _parse_date(date)
+    return PROVIDER.cold_streak_hitters(
+        gdate, min_avg=min_avg, games=games, require_zero_hit_each=_as_bool(require_zero_hit_each), debug=_as_bool(debug)
+    )
 
-@app.get("/pitcher_streaks", operation_id="pitcher_streaks")
+@app.get("/pitcher_streaks")
 def pitcher_streaks(
-    date: Optional[str] = Query(None),
+    date: str = Query(...),
     hot_max_era: float = Query(4.00),
     hot_min_ks_each: int = Query(6, ge=0),
-    hot_last_starts: int = Query(3, ge=1),
+    hot_last_starts: int = Query(3, ge=1, le=10),
     cold_min_era: float = Query(4.60),
     cold_min_runs_each: int = Query(3, ge=0),
-    cold_last_starts: int = Query(2, ge=1),
-    debug: int = Query(0, ge=0, le=1),
+    cold_last_starts: int = Query(2, ge=1, le=10),
+    debug: Union[bool, int] = Query(False, description="true/false or 1/0"),
 ):
-    the_date = parse_date(date)
-    return safe_call(provider, "pitcher_streaks",
-        date=the_date, hot_max_era=hot_max_era, hot_min_ks_each=hot_min_ks_each,
-        hot_last_starts=hot_last_starts, cold_min_era=cold_min_era,
-        cold_min_runs_each=cold_min_runs_each, cold_last_starts=cold_last_starts,
-        debug=bool(debug))
+    _ensure_provider()
+    gdate = _parse_date(date)
+    return PROVIDER.pitcher_streaks(
+        gdate,
+        hot_max_era=hot_max_era,
+        hot_min_ks_each=hot_min_ks_each,
+        hot_last_starts=hot_last_starts,
+        cold_min_era=cold_min_era,
+        cold_min_runs_each=cold_min_runs_each,
+        cold_last_starts=cold_last_starts,
+        debug=_as_bool(debug),
+    )
 
-@app.get("/cold_pitchers", operation_id="cold_pitchers")
+@app.get("/cold_pitchers")
 def cold_pitchers(
-    date: Optional[str] = Query(None),
+    date: str = Query(...),
     min_era: float = Query(4.60),
     min_runs_each: int = Query(3, ge=0),
-    last_starts: int = Query(2, ge=1),
-    debug: int = Query(0, ge=0, le=1),
+    last_starts: int = Query(2, ge=1, le=10),
+    debug: Union[bool, int] = Query(False, description="true/false or 1/0"),
 ):
-    the_date = parse_date(date)
-    return safe_call(provider, "cold_pitchers",
-        date=the_date, min_era=min_era, min_runs_each=min_runs_each,
-        last_starts=last_starts, debug=bool(debug))
+    _ensure_provider()
+    gdate = _parse_date(date)
+    return PROVIDER.cold_pitchers(
+        gdate, min_era=min_era, min_runs_each=min_runs_each, last_starts=last_starts, debug=_as_bool(debug)
+    )
 
-@app.get("/slate_scan", response_model=SlateScanResp, operation_id="slate_scan")
+@app.get("/slate_scan")
 def slate_scan(
-    date: Optional[str] = Query(None),
-    debug: int = Query(0, ge=0, le=1),
+    date: str = Query(...),
+    debug: Union[bool, int] = Query(False, description="true/false or 1/0"),
 ):
-    the_date = parse_date(date)
-    resp = safe_call(provider, "slate_scan", date=the_date, debug=bool(debug))
-    out = {
-        "hot_hitters": resp.get("hot_hitters", []),
-        "cold_hitters": resp.get("cold_hitters", []),
-        "hot_pitchers": resp.get("hot_pitchers", []),
-        "cold_pitchers": resp.get("cold_pitchers", []),
-        "matchups": resp.get("matchups", []),
-    }
-    if debug == 1:
-        out["debug"] = resp.get("debug", {})
-    return out
+    _ensure_provider()
+    gdate = _parse_date(date)
+    return PROVIDER.slate_scan(gdate, debug=_as_bool(debug))
 
-# ------------------
-# Run local
-# ------------------
+
 if __name__ == "__main__":
+    # Render runs your start command; keep this for local dev.
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=True)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
