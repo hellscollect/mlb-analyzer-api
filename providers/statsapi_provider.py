@@ -6,6 +6,7 @@ from typing import Dict, List, Any, Iterable, Optional, Tuple
 import requests
 from models import Hitter, Pitcher
 
+# ----- tiny helpers -----
 def _safe_float(x):
     try:
         return float(x) if x is not None else None
@@ -32,10 +33,11 @@ class StatsApiProvider:
     """
     Provider backed by MLB's public StatsAPI (no auth).
     Env (optional):
-      STATSAPI_BASE = https://statsapi.mlb.com/api/v1  (default)
-      STATSAPI_SEASON = 2025  (defaults to date.year)
-      STATSAPI_HITTERS_PER_TEAM = 3
+      STATSAPI_BASE = https://statsapi.mlb.com/api/v1          (default)
+      STATSAPI_SEASON = 2025                                   (defaults to date.year)
+      STATSAPI_HITTERS_PER_TEAM = 3                            (# of position players sampled per team)
       STATSAPI_TIMEOUT = 10
+      STATSAPI_GAME_TYPE = R                                   (regular-season logs)
     """
 
     def __init__(self):
@@ -43,11 +45,13 @@ class StatsApiProvider:
         self.season_override = os.getenv("STATSAPI_SEASON")
         self.hitters_per_team = int(os.getenv("STATSAPI_HITTERS_PER_TEAM", "3"))
         self.timeout = float(os.getenv("STATSAPI_TIMEOUT", "10"))
+        self.game_type = os.getenv("STATSAPI_GAME_TYPE", "R")  # R=regular, S=spring, etc.
         self.key = ""  # for /provider_raw debug parity
+
         self._session = requests.Session()
         self._session.headers.update({"User-Agent": "mlb-analyzer/1.0"})
 
-    # -------- Public (used by main.py) --------
+    # ---------- Public methods used by main.py ----------
     def hot_streak_hitters(self, date: _date, min_avg: float = 0.280, games: int = 3,
                            require_hit_each: bool = True, debug: bool = False):
         hitters = self.get_hitters(date)
@@ -131,7 +135,7 @@ class StatsApiProvider:
         if debug: out["debug"] = {"counts": {k: len(out[k]) for k in out}}
         return out
 
-    # -------- Internal helpers --------
+    # ---------- Internal helpers ----------
     def _season_of(self, d: _date) -> int:
         if self.season_override and self.season_override.isdigit():
             return int(self.season_override)
@@ -167,7 +171,7 @@ class StatsApiProvider:
                     opp_code_by_team[home_code] = away_code
         return opp_prob_by_team, opp_code_by_team
 
-    # -------- Raw fetches (StatsAPI) --------
+    # ---------- Raw fetches (StatsAPI) ----------
     def _fetch_pitcher_rows(self, game_date: _date, limit: Optional[int] = None, team: Optional[str] = None) -> Iterable[Dict[str, Any]]:
         season = self._season_of(game_date)
         sched = self._get("/schedule", {"sportId": 1, "date": game_date.isoformat(), "hydrate": "probablePitcher"})
@@ -188,8 +192,9 @@ class StatsApiProvider:
 
         rows: List[Dict[str, Any]] = []
         for pid, tcode, opp in entries:
-            # NOTE: the correct hydrate syntax uses type=..., not stats=...
-            data = self._get(f"/people/{pid}", {"hydrate": f"stats(group=pitching,type=season,gameLog,season={season})"})
+            # IMPORTANT: include gameType=[R] and sportId=1 so game logs populate
+            hydrate = f"stats(group=pitching,type=season,gameLog,season={season},gameType=[{self.game_type}],sportId=1)"
+            data = self._get(f"/people/{pid}", {"hydrate": hydrate})
             ppl = (data.get("people") or [])
             if not ppl: continue
             person = ppl[0]
@@ -254,7 +259,8 @@ class StatsApiProvider:
                 pid = person.get("id")
                 if not pid: continue
 
-                pdata = self._get(f"/people/{pid}", {"hydrate": f"stats(group=hitting,type=season,gameLog,season={season})"})
+                hydrate = f"stats(group=hitting,type=season,gameLog,season={season},gameType=[{self.game_type}],sportId=1)"
+                pdata = self._get(f"/people/{pid}", {"hydrate": hydrate})
                 ppl = (pdata.get("people") or [])
                 if not ppl: continue
                 p0 = ppl[0]
@@ -299,7 +305,7 @@ class StatsApiProvider:
         if limit: rows = rows[:limit]
         return rows
 
-    # -------- Map to Pydantic --------
+    # ---------- Map to Pydantic ----------
     def get_hitters(self, game_date: _date) -> List[Hitter]:
         return [self._map_hitter(r) for r in self._fetch_hitter_rows(game_date)]
 
