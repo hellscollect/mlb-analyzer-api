@@ -1,4 +1,4 @@
-# main.py — full file (paste this whole thing)
+# main.py — full file with POST wrappers for Actions reliability
 
 import os
 import importlib
@@ -11,17 +11,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import pytz
 
-# NEW: ensure OpenAPI has servers for GPT Actions import
+# Ensure OpenAPI has servers for GPT Actions import
 from fastapi.openapi.utils import get_openapi
 
 APP_NAME = "MLB Analyzer API"
-
-# Read your public Render URL (no trailing slash), e.g. https://your-app.onrender.com
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 
 app = FastAPI(
     title=APP_NAME,
-    version="1.0.3",
+    version="1.0.4",
     description="Custom GPT + API for MLB streak analysis",
 )
 
@@ -47,7 +45,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["*"],   # includes POST
     allow_headers=["*"],
 )
 
@@ -159,6 +157,48 @@ class SlateScanResp(BaseModel):
     matchups: List[Dict[str, Any]]
     debug: Optional[Dict[str, Any]] = None
 
+# --- Request bodies for POST wrappers ---
+class DateOnlyReq(BaseModel):
+    date: Optional[str] = None
+    debug: int = 0
+
+class ProviderRawReq(BaseModel):
+    date: Optional[str] = None
+    limit: Optional[int] = None
+    team: Optional[str] = None
+    debug: int = 0
+
+class HotHittersReq(BaseModel):
+    date: Optional[str] = None
+    min_avg: float = 0.280
+    games: int = 3
+    require_hit_each: bool = True
+    debug: int = 0
+
+class ColdHittersReq(BaseModel):
+    date: Optional[str] = None
+    min_avg: float = 0.275
+    games: int = 2
+    require_zero_hit_each: bool = True
+    debug: int = 0
+
+class PitcherStreaksReq(BaseModel):
+    date: Optional[str] = None
+    hot_max_era: float = 4.00
+    hot_min_ks_each: int = 6
+    hot_last_starts: int = 3
+    cold_min_era: float = 4.60
+    cold_min_runs_each: int = 3
+    cold_last_starts: int = 2
+    debug: int = 0
+
+class ColdPitchersReq(BaseModel):
+    date: Optional[str] = None
+    min_era: float = 4.60
+    min_runs_each: int = 3
+    last_starts: int = 2
+    debug: int = 0
+
 # ------------------
 # Health
 # ------------------
@@ -179,7 +219,7 @@ def health(tz: str = Query("America/New_York", description="IANA timezone for ti
     )
 
 # ------------------
-# Raw provider rows endpoint (with richer debug)
+# Raw provider rows (GET) + POST wrapper
 # ------------------
 @app.get(
     "/provider_raw",
@@ -206,7 +246,6 @@ def provider_raw(
         "pitchers_raw": pitchers,
     }
     if debug == 1:
-        # Safely expose provider config without secrets
         provider_base = getattr(provider, "base", None)
         provider_key_present = bool(getattr(provider, "key", "") or os.getenv("DATA_API_KEY"))
         out["debug"] = {
@@ -222,8 +261,18 @@ def provider_raw(
         }
     return out
 
+@app.post("/provider_raw_post", operation_id="provider_raw_post")
+def provider_raw_post(body: ProviderRawReq):
+    the_date = parse_date(body.date)
+    return provider_raw(
+        date=the_date.isoformat(),
+        limit=body.limit,
+        team=body.team,
+        debug=body.debug,
+    )
+
 # ------------------
-# Existing endpoints
+# Existing GET endpoints + POST wrappers
 # ------------------
 @app.get("/hot_streak_hitters", operation_id="hot_streak_hitters")
 def hot_streak_hitters(
@@ -234,9 +283,20 @@ def hot_streak_hitters(
     debug: int = Query(0, ge=0, le=1),
 ):
     the_date = parse_date(date)
-    return safe_call(provider, "hot_streak_hitters",
+    return safe_call(
+        provider, "hot_streak_hitters",
         date=the_date, min_avg=min_avg, games=games,
-        require_hit_each=bool(require_hit_each), debug=bool(debug))
+        require_hit_each=bool(require_hit_each), debug=bool(debug)
+    )
+
+@app.post("/hot_streak_hitters_post", operation_id="hot_streak_hitters_post")
+def hot_streak_hitters_post(body: HotHittersReq):
+    the_date = parse_date(body.date)
+    return safe_call(
+        provider, "hot_streak_hitters",
+        date=the_date, min_avg=body.min_avg, games=body.games,
+        require_hit_each=bool(body.require_hit_each), debug=bool(body.debug)
+    )
 
 @app.get("/cold_streak_hitters", operation_id="cold_streak_hitters")
 def cold_streak_hitters(
@@ -247,9 +307,20 @@ def cold_streak_hitters(
     debug: int = Query(0, ge=0, le=1),
 ):
     the_date = parse_date(date)
-    return safe_call(provider, "cold_streak_hitters",
+    return safe_call(
+        provider, "cold_streak_hitters",
         date=the_date, min_avg=min_avg, games=games,
-        require_zero_hit_each=bool(require_zero_hit_each), debug=bool(debug))
+        require_zero_hit_each=bool(require_zero_hit_each), debug=bool(debug)
+    )
+
+@app.post("/cold_streak_hitters_post", operation_id="cold_streak_hitters_post")
+def cold_streak_hitters_post(body: ColdHittersReq):
+    the_date = parse_date(body.date)
+    return safe_call(
+        provider, "cold_streak_hitters",
+        date=the_date, min_avg=body.min_avg, games=body.games,
+        require_zero_hit_each=bool(body.require_zero_hit_each), debug=bool(body.debug)
+    )
 
 @app.get("/pitcher_streaks", operation_id="pitcher_streaks")
 def pitcher_streaks(
@@ -263,11 +334,24 @@ def pitcher_streaks(
     debug: int = Query(0, ge=0, le=1),
 ):
     the_date = parse_date(date)
-    return safe_call(provider, "pitcher_streaks",
+    return safe_call(
+        provider, "pitcher_streaks",
         date=the_date, hot_max_era=hot_max_era, hot_min_ks_each=hot_min_ks_each,
         hot_last_starts=hot_last_starts, cold_min_era=cold_min_era,
         cold_min_runs_each=cold_min_runs_each, cold_last_starts=cold_last_starts,
-        debug=bool(debug))
+        debug=bool(debug)
+    )
+
+@app.post("/pitcher_streaks_post", operation_id="pitcher_streaks_post")
+def pitcher_streaks_post(body: PitcherStreaksReq):
+    the_date = parse_date(body.date)
+    return safe_call(
+        provider, "pitcher_streaks",
+        date=the_date, hot_max_era=body.hot_max_era, hot_min_ks_each=body.hot_min_ks_each,
+        hot_last_starts=body.hot_last_starts, cold_min_era=body.cold_min_era,
+        cold_min_runs_each=body.cold_min_runs_each, cold_last_starts=body.cold_last_starts,
+        debug=bool(body.debug)
+    )
 
 @app.get("/cold_pitchers", operation_id="cold_pitchers")
 def cold_pitchers(
@@ -278,9 +362,20 @@ def cold_pitchers(
     debug: int = Query(0, ge=0, le=1),
 ):
     the_date = parse_date(date)
-    return safe_call(provider, "cold_pitchers",
+    return safe_call(
+        provider, "cold_pitchers",
         date=the_date, min_era=min_era, min_runs_each=min_runs_each,
-        last_starts=last_starts, debug=bool(debug))
+        last_starts=last_starts, debug=bool(debug)
+    )
+
+@app.post("/cold_pitchers_post", operation_id="cold_pitchers_post")
+def cold_pitchers_post(body: ColdPitchersReq):
+    the_date = parse_date(body.date)
+    return safe_call(
+        provider, "cold_pitchers",
+        date=the_date, min_era=body.min_era, min_runs_each=body.min_runs_each,
+        last_starts=body.last_starts, debug=bool(body.debug)
+    )
 
 @app.get("/slate_scan", response_model=SlateScanResp, operation_id="slate_scan")
 def slate_scan(
@@ -299,6 +394,10 @@ def slate_scan(
     if debug == 1:
         out["debug"] = resp.get("debug", {})
     return out
+
+@app.post("/slate_scan_post", response_model=SlateScanResp, operation_id="slate_scan_post")
+def slate_scan_post(body: DateOnlyReq):
+    return slate_scan(date=body.date, debug=body.debug)
 
 # ------------------
 # Run local
