@@ -18,7 +18,7 @@ APP_NAME = "MLB Analyzer API"
 
 app = FastAPI(
     title=APP_NAME,
-    version="1.0.5",  # <-- bumped
+    version="1.0.6",
     description="Custom GPT + API for MLB streak analysis",
 )
 
@@ -31,9 +31,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ------------------
-# OpenAPI servers patch (so Actions import the correct Render URL)
-# ------------------
+# --- OpenAPI servers patch ---
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 
 def custom_openapi():
@@ -45,27 +43,17 @@ def custom_openapi():
         description=app.description,
         routes=app.routes,
     )
-    servers = []
-    if PUBLIC_BASE_URL:
-        servers.append({"url": PUBLIC_BASE_URL})
-    else:
-        servers.append({"url": "http://localhost:8000"})
+    servers = [{"url": PUBLIC_BASE_URL or "http://localhost:8000"}]
     openapi_schema["servers"] = servers
     app.openapi_schema = openapi_schema
     return app.openapi_schema
 
 app.openapi = custom_openapi  # type: ignore
 
-# ------------------
-# Provider loading
-# ------------------
+# --- Provider loading ---
 _last_provider_error: Optional[str] = None
 
 def load_provider() -> Tuple[Optional[Any], Optional[str], Optional[str]]:
-    """
-    Load provider from env MLB_PROVIDER = 'path.to.module:ClassName'
-    Falls back to providers.simple_provider:SimpleProvider if not set.
-    """
     global _last_provider_error
     target = os.getenv("MLB_PROVIDER", "providers.simple_provider:SimpleProvider")
     module_path, _, class_name = target.partition(":")
@@ -82,9 +70,7 @@ def load_provider() -> Tuple[Optional[Any], Optional[str], Optional[str]]:
 
 provider, provider_module, provider_class = load_provider()
 
-# ------------------
-# Utilities
-# ------------------
+# --- Utilities ---
 def parse_date(d: Optional[str]) -> date_cls:
     tz = pytz.timezone("America/New_York")
     now = datetime.now(tz).date()
@@ -109,20 +95,13 @@ def safe_call(obj: Any, name: str, *args, **kwargs):
     return fn(*args, **kwargs)
 
 def _smart_call_fetch(method_name: str, the_date: date_cls, limit: Optional[int], team: Optional[str]):
-    """
-    Call provider private fetch with whatever parameters it supports.
-    Tries kwargs ('date' or 'game_date', 'limit', 'team'); falls back to positional.
-    """
     if provider is None:
         raise HTTPException(status_code=503, detail="Provider not loaded")
-
     fn = getattr(provider, method_name, None)
     if not callable(fn):
         raise HTTPException(status_code=501, detail=f"Provider does not implement {method_name}()")
-
     sig = inspect.signature(fn)
     params = sig.parameters
-
     kwargs = {}
     date_param_name = "date" if "date" in params else ("game_date" if "game_date" in params else None)
     if date_param_name:
@@ -131,7 +110,6 @@ def _smart_call_fetch(method_name: str, the_date: date_cls, limit: Optional[int]
         kwargs["limit"] = limit
     if "team" in params and team is not None:
         kwargs["team"] = team
-
     try:
         if date_param_name or (not params):
             return fn(**kwargs)
@@ -145,9 +123,7 @@ def _smart_call_fetch(method_name: str, the_date: date_cls, limit: Optional[int]
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error calling {method_name}: {type(e).__name__}: {e}")
 
-# ------------------
-# Models
-# ------------------
+# --- Models ---
 class HealthResp(BaseModel):
     ok: bool
     provider_loaded: bool
@@ -205,19 +181,18 @@ class DateOnlyReq(BaseModel):
     date: Optional[str] = None
     debug: int = 0
 
-# Smoke test model
+# Lightweight smoke test
 class SmokeReq(BaseModel):
     date: Optional[str] = None
-    samples: int = 3  # how many names to include per list (keeps response small)
+    max_teams: int = 6
+    per_team: int = 2
     debug: int = 1
 
 # Diagnostics
 class DiagDateReq(BaseModel):
     date: Optional[str] = None
 
-# ------------------
-# Health
-# ------------------
+# --- Health ---
 @app.get("/health", response_model=HealthResp, operation_id="health")
 def health(tz: str = Query("America/New_York", description="IANA timezone for timestamp echo")):
     try:
@@ -234,15 +209,8 @@ def health(tz: str = Query("America/New_York", description="IANA timezone for ti
         now_local=now_str,
     )
 
-# ------------------
-# Raw provider rows endpoint (with richer debug)
-# ------------------
-@app.get(
-    "/provider_raw",
-    operation_id="provider_raw",
-    summary="Inspect raw rows from provider (temporary endpoint)",
-    description="Returns raw hitter and pitcher rows straight from the provider's private fetch methods, without mapping."
-)
+# --- Raw provider rows (GET) ---
+@app.get("/provider_raw", operation_id="provider_raw")
 def provider_raw(
     date: Optional[str] = Query(None),
     limit: Optional[int] = Query(None, ge=1, le=5000),
@@ -277,9 +245,7 @@ def provider_raw(
         }
     return out
 
-# ------------------
-# Existing GET endpoints
-# ------------------
+# --- Existing GET endpoints ---
 @app.get("/hot_streak_hitters", operation_id="hot_streak_hitters")
 def hot_streak_hitters(
     date: Optional[str] = Query(None),
@@ -355,9 +321,7 @@ def slate_scan(
         out["debug"] = resp.get("debug", {})
     return out
 
-# ------------------
-# POST wrappers (for Actions)
-# ------------------
+# --- POST wrappers (for Actions) ---
 @app.post("/provider_raw_post", operation_id="provider_raw_post")
 def provider_raw_post(body: ProviderRawReq):
     the_date = parse_date(body.date)
@@ -429,9 +393,7 @@ def slate_scan_post(body: DateOnlyReq):
         out["debug"] = resp.get("debug", {})
     return out
 
-# ------------------
-# Diagnostics (POST)
-# ------------------
+# --- Diagnostics (POST) ---
 @app.post("/diag_schedule_post", operation_id="diag_schedule_post")
 def diag_schedule_post(body: DiagDateReq):
     the_date = parse_date(body.date)
@@ -441,58 +403,14 @@ def diag_schedule_post(body: DiagDateReq):
         raise HTTPException(status_code=501, detail="Provider missing debug_schedule()")
     return provider.debug_schedule(date=the_date)
 
-# ------------------
-# ONE-SHOT, SMALL PAYLOAD SMOKE TEST (POST)
-# ------------------
+# --- ONE-SHOT, SMALL PAYLOAD SMOKE TEST (POST) ---
 @app.post("/smoke_post", operation_id="smoke_post")
 def smoke_post(body: SmokeReq):
-    """
-    Single, lightweight check that won't exceed GPT payload limits.
-    Returns counts + tiny samples across all lists for the given date.
-    """
     the_date = parse_date(body.date)
-    samples = max(1, min(10, body.samples))
+    return safe_call(provider, "light_slate",
+        date=the_date, max_teams=body.max_teams, per_team=body.per_team, debug=bool(body.debug))
 
-    # Use slate_scan once, then derive counts + tiny samples client-side
-    resp = safe_call(provider, "slate_scan", date=the_date, debug=True)
-
-    def short_names(items: List[Dict[str, Any]], key="player_name") -> List[str]:
-        out: List[str] = []
-        for it in items:
-            name = it.get(key)
-            if name:
-                out.append(str(name))
-            if len(out) >= samples:
-                break
-        return out
-
-    hot_hitters = resp.get("hot_hitters", [])
-    cold_hitters = resp.get("cold_hitters", [])
-    hot_pitchers = resp.get("hot_pitchers", [])
-    cold_pitchers = resp.get("cold_pitchers", [])
-    matchups = resp.get("matchups", [])
-
-    return {
-        "date": the_date.isoformat(),
-        "counts": {
-            "hot_hitters": len(hot_hitters),
-            "cold_hitters": len(cold_hitters),
-            "hot_pitchers": len(hot_pitchers),
-            "cold_pitchers": len(cold_pitchers),
-            "matchups": len(matchups),
-        },
-        "samples": {
-            "hot_hitters": short_names(hot_hitters),
-            "cold_hitters": short_names(cold_hitters),
-            "hot_pitchers": short_names(hot_pitchers),
-            "cold_pitchers": short_names(cold_pitchers),
-        },
-        "debug": resp.get("debug", {}),
-    }
-
-# ------------------
-# Run local
-# ------------------
+# --- Run local ---
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=True)
