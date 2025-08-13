@@ -1,141 +1,58 @@
-from datetime import date as _date
-from typing import Dict, List
-# Import the exact Pydantic models your API uses
-from main import Hitter, Pitcher
+from typing import Any, Dict, List, Optional
+from datetime import date
 
 class SimpleProvider:
     """
-    Example provider with synthetic data for any given date.
-    It returns Hitter and Pitcher *objects* (not dicts), matching main.py v1.6.3 expectations.
+    Minimal provider that satisfies the exact contracts used by main.py.
+    Returns empty-but-valid structures so your API never 500's while you wire up a real source.
     """
 
-    def __init__(self):
-        # keyed by ISO date string
-        self._pitchers_by_date: Dict[str, List[Pitcher]] = {}
-        self._hitters_by_date: Dict[str, List[Hitter]] = {}
+    # Optional knobs your main.py inspects in /provider_raw?debug=1
+    base: Optional[str] = None    # upstream base URL (unset here)
+    key: Optional[str] = None     # API key (unset here)
 
-    def _ensure_seed(self, d: _date):
-        key = d.isoformat()
-        if key in self._pitchers_by_date:
-            return
+    def __init__(self) -> None:
+        # Do NOT do anything that can crash here.
+        pass
 
-        # ---- Pitchers (two hot, two cold) ----
-        pitchers = [
-            Pitcher(
-                player_id="pit-bos-01",
-                name="Carl Flame",
-                team="BOS",
-                opponent_team="NYY",
-                era=3.20,
-                kbb=4.5,
-                k_per_start_last_n=[7, 8, 6],
-                runs_allowed_last_n=[2, 1, 2],
-                is_probable=True
-            ),
-            Pitcher(
-                player_id="pit-nyy-02",
-                name="Nate Ice",
-                team="NYY",
-                opponent_team="BOS",
-                era=5.05,
-                kbb=1.9,
-                k_per_start_last_n=[5, 4, 3],
-                runs_allowed_last_n=[4, 3, 5],
-                is_probable=True
-            ),
-            Pitcher(
-                player_id="pit-lad-03",
-                name="Leo Heat",
-                team="LAD",
-                opponent_team="SFG",
-                era=2.95,
-                kbb=5.2,
-                k_per_start_last_n=[9, 7, 8],
-                runs_allowed_last_n=[1, 2, 0],
-                is_probable=True
-            ),
-            Pitcher(
-                player_id="pit-sfg-04",
-                name="Sam Slump",
-                team="SFG",
-                opponent_team="LAD",
-                era=4.90,
-                kbb=2.1,
-                k_per_start_last_n=[4, 5, 5],
-                runs_allowed_last_n=[3, 4, 3],
-                is_probable=True
-            ),
-        ]
+    # ---- private fetchers used by /provider_raw ----
+    # NOTE: names and params must match what _smart_call_fetch probes for
+    def _fetch_hitter_rows(self, date: date, limit: Optional[int] = None, team: Optional[str] = None) -> List[Dict[str, Any]]:
+        return []  # stub: no external calls
 
-        # ---- Hitters (two hot, two cold) ----
-        hitters = [
-            Hitter(
-                player_id="hit-nyy-11",
-                name="Johnny Rake",
-                team="NYY",
-                opponent_team="BOS",
-                probable_pitcher_id=None,
-                avg=0.305,
-                obp=0.370,
-                slg=0.510,
-                last_n_games=5,
-                last_n_hits_each_game=[2, 1, 3],  # last 3 games each ≥ 1 hit
-                last_n_hitless_games=0
-            ),
-            Hitter(
-                player_id="hit-bos-12",
-                name="Mike Freeze",
-                team="BOS",
-                opponent_team="NYY",
-                probable_pitcher_id="pit-nyy-02",  # cold NYY probable
-                avg=0.280,
-                obp=0.320,
-                slg=0.390,
-                last_n_games=3,
-                last_n_hits_each_game=[0, 0, 1],
-                last_n_hitless_games=2
-            ),
-            Hitter(
-                player_id="hit-lad-13",
-                name="Alonzo Torch",
-                team="LAD",
-                opponent_team="SFG",
-                probable_pitcher_id=None,  # infer cold SFG probable from team
-                avg=0.315,
-                obp=0.380,
-                slg=0.560,
-                last_n_games=4,
-                last_n_hits_each_game=[1, 2, 1],
-                last_n_hitless_games=0
-            ),
-            Hitter(
-                player_id="hit-sfg-14",
-                name="Rick Quiet",
-                team="SFG",
-                opponent_team="LAD",
-                probable_pitcher_id="pit-lad-03",  # hot LAD probable
-                avg=0.276,
-                obp=0.310,
-                slg=0.360,
-                last_n_games=3,
-                last_n_hits_each_game=[0, 0, 1],
-                last_n_hitless_games=2
-            ),
-        ]
+    def _fetch_pitcher_rows(self, date: date, limit: Optional[int] = None, team: Optional[str] = None) -> List[Dict[str, Any]]:
+        return []  # stub: no external calls
 
-        self._pitchers_by_date[key] = pitchers
-        self._hitters_by_date[key] = hitters
+    # ---- public methods used by your endpoints ----
+    def hot_streak_hitters(self, *, date: date, min_avg: float, games: int,
+                           require_hit_each: bool, debug: bool) -> Dict[str, Any]:
+        return {"items": [], "debug": {"stub": True} if debug else None}
 
-    # === Required by main.py interface ===
-    def get_hitters(self, game_date: _date) -> List[Hitter]:
-        self._ensure_seed(game_date)
-        return self._hitters_by_date[game_date.isoformat()]
+    def cold_streak_hitters(self, *, date: date, min_avg: float, games: int,
+                            require_zero_hit_each: bool, debug: bool) -> Dict[str, Any]:
+        return {"items": [], "debug": {"stub": True} if debug else None}
 
-    def get_pitchers(self, game_date: _date) -> List[Pitcher]:
-        self._ensure_seed(game_date)
-        return self._pitchers_by_date[game_date.isoformat()]
+    def pitcher_streaks(self, *, date: date, hot_max_era: float, hot_min_ks_each: int, hot_last_starts: int,
+                        cold_min_era: float, cold_min_runs_each: int, cold_last_starts: int, debug: bool) -> Dict[str, Any]:
+        return {
+            "hot": [],
+            "cold": [],
+            "debug": {"stub": True} if debug else None
+        }
 
-    # === Optional but used for better matchup inference ===
-    def get_probable_pitchers_by_team(self, game_date: _date) -> Dict[str, Pitcher]:
-        self._ensure_seed(game_date)
-        return {p.team: p for p in self._pitchers_by_date[game_date.isoformat()] if p.is_probable}
+    def cold_pitchers(self, *, date: date, min_era: float, min_runs_each: int,
+                      last_starts: int, debug: bool) -> Dict[str, Any]:
+        return {"items": [], "debug": {"stub": True} if debug else None}
+
+    def slate_scan(self, *, date: date, debug: bool) -> Dict[str, Any]:
+        # IMPORTANT: keys + types exactly as main.py reads
+        out = {
+            "hot_hitters": [],
+            "cold_hitters": [],
+            "hot_pitchers": [],
+            "cold_pitchers": [],
+            "matchups": [],
+        }
+        if debug:
+            out["debug"] = {"stub": True}
+        return out
