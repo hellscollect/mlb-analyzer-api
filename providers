@@ -1,3 +1,0 @@
-providers/
-├── __init__.py          ← empty file, just so Python treats this as a package
-└── simple_provider.py   ← your provider logic
