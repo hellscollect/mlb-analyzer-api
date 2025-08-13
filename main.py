@@ -1,794 +1,551 @@
-from flask import Flask, jsonify, request
-import requests
-from datetime import datetime
+# main.py
+from __future__ import annotations
+from typing import List, Optional, Dict, Any, Tuple
+from datetime import date as _date, datetime, timedelta
 import os
 
-# ZoneInfo fallback for older Python versions
-try:
-    from zoneinfo import ZoneInfo  # type: ignore
-except Exception:  # pragma: no cover
-    from backports.zoneinfo import ZoneInfo  # type: ignore
+from fastapi import FastAPI, Query
+from pydantic import BaseModel, Field
 
-app = Flask(__name__)
+app = FastAPI(
+    title="MLB Analyzer API",
+    version="1.6.0",
+    description="Hot/Cold hitters & pitchers with slate scan and matchup filters. Supports relative dates and advanced filters."
+)
 
-MLB_API = "https://statsapi.mlb.com/api/v1"
+# =========================
+# Utilities: Date Handling
+# =========================
 
-
-# ---------------------------
-# Helpers
-# ---------------------------
-
-def today_str_et():
-    return datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
-
-
-def _get(url, params=None, timeout=30):
-    r = requests.get(url, params=params or {}, timeout=timeout)
-    r.raise_for_status()
-    return r.json()
-
-
-def get_schedule(date_str):
-    # include probablePitcher for hitter/pitcher logic
-    return _get(f"{MLB_API}/schedule", {
-        "sportId": 1,
-        "date": date_str,
-        "hydrate": "probablePitcher"
-    })
-
-
-def get_team_roster(team_id):
-    data = _get(f"{MLB_API}/teams/{team_id}/roster")
-    return data.get("roster", [])
-
-
-def get_person_name(person_id):
+def _parse_date(d: Optional[str]) -> _date:
+    """
+    Accepts: None, 'today', 'yesterday', 'tomorrow', or 'YYYY-MM-DD'.
+    Falls back to today if None/empty/invalid.
+    """
+    if not d:
+        return _date.today()
+    s = d.strip().lower()
+    today = _date.today()
+    if s in ("today",):
+        return today
+    if s in ("yesterday", "yday"):
+        return today - timedelta(days=1)
+    if s in ("tomorrow", "tmmr", "tmrw"):
+        return today + timedelta(days=1)
     try:
-        data = _get(f"{MLB_API}/people/{person_id}")
-        return data["people"][0]["fullName"]
+        return datetime.strptime(s, "%Y-%m-%d").date()
     except Exception:
-        return str(person_id)
+        return today
 
 
-def get_player_season_avg(player_id, season=None):
-    if season is None:
-        season = datetime.now(ZoneInfo("America/New_York")).year
-    data = _get(f"{MLB_API}/people/{player_id}/stats", {
-        "stats": "season",
-        "group": "hitting",
-        "season": season
-    })
-    try:
-        splits = data["stats"][0]["splits"]
-        if not splits:
-            return None
-        avg_str = splits[0]["stat"].get("avg")
-        if not avg_str or avg_str in (".---",):
-            return None
-        return float(avg_str)
-    except Exception:
-        return None
+# =========================
+# Data Models
+# =========================
+
+class Hitter(BaseModel):
+    player_id: str
+    name: str
+    team: str
+    opponent_team: Optional[str] = None
+    probable_pitcher_id: Optional[str] = None  # if known pregame
+    avg: float
+    obp: Optional[float] = None
+    slg: Optional[float] = None
+    last_n_games: int = 0
+    last_n_hits_each_game: List[int] = Field(default_factory=list)  # hits per game for N most recent games
+    last_n_hitless_games: int = 0  # consecutive recent hitless games
+
+class Pitcher(BaseModel):
+    player_id: str
+    name: str
+    team: str
+    opponent_team: Optional[str] = None
+    k_per_start_last_n: List[int] = Field(default_factory=list)
+    runs_allowed_last_n: List[int] = Field(default_factory=list)
+    era: float
+    kbb: Optional[float] = None  # K/BB ratio
+    is_probable: bool = False
+
+class StreakResult(BaseModel):
+    debug: Dict[str, Any] = Field(default_factory=dict)
+    results: List[Dict[str, Any]] = Field(default_factory=list)
+
+class SlateScanResponse(BaseModel):
+    date: str
+    debug: Dict[str, Any] = Field(default_factory=dict)
+    hot_hitters: List[Dict[str, Any]] = Field(default_factory=list)
+    cold_hitters: List[Dict[str, Any]] = Field(default_factory=list)
+    hot_pitchers: List[Dict[str, Any]] = Field(default_factory=list)
+    cold_pitchers: List[Dict[str, Any]] = Field(default_factory=list)
+    # New matchup buckets
+    matchups: Dict[str, List[Dict[str, Any]]] = Field(default_factory=dict)
 
 
-def get_pitcher_season_era(player_id, season=None):
-    if season is None:
-        season = datetime.now(ZoneInfo("America/New_York")).year
-    data = _get(f"{MLB_API}/people/{player_id}/stats", {
-        "stats": "season",
-        "group": "pitching",
-        "season": season
-    })
-    try:
-        splits = data["stats"][0]["splits"]
-        if not splits:
-            return None
-        era_str = splits[0]["stat"].get("era")
-        if not era_str or era_str in ("", "--"):
-            return None
-        return float(era_str)
-    except Exception:
-        return None
+# =================================
+# Data Provider (pluggable / safe)
+# =================================
 
-
-# ---- date parsing helper for game logs ----
-def _parse_ymd(dstr: str):
-    """Parse 'YYYY-MM-DD' into a date object."""
-    return datetime.strptime(dstr, "%Y-%m-%d").date()
-
-
-# ---- hitting game logs (respect as_of_date and sort newest->oldest) ----
-def get_player_last_n_games(player_id, n=2, season=None, as_of_date=None):
-    if season is None:
-        season = datetime.now(ZoneInfo("America/New_York")).year
-    data = _get(f"{MLB_API}/people/{player_id}/stats", {
-        "stats": "gameLog",
-        "group": "hitting",
-        "season": season
-    })
-    try:
-        splits = data["stats"][0]["splits"]
-    except Exception:
+class DataProvider:
+    """
+    Replace these methods with your production data layer.
+    Returning empty lists is intentional to avoid deployment crashes if not wired.
+    """
+    def get_hitters(self, game_date: _date) -> List[Hitter]:
+        # TODO: Integrate your real data fetch. Must fill fields used above.
         return []
 
-    if as_of_date:
-        cutoff = _parse_ymd(as_of_date)
-        splits = [s for s in splits if _parse_ymd(s.get("date")) <= cutoff]
-
-    splits.sort(key=lambda s: s.get("date", ""), reverse=True)
-    return splits[:max(0, n)]
-
-
-# ---- pitching game logs (starts only; respect as_of_date and sort newest->oldest) ----
-def get_pitcher_last_n_starts(player_id, n=2, season=None, as_of_date=None):
-    if season is None:
-        season = datetime.now(ZoneInfo("America/New_York")).year
-    data = _get(f"{MLB_API}/people/{player_id}/stats", {
-        "stats": "gameLog",
-        "group": "pitching",
-        "season": season
-    })
-    try:
-        splits = data["stats"][0]["splits"]
-    except Exception:
+    def get_pitchers(self, game_date: _date) -> List[Pitcher]:
+        # TODO: Integrate your real data fetch. Must fill fields used above.
         return []
 
-    # keep only starts
-    starts = [s for s in splits if int(s.get("stat", {}).get("gamesStarted", 0)) == 1]
-
-    if as_of_date:
-        cutoff = _parse_ymd(as_of_date)
-        starts = [s for s in starts if _parse_ymd(s.get("date")) <= cutoff]
-
-    starts.sort(key=lambda s: s.get("date", ""), reverse=True)
-    return starts[:max(0, n)]
+    def get_probable_pitchers_by_team(self, game_date: _date) -> Dict[str, Pitcher]:
+        """
+        Convenience map of probable starting pitchers keyed by team.
+        If your data source already annotates Pitcher.is_probable/opponent_team, just build from that.
+        """
+        probables = {p.team: p for p in self.get_pitchers(game_date) if getattr(p, "is_probable", False)}
+        return probables
 
 
-def is_hitless(game_splits):
-    if not game_splits:
-        return False
-    return all(int(g.get("stat", {}).get("hits", 0)) == 0 for g in game_splits)
+_provider = DataProvider()
 
 
-def is_hit_in_each(game_splits):
-    if not game_splits:
-        return False
-    return all(int(g.get("stat", {}).get("hits", 0)) >= 1 for g in game_splits)
+# =========================
+# Filtering Helpers
+# =========================
 
-
-# ---- helpers for schedule objects ----
-def _opposing_probable_pitcher_id(game_obj, side):
-    """Return the opposing team's probable pitcher id if present."""
-    opp_side = "home" if side == "away" else "away"
-    opp = game_obj.get("teams", {}).get(opp_side, {})
-    pp = opp.get("probablePitcher") or {}
-    return pp.get("id")
-
-
-def _team_probable_pitcher_id(game_obj, side):
-    """Return this side's probable pitcher id if present."""
-    t = game_obj.get("teams", {}).get(side, {})
-    pp = t.get("probablePitcher") or {}
-    return pp.get("id")
-
-
-def _passes_pitcher_era_filter(game_obj, side, min_pitcher_era, season_year):
-    if min_pitcher_era is None:
+def _passes_min(value: Optional[float], threshold: Optional[float]) -> bool:
+    if threshold is None or threshold == 0:
         return True
-    pid = _opposing_probable_pitcher_id(game_obj, side)
-    if not pid:
-        return False  # if ERA filter requested but no probable pitcher, skip
-    era = get_pitcher_season_era(pid, season_year)
-    return (era is not None) and (era >= min_pitcher_era)
+    if value is None:
+        return False
+    return value >= threshold
 
+def _passes_max(value: Optional[float], threshold: Optional[float]) -> bool:
+    if threshold is None or threshold == 0:
+        return True
+    if value is None:
+        return False
+    return value <= threshold
 
-# ---------------------------
-# Routes
-# ---------------------------
-
-@app.get("/")
-def root():
-    return jsonify({"ok": True, "message": "API is running", "today_et": today_str_et()})
-
-
-@app.get("/health")
-def health():
-    return jsonify({"ok": True})
-
-
-@app.get("/cold_streak_hitters")
-def cold_streak_hitters():
-    """
-    Hitters with season AVG >= min_avg and 0 hits in each of last_n games as-of 'date'.
-    Query params:
-      - date (YYYY-MM-DD, default today ET)
-      - min_avg (default 0.275)
-      - last_n (default 2)
-      - min_pitcher_era (optional: opposing probable pitcher ERA must be >= this)
-      - debug=1 to include counters
-    """
-    date_str = request.args.get("date") or today_str_et()
-    try:
-        min_avg = float(request.args.get("min_avg", 0.275))
-    except Exception:
-        min_avg = 0.275
-    try:
-        last_n = int(request.args.get("last_n", 2))
-    except Exception:
-        last_n = 2
-    mpe_raw = request.args.get("min_pitcher_era")
-    min_pitcher_era = float(mpe_raw) if mpe_raw not in (None, "",) else None
-    debug = request.args.get("debug") == "1"
-
-    counters = {
-        "games_total": 0, "teams_total": 0, "roster_players_total": 0,
-        "non_pitchers": 0, "season_stat_available": 0, "passed_avg": 0,
-        "had_recent_gamelogs": 0, "passed_hitless": 0, "passed_pitcher_era": 0
+def _serialize_hitter(h: Hitter) -> Dict[str, Any]:
+    return {
+        "player_id": h.player_id,
+        "name": h.name,
+        "team": h.team,
+        "opponent_team": h.opponent_team,
+        "probable_pitcher_id": h.probable_pitcher_id,
+        "avg": h.avg,
+        "obp": h.obp,
+        "slg": h.slg,
+        "last_n_games": h.last_n_games,
+        "last_n_hits_each_game": h.last_n_hits_each_game,
+        "last_n_hitless_games": h.last_n_hitless_games,
     }
 
-    sched = get_schedule(date_str)
-    games = [g for d in sched.get("dates", []) for g in d.get("games", [])]
-    counters["games_total"] = len(games)
-
-    results = []
-    season_year = datetime.now(ZoneInfo("America/New_York")).year
-
-    for g in games:
-        teams = g.get("teams", {})
-        for side in ("home", "away"):
-            t = teams.get(side, {})
-            team = t.get("team", {})
-            team_id = team.get("id")
-            team_name = team.get("name")
-            if not team_id:
-                continue
-            counters["teams_total"] += 1
-
-            if not _passes_pitcher_era_filter(g, side, min_pitcher_era, season_year):
-                continue
-            counters["passed_pitcher_era"] += 1
-
-            roster = get_team_roster(team_id)
-            counters["roster_players_total"] += len(roster)
-
-            for p in roster:
-                pos_type = p.get("position", {}).get("type", "")
-                if pos_type == "Pitcher":
-                    continue
-                counters["non_pitchers"] += 1
-
-                pid = p.get("person", {}).get("id")
-                pname = p.get("person", {}).get("fullName")
-                if not pid:
-                    continue
-
-                avg = get_player_season_avg(pid, season_year)
-                if avg is None:
-                    continue
-                counters["season_stat_available"] += 1
-                if avg < min_avg:
-                    continue
-                counters["passed_avg"] += 1
-
-                glast = get_player_last_n_games(pid, n=last_n, season=season_year, as_of_date=date_str)
-                if glast:
-                    counters["had_recent_gamelogs"] += 1
-                if not is_hitless(glast):
-                    continue
-                counters["passed_hitless"] += 1
-
-                results.append({
-                    "player": pname, "team": team_name, "avg": avg,
-                    "recent_games": [
-                        {"date": gi.get("date"), "hits": int(gi.get("stat", {}).get("hits", 0))}
-                        for gi in glast
-                    ]
-                })
-
-    if debug:
-        return jsonify({"date": date_str, "min_avg": min_avg, "last_n": last_n,
-                        "min_pitcher_era": min_pitcher_era,
-                        "counters": counters, "results": results})
-    return jsonify(results)
-
-
-@app.get("/hot_streak_hitters")
-def hot_streak_hitters():
-    """
-    Hitters with season AVG >= min_avg and >=1 hit in each of last_n games as-of 'date'.
-    Query params:
-      - date (YYYY-MM-DD, default today ET)
-      - min_avg (default 0.275)
-      - last_n (default 2)
-      - min_pitcher_era (optional: opposing probable pitcher ERA must be >= this)
-      - debug=1 to include counters
-    """
-    date_str = request.args.get("date") or today_str_et()
-    try:
-        min_avg = float(request.args.get("min_avg", 0.275))
-    except Exception:
-        min_avg = 0.275
-    try:
-        last_n = int(request.args.get("last_n", 2))
-    except Exception:
-        last_n = 2
-    mpe_raw = request.args.get("min_pitcher_era")
-    min_pitcher_era = float(mpe_raw) if mpe_raw not in (None, "",) else None
-    debug = request.args.get("debug") == "1"
-
-    counters = {
-        "games_total": 0, "teams_total": 0, "roster_players_total": 0,
-        "non_pitchers": 0, "season_stat_available": 0, "passed_avg": 0,
-        "had_recent_gamelogs": 0, "passed_hot": 0, "passed_pitcher_era": 0
+def _serialize_pitcher(p: Pitcher) -> Dict[str, Any]:
+    return {
+        "player_id": p.player_id,
+        "name": p.name,
+        "team": p.team,
+        "opponent_team": p.opponent_team,
+        "era": p.era,
+        "kbb": p.kbb,
+        "k_per_start_last_n": p.k_per_start_last_n,
+        "runs_allowed_last_n": p.runs_allowed_last_n,
+        "is_probable": p.is_probable,
     }
 
-    sched = get_schedule(date_str)
-    games = [g for d in sched.get("dates", []) for g in d.get("games", [])]
-    counters["games_total"] = len(games)
 
-    results = []
-    season_year = datetime.now(ZoneInfo("America/New_York")).year
+# =========================
+# Business Logic
+# =========================
 
-    for g in games:
-        teams = g.get("teams", {})
-        for side in ("home", "away"):
-            t = teams.get(side, {})
-            team = t.get("team", {})
-            team_id = team.get("id")
-            team_name = team.get("name")
-            if not team_id:
-                continue
-            counters["teams_total"] += 1
+def find_hot_hitters(
+    hitters: List[Hitter],
+    *,
+    avg_min: float,
+    last_n: int,
+    require_hits_each_game: bool = True,
+    obp_min: Optional[float] = None,
+    slg_min: Optional[float] = None,
+    debug: bool = False
+) -> Tuple[List[Hitter], Dict[str, Any]]:
+    dbg = {"scanned": len(hitters), "kept_after_avg": 0, "kept_after_hits": 0, "kept_after_adv": 0}
+    pool = [h for h in hitters if h.avg >= avg_min]
+    dbg["kept_after_avg"] = len(pool)
 
-            if not _passes_pitcher_era_filter(g, side, min_pitcher_era, season_year):
-                continue
-            counters["passed_pitcher_era"] += 1
+    if require_hits_each_game and last_n > 0:
+        tmp = []
+        for h in pool:
+            if len(h.last_n_hits_each_game) >= last_n and all(x >= 1 for x in h.last_n_hits_each_game[:last_n]):
+                tmp.append(h)
+        pool = tmp
+    dbg["kept_after_hits"] = len(pool)
 
-            roster = get_team_roster(team_id)
-            counters["roster_players_total"] += len(roster)
+    tmp = []
+    for h in pool:
+        if not _passes_min(h.obp, obp_min): 
+            continue
+        if not _passes_min(h.slg, slg_min):
+            continue
+        tmp.append(h)
+    pool = tmp
+    dbg["kept_after_adv"] = len(pool)
 
-            for p in roster:
-                pos_type = p.get("position", {}).get("type", "")
-                if pos_type == "Pitcher":
-                    continue
-                counters["non_pitchers"] += 1
+    return pool, dbg if debug else {}
 
-                pid = p.get("person", {}).get("id")
-                pname = p.get("person", {}).get("fullName")
-                if not pid:
-                    continue
+def find_cold_hitters(
+    hitters: List[Hitter],
+    *,
+    avg_min: float,
+    last_n_hitless: int,
+    obp_max: Optional[float] = None,
+    slg_max: Optional[float] = None,
+    debug: bool = False
+) -> Tuple[List[Hitter], Dict[str, Any]]:
+    dbg = {"scanned": len(hitters), "kept_after_avg": 0, "kept_after_hitless": 0, "kept_after_adv": 0}
+    pool = [h for h in hitters if h.avg >= avg_min]
+    dbg["kept_after_avg"] = len(pool)
 
-                avg = get_player_season_avg(pid, season_year)
-                if avg is None:
-                    continue
-                counters["season_stat_available"] += 1
-                if avg < min_avg:
-                    continue
-                counters["passed_avg"] += 1
+    if last_n_hitless > 0:
+        pool = [h for h in pool if h.last_n_hitless_games >= last_n_hitless]
+    dbg["kept_after_hitless"] = len(pool)
 
-                glast = get_player_last_n_games(pid, n=last_n, season=season_year, as_of_date=date_str)
-                if glast:
-                    counters["had_recent_gamelogs"] += 1
-                if not is_hit_in_each(glast):
-                    continue
-                counters["passed_hot"] += 1
+    tmp = []
+    for h in pool:
+        if not _passes_max(h.obp, obp_max):
+            continue
+        if not _passes_max(h.slg, slg_max):
+            continue
+        tmp.append(h)
+    pool = tmp
+    dbg["kept_after_adv"] = len(pool)
 
-                results.append({
-                    "player": pname, "team": team_name, "avg": avg,
-                    "recent_games": [
-                        {"date": gi.get("date"), "hits": int(gi.get("stat", {}).get("hits", 0))}
-                        for gi in glast
-                    ]
-                })
+    return pool, dbg if debug else {}
 
-    if debug:
-        return jsonify({"date": date_str, "min_avg": min_avg, "last_n": last_n,
-                        "min_pitcher_era": min_pitcher_era,
-                        "counters": counters, "results": results})
-    return jsonify(results)
+def find_hot_pitchers(
+    pitchers: List[Pitcher],
+    *,
+    era_max: float,
+    strikeouts_each_last_n: int,
+    kbb_min: Optional[float] = None,
+    debug: bool = False
+) -> Tuple[List[Pitcher], Dict[str, Any]]:
+    dbg = {"scanned": len(pitchers), "kept_after_era": 0, "kept_after_ks": 0, "kept_after_kbb": 0}
+    pool = [p for p in pitchers if p.era <= era_max]
+    dbg["kept_after_era"] = len(pool)
+
+    if strikeouts_each_last_n > 0:
+        tmp = []
+        for p in pool:
+            if len(p.k_per_start_last_n) >= strikeouts_each_last_n and all(
+                k >= 6 for k in p.k_per_start_last_n[:strikeouts_each_last_n]
+            ):
+                tmp.append(p)
+        pool = tmp
+    dbg["kept_after_ks"] = len(pool)
+
+    tmp = []
+    for p in pool:
+        if not _passes_min(p.kbb, kbb_min):
+            continue
+        tmp.append(p)
+    pool = tmp
+    dbg["kept_after_kbb"] = len(pool)
+
+    return pool, dbg if debug else {}
+
+def find_cold_pitchers(
+    pitchers: List[Pitcher],
+    *,
+    era_min: float,
+    runs_allowed_each_last_n: int,
+    kbb_max: Optional[float] = None,
+    debug: bool = False
+) -> Tuple[List[Pitcher], Dict[str, Any]]:
+    dbg = {"scanned": len(pitchers), "kept_after_era": 0, "kept_after_runs": 0, "kept_after_kbb": 0}
+    pool = [p for p in pitchers if p.era >= era_min]
+    dbg["kept_after_era"] = len(pool)
+
+    if runs_allowed_each_last_n > 0:
+        tmp = []
+        for p in pool:
+            if len(p.runs_allowed_last_n) >= runs_allowed_each_last_n and all(
+                r >= 3 for r in p.runs_allowed_last_n[:runs_allowed_each_last_n]
+            ):
+                tmp.append(p)
+        pool = tmp
+    dbg["kept_after_runs"] = len(pool)
+
+    tmp = []
+    for p in pool:
+        if not _passes_max(p.kbb, kbb_max):
+            continue
+        tmp.append(p)
+    pool = tmp
+    dbg["kept_after_kbb"] = len(pool)
+
+    return pool, dbg if debug else {}
 
 
-@app.get("/pitcher_streaks")
-def pitcher_streaks():
+# =========================
+# Matchup Builder
+# =========================
+
+def build_matchups(
+    *, date_obj: _date,
+    hot_hitters: List[Hitter],
+    cold_hitters: List[Hitter],
+    hot_pitchers: List[Pitcher],
+    cold_pitchers: List[Pitcher],
+    provider: DataProvider
+) -> Dict[str, List[Dict[str, Any]]]:
     """
-    Probable starters matching ERA and K filters over their last N starts as-of 'date'.
-    Query params:
-      - date (YYYY-MM-DD, default today ET)
-      - max_era (optional: require season ERA <= this value)
-      - min_strikeouts (optional int: each start must have >= this K)
-      - last_n (default 2)
-      - debug=1 to include counters
+    Produces two buckets:
+      - hot_hitters_vs_cold_pitchers
+      - hot_pitchers_vs_cold_hitters
+    Matching rules:
+      1) Prefer explicit probable pitcher IDs on hitters (probable_pitcher_id).
+      2) Else match by hitter.opponent_team -> provider.get_probable_pitchers_by_team().
+      3) Else best-effort by team/opponent_team if present on pitchers.
     """
-    date_str = request.args.get("date") or today_str_et()
-    as_of = date_str
-    try:
-        last_n = int(request.args.get("last_n", 2))
-    except Exception:
-        last_n = 2
-    me_raw = request.args.get("max_era")
-    max_era = float(me_raw) if me_raw not in (None, "",) else None
-    try:
-        min_k = int(request.args.get("min_strikeouts", 0))
-    except Exception:
-        min_k = 0
-    debug = request.args.get("debug") == "1"
+    probables_by_team = provider.get_probable_pitchers_by_team(date_obj)
+    cold_pitchers_by_id = {p.player_id: p for p in cold_pitchers}
+    cold_pitchers_by_team = {p.team: p for p in cold_pitchers if p.is_probable}
+    hot_pitchers_by_team = {p.team: p for p in hot_pitchers if p.is_probable}
 
-    counters = {
-        "games_total": 0, "probables_checked": 0, "season_era_available": 0,
-        "passed_season_era": 0, "had_recent_starts": 0, "passed_min_k": 0
-    }
+    hh_vs_cp = []
+    for h in hot_hitters:
+        matched_pitcher: Optional[Pitcher] = None
+        # 1) direct probable pitcher id
+        if h.probable_pitcher_id and h.probable_pitcher_id in cold_pitchers_by_id:
+            matched_pitcher = cold_pitchers_by_id[h.probable_pitcher_id]
+        # 2) opponent team + probables
+        elif h.opponent_team and h.opponent_team in probables_by_team:
+            p = probables_by_team[h.opponent_team]
+            if p.player_id in cold_pitchers_by_id:
+                matched_pitcher = cold_pitchers_by_id[p.player_id]
+        # 3) fallback: match by team maps
+        elif h.opponent_team and h.opponent_team in cold_pitchers_by_team:
+            matched_pitcher = cold_pitchers_by_team[h.opponent_team]
 
-    sched = get_schedule(date_str)
-    games = [g for d in sched.get("dates", []) for g in d.get("games", [])]
-    counters["games_total"] = len(games)
-
-    results = []
-    season_year = datetime.now(ZoneInfo("America/New_York")).year
-
-    for g in games:
-        for side in ("home", "away"):
-            pid = _team_probable_pitcher_id(g, side)
-            if not pid:
-                continue
-            counters["probables_checked"] += 1
-
-            era = get_pitcher_season_era(pid, season_year)
-            if era is None:
-                continue
-            counters["season_era_available"] += 1
-            if (max_era is not None) and (era > max_era):
-                continue
-            counters["passed_season_era"] += 1
-
-            starts = get_pitcher_last_n_starts(pid, n=last_n, season=season_year, as_of_date=as_of)
-            if starts:
-                counters["had_recent_starts"] += 1
-
-            if len(starts) < max(1, last_n):
-                continue
-
-            if min_k > 0:
-                if not all(int(s.get("stat", {}).get("strikeOuts", 0)) >= min_k for s in starts):
-                    continue
-                counters["passed_min_k"] += 1
-
-            team_name = g.get("teams", {}).get(side, {}).get("team", {}).get("name")
-            pname = get_person_name(pid)
-            recent = []
-            for s in starts:
-                stat = s.get("stat", {})
-                recent.append({
-                    "date": s.get("date"),
-                    "inningsPitched": stat.get("inningsPitched"),
-                    "strikeOuts": int(stat.get("strikeOuts", 0)),
-                    "runs": int(stat.get("runs", stat.get("earnedRuns", 0)))
-                })
-
-            results.append({
-                "player": pname, "team": team_name, "era": era,
-                "recent_starts": recent
+        if matched_pitcher:
+            hh_vs_cp.append({
+                "hitter": _serialize_hitter(h),
+                "pitcher": _serialize_pitcher(matched_pitcher)
             })
 
-    if debug:
-        return jsonify({"date": date_str, "last_n": last_n, "max_era": max_era,
-                        "min_strikeouts": min_k, "counters": counters, "results": results})
-    return jsonify(results)
+    hp_vs_ch = []
+    # Inverse: find cold hitters facing hot probable pitchers
+    for h in cold_hitters:
+        matched_pitcher: Optional[Pitcher] = None
+        if h.probable_pitcher_id and h.probable_pitcher_id in {p.player_id for p in hot_pitchers}:
+            matched_pitcher = next((p for p in hot_pitchers if p.player_id == h.probable_pitcher_id), None)
+        elif h.opponent_team and h.opponent_team in probables_by_team:
+            p = probables_by_team[h.opponent_team]
+            if p.player_id in {hp.player_id for hp in hot_pitchers}:
+                matched_pitcher = next((hp for hp in hot_pitchers if hp.player_id == p.player_id), None)
+        elif h.opponent_team and h.opponent_team in hot_pitchers_by_team:
+            matched_pitcher = hot_pitchers_by_team[h.opponent_team]
 
+        if matched_pitcher:
+            hp_vs_ch.append({
+                "pitcher": _serialize_pitcher(matched_pitcher),
+                "hitter": _serialize_hitter(h)
+            })
 
-@app.get("/cold_pitchers")
-def cold_pitchers():
-    """
-    Probable starters considered 'cold' as-of 'date'.
-    Criteria (defaults):
-      - season ERA >= min_era (default 4.50)
-      - in each of last_n starts, runs allowed >= min_runs (default 3)
-    Query params:
-      - date (YYYY-MM-DD, default today ET)
-      - min_era (float, default 4.50)
-      - min_runs (int, default 3)
-      - last_n (int, default 2)
-      - debug=1 to include counters
-    """
-    date_str = request.args.get("date") or today_str_et()
-    try:
-        min_era = float(request.args.get("min_era", 4.50))
-    except Exception:
-        min_era = 4.50
-    try:
-        min_runs = int(request.args.get("min_runs", 3))
-    except Exception:
-        min_runs = 3
-    try:
-        last_n = int(request.args.get("last_n", 2))
-    except Exception:
-        last_n = 2
-    debug = request.args.get("debug") == "1"
-
-    counters = {
-        "games_total": 0, "probables": 0, "season_era_avail": 0,
-        "passed_min_era": 0, "had_recent_starts": 0, "passed_runs_filter": 0
+    return {
+        "hot_hitters_vs_cold_pitchers": hh_vs_cp,
+        "hot_pitchers_vs_cold_hitters": hp_vs_ch
     }
 
-    sched = get_schedule(date_str)
-    games = [g for d in sched.get("dates", []) for g in d.get("games", [])]
-    counters["games_total"] = len(games)
 
-    season_year = datetime.now(ZoneInfo("America/New_York")).year
-    results = []
+# =========================
+# Endpoints
+# =========================
 
-    def runs_allowed(s):
-        st = s.get("stat", {})
-        return int(st.get("runs", st.get("earnedRuns", 0)))
+@app.get("/hot_streak_hitters", response_model=StreakResult)
+def hot_streak_hitters(
+    avg_min: float = Query(0.280, description="Minimum batting average"),
+    last_n: int = Query(3, description="Lookback games requiring ≥1 hit each"),
+    date: Optional[str] = Query(None, description="today|yesterday|tomorrow|YYYY-MM-DD"),
+    obp_min: Optional[float] = Query(None, description="Minimum OBP (optional)"),
+    slg_min: Optional[float] = Query(None, description="Minimum SLG (optional)"),
+    debug: Optional[int] = Query(0, description="Set to 1 to return counters")
+):
+    d = _parse_date(date)
+    hitters = _provider.get_hitters(d)
+    filtered, dbg = find_hot_hitters(
+        hitters,
+        avg_min=avg_min,
+        last_n=last_n,
+        require_hits_each_game=True,
+        obp_min=obp_min,
+        slg_min=slg_min,
+        debug=bool(debug)
+    )
+    return StreakResult(
+        debug=dbg,
+        results=[_serialize_hitter(h) for h in filtered]
+    )
 
-    for g in games:
-        for side in ("home", "away"):
-            pid = _team_probable_pitcher_id(g, side)
-            if not pid:
-                continue
-            counters["probables"] += 1
+@app.get("/cold_streak_hitters", response_model=StreakResult)
+def cold_streak_hitters(
+    avg_min: float = Query(0.275, description="Minimum batting average"),
+    last_n_hitless: int = Query(2, description="Number of most recent games with 0 hits"),
+    date: Optional[str] = Query(None, description="today|yesterday|tomorrow|YYYY-MM-DD"),
+    obp_max: Optional[float] = Query(None, description="Maximum OBP (optional)"),
+    slg_max: Optional[float] = Query(None, description="Maximum SLG (optional)"),
+    debug: Optional[int] = Query(0, description="Set to 1 to return counters")
+):
+    d = _parse_date(date)
+    hitters = _provider.get_hitters(d)
+    filtered, dbg = find_cold_hitters(
+        hitters,
+        avg_min=avg_min,
+        last_n_hitless=last_n_hitless,
+        obp_max=obp_max,
+        slg_max=slg_max,
+        debug=bool(debug)
+    )
+    return StreakResult(
+        debug=dbg,
+        results=[_serialize_hitter(h) for h in filtered]
+    )
 
-            era = get_pitcher_season_era(pid, season_year)
-            if era is None:
-                continue
-            counters["season_era_avail"] += 1
-            if era < min_era:
-                continue
-            counters["passed_min_era"] += 1
+@app.get("/pitcher_streaks", response_model=StreakResult)
+def pitcher_streaks(
+    era_max: float = Query(4.00, description="Maximum ERA to qualify as 'hot'"),
+    strikeouts_each_last_n: int = Query(3, description="Require ≥6 K in each of the last N starts"),
+    date: Optional[str] = Query(None, description="today|yesterday|tomorrow|YYYY-MM-DD"),
+    kbb_min: Optional[float] = Query(None, description="Minimum K/BB ratio (optional)"),
+    debug: Optional[int] = Query(0, description="Set to 1 to return counters")
+):
+    d = _parse_date(date)
+    pitchers = _provider.get_pitchers(d)
+    filtered, dbg = find_hot_pitchers(
+        pitchers,
+        era_max=era_max,
+        strikeouts_each_last_n=strikeouts_each_last_n,
+        kbb_min=kbb_min,
+        debug=bool(debug)
+    )
+    return StreakResult(
+        debug=dbg,
+        results=[_serialize_pitcher(p) for p in filtered]
+    )
 
-            starts = get_pitcher_last_n_starts(pid, n=last_n, season=season_year, as_of_date=date_str)
-            if starts:
-                counters["had_recent_starts"] += 1
-            if len(starts) < max(1, last_n):
-                continue
+@app.get("/cold_pitchers", response_model=StreakResult)
+def cold_pitchers(
+    era_min: float = Query(4.60, description="Minimum ERA to qualify as 'cold'"),
+    runs_allowed_each_last_n: int = Query(2, description="Require ≥3 ER in each of the last N starts"),
+    date: Optional[str] = Query(None, description="today|yesterday|tomorrow|YYYY-MM-DD"),
+    kbb_max: Optional[float] = Query(None, description="Maximum K/BB ratio (optional)"),
+    debug: Optional[int] = Query(0, description="Set to 1 to return counters")
+):
+    d = _parse_date(date)
+    pitchers = _provider.get_pitchers(d)
+    filtered, dbg = find_cold_pitchers(
+        pitchers,
+        era_min=era_min,
+        runs_allowed_each_last_n=runs_allowed_each_last_n,
+        kbb_max=kbb_max,
+        debug=bool(debug)
+    )
+    return StreakResult(
+        debug=dbg,
+        results=[_serialize_pitcher(p) for p in filtered]
+    )
 
-            if not all(runs_allowed(s) >= min_runs for s in starts):
-                continue
-            counters["passed_runs_filter"] += 1
+@app.get("/slate_scan", response_model=SlateScanResponse)
+def slate_scan(
+    # HITTERS (hot)
+    hot_avg_min: float = Query(0.280, description="Hot hitters: minimum AVG"),
+    hot_last_n: int = Query(3, description="Hot hitters: require ≥1 hit each of last N"),
+    hot_obp_min: Optional[float] = Query(None, description="Hot hitters: minimum OBP"),
+    hot_slg_min: Optional[float] = Query(None, description="Hot hitters: minimum SLG"),
+    # HITTERS (cold)
+    cold_avg_min: float = Query(0.275, description="Cold hitters: minimum AVG"),
+    cold_last_n_hitless: int = Query(2, description="Cold hitters: consecutive 0-hit games (N)"),
+    cold_obp_max: Optional[float] = Query(None, description="Cold hitters: maximum OBP"),
+    cold_slg_max: Optional[float] = Query(None, description="Cold hitters: maximum SLG"),
+    # PITCHERS (hot)
+    hot_era_max: float = Query(4.00, description="Hot pitchers: maximum ERA"),
+    hot_ks_each_last_n: int = Query(3, description="Hot pitchers: require ≥6 K each of last N starts"),
+    hot_kbb_min: Optional[float] = Query(None, description="Hot pitchers: minimum K/BB"),
+    # PITCHERS (cold)
+    cold_era_min: float = Query(4.60, description="Cold pitchers: minimum ERA"),
+    cold_runs_each_last_n: int = Query(2, description="Cold pitchers: require ≥3 ER each of last N starts"),
+    cold_kbb_max: Optional[float] = Query(None, description="Cold pitchers: maximum K/BB"),
+    # Global
+    date: Optional[str] = Query(None, description="today|yesterday|tomorrow|YYYY-MM-DD"),
+    debug: Optional[int] = Query(0, description="Set to 1 to include counters")
+):
+    d = _parse_date(date)
+    hitters = _provider.get_hitters(d)
+    pitchers = _provider.get_pitchers(d)
 
-            team_name = g.get("teams", {}).get(side, {}).get("team", {}).get("name")
-            pname = get_person_name(pid)
-            recent = [{
-                "date": s.get("date"),
-                "inningsPitched": s.get("stat", {}).get("inningsPitched"),
-                "strikeOuts": int(s.get("stat", {}).get("strikeOuts", 0)),
-                "runs": runs_allowed(s)
-            } for s in starts]
+    # hot hitters
+    hh, dbg_hh = find_hot_hitters(
+        hitters,
+        avg_min=hot_avg_min,
+        last_n=hot_last_n,
+        require_hits_each_game=True,
+        obp_min=hot_obp_min,
+        slg_min=hot_slg_min,
+        debug=bool(debug)
+    )
 
-            results.append({"player": pname, "team": team_name, "era": era, "recent_starts": recent})
+    # cold hitters
+    ch, dbg_ch = find_cold_hitters(
+        hitters,
+        avg_min=cold_avg_min,
+        last_n_hitless=cold_last_n_hitless,
+        obp_max=cold_obp_max,
+        slg_max=cold_slg_max,
+        debug=bool(debug)
+    )
 
-    if debug:
-        return jsonify({"date": date_str, "min_era": min_era, "min_runs": min_runs, "last_n": last_n,
-                        "counters": counters, "results": results})
-    return jsonify(results)
+    # hot pitchers
+    hp, dbg_hp = find_hot_pitchers(
+        pitchers,
+        era_max=hot_era_max,
+        strikeouts_each_last_n=hot_ks_each_last_n,
+        kbb_min=hot_kbb_min,
+        debug=bool(debug)
+    )
 
+    # cold pitchers
+    cp, dbg_cp = find_cold_pitchers(
+        pitchers,
+        era_min=cold_era_min,
+        runs_allowed_each_last_n=cold_runs_each_last_n,
+        kbb_max=cold_kbb_max,
+        debug=bool(debug)
+    )
 
-@app.get("/slate_scan")
-def slate_scan():
-    """
-    One-call slate scan that returns hot/cold hitters, hot pitchers, and cold pitchers for a given date.
-    Query params (all optional):
-      - date: YYYY-MM-DD (default: today ET)
-      - hot_min_avg: float (default 0.275)
-      - hot_last_n: int   (default 2)   -> >=1 hit each game
-      - cold_min_avg: float (default 0.275)
-      - cold_last_n: int   (default 2)  -> 0 hits each game
-      - pitcher_max_era: float (optional: season ERA <= this)   [hot pitchers]
-      - pitcher_min_strikeouts: int (optional: each start >= this) [hot pitchers]
-      - pitcher_last_n: int (default 2) [hot pitchers]
-      - pitcher_cold_min_era: float (default 4.50) [cold pitchers]
-      - pitcher_cold_min_runs: int (default 3) [cold pitchers]
-      - pitcher_cold_last_n: int (default = pitcher_last_n) [cold pitchers]
-      - debug: 1 to include counters per section
-    """
-    date_str = request.args.get("date") or today_str_et()
-    season_year = datetime.now(ZoneInfo("America/New_York")).year
+    # Matchups
+    matchups = build_matchups(
+        date_obj=d,
+        hot_hitters=hh,
+        cold_hitters=ch,
+        hot_pitchers=hp,
+        cold_pitchers=cp,
+        provider=_provider
+    )
 
-    # hitters params
-    try:
-        hot_min_avg = float(request.args.get("hot_min_avg", 0.275))
-    except Exception:
-        hot_min_avg = 0.275
-    try:
-        hot_last_n = int(request.args.get("hot_last_n", 2))
-    except Exception:
-        hot_last_n = 2
-    try:
-        cold_min_avg = float(request.args.get("cold_min_avg", 0.275))
-    except Exception:
-        cold_min_avg = 0.275
-    try:
-        cold_last_n = int(request.args.get("cold_last_n", 2))
-    except Exception:
-        cold_last_n = 2
-
-    # hot pitcher params
-    pe = request.args.get("pitcher_max_era")
-    pitcher_max_era = float(pe) if pe not in (None, "",) else None
-    try:
-        pitcher_min_k = int(request.args.get("pitcher_min_strikeouts", 0))
-    except Exception:
-        pitcher_min_k = 0
-    try:
-        pitcher_last_n = int(request.args.get("pitcher_last_n", 2))
-    except Exception:
-        pitcher_last_n = 2
-
-    # cold pitcher params
-    try:
-        cp_min_era = float(request.args.get("pitcher_cold_min_era", 4.50))
-    except Exception:
-        cp_min_era = 4.50
-    try:
-        cp_min_runs = int(request.args.get("pitcher_cold_min_runs", 3))
-    except Exception:
-        cp_min_runs = 3
-    try:
-        cp_last_n = int(request.args.get("pitcher_cold_last_n", pitcher_last_n))
-    except Exception:
-        cp_last_n = pitcher_last_n
-
-    debug = request.args.get("debug") == "1"
-
-    sched = get_schedule(date_str)
-    games = [g for d in sched.get("dates", []) for g in d.get("games", [])]
-
-    # ---- Collect hot/cold hitters ----
-    hot_hitters, cold_hitters = [], []
-    hot_counters = {"teams": 0, "roster": 0, "non_pitchers": 0, "season_stat": 0, "passed_avg": 0, "logs": 0, "passed_hot": 0}
-    cold_counters = {"teams": 0, "roster": 0, "non_pitchers": 0, "season_stat": 0, "passed_avg": 0, "logs": 0, "passed_cold": 0}
-
-    for g in games:
-        for side in ("home", "away"):
-            team = g.get("teams", {}).get(side, {}).get("team", {})
-            team_id, team_name = team.get("id"), team.get("name")
-            if not team_id:
-                continue
-
-            # hot hitters
-            hot_counters["teams"] += 1
-            roster = get_team_roster(team_id)
-            hot_counters["roster"] += len(roster)
-            for p in roster:
-                pos_type = p.get("position", {}).get("type", "")
-                if pos_type == "Pitcher":
-                    continue
-                hot_counters["non_pitchers"] += 1
-                pid = p.get("person", {}).get("id")
-                pname = p.get("person", {}).get("fullName")
-                if not pid:
-                    continue
-                avg = get_player_season_avg(pid, season_year)
-                if avg is None:
-                    continue
-                hot_counters["season_stat"] += 1
-                if avg < hot_min_avg:
-                    continue
-                hot_counters["passed_avg"] += 1
-                glast = get_player_last_n_games(pid, n=hot_last_n, season=season_year, as_of_date=date_str)
-                if glast:
-                    hot_counters["logs"] += 1
-                if not is_hit_in_each(glast):
-                    continue
-                hot_counters["passed_hot"] += 1
-                hot_hitters.append({
-                    "player": pname, "team": team_name, "avg": avg,
-                    "recent_games": [{"date": gi.get("date"), "hits": int(gi.get("stat", {}).get("hits", 0))} for gi in glast]
-                })
-
-            # cold hitters (reuse roster)
-            cold_counters["teams"] += 1
-            for p in roster:
-                pos_type = p.get("position", {}).get("type", "")
-                if pos_type == "Pitcher":
-                    continue
-                cold_counters["non_pitchers"] += 1
-                pid = p.get("person", {}).get("id")
-                pname = p.get("person", {}).get("fullName")
-                if not pid:
-                    continue
-                avg = get_player_season_avg(pid, season_year)
-                if avg is None:
-                    continue
-                cold_counters["season_stat"] += 1
-                if avg < cold_min_avg:
-                    continue
-                cold_counters["passed_avg"] += 1
-                glast = get_player_last_n_games(pid, n=cold_last_n, season=season_year, as_of_date=date_str)
-                if glast:
-                    cold_counters["logs"] += 1
-                if not is_hitless(glast):
-                    continue
-                cold_counters["passed_cold"] += 1
-                cold_hitters.append({
-                    "player": pname, "team": team_name, "avg": avg,
-                    "recent_games": [{"date": gi.get("date"), "hits": int(gi.get("stat", {}).get("hits", 0))} for gi in glast]
-                })
-
-    # ---- hot pitchers (probables only) ----
-    pitch_results = []
-    pitch_counters = {"games": len(games), "probables": 0, "season_era": 0, "passed_era": 0, "had_starts": 0, "passed_min_k": 0}
-    for g in games:
-        for side in ("home", "away"):
-            pid = _team_probable_pitcher_id(g, side)
-            if not pid:
-                continue
-            pitch_counters["probables"] += 1
-            era = get_pitcher_season_era(pid, season_year)
-            if era is None:
-                continue
-            pitch_counters["season_era"] += 1
-            if (pitcher_max_era is not None) and (era > pitcher_max_era):
-                continue
-            pitch_counters["passed_era"] += 1
-
-            starts = get_pitcher_last_n_starts(pid, n=pitcher_last_n, season=season_year, as_of_date=date_str)
-            if starts:
-                pitch_counters["had_starts"] += 1
-            if len(starts) < max(1, pitcher_last_n):
-                continue
-            if pitcher_min_k > 0:
-                if not all(int(s.get("stat", {}).get("strikeOuts", 0)) >= pitcher_min_k for s in starts):
-                    continue
-                pitch_counters["passed_min_k"] += 1
-
-            team_name = g.get("teams", {}).get(side, {}).get("team", {}).get("name")
-            pname = get_person_name(pid)
-            recent = [{
-                "date": s.get("date"),
-                "inningsPitched": s.get("stat", {}).get("inningsPitched"),
-                "strikeOuts": int(s.get("stat", {}).get("strikeOuts", 0)),
-                "runs": int(s.get("stat", {}).get("runs", s.get("stat", {}).get("earnedRuns", 0)))
-            } for s in starts]
-
-            pitch_results.append({"player": pname, "team": team_name, "era": era, "recent_starts": recent})
-
-    # ---- cold pitchers (probables only) ----
-    cold_pitchers_list = []
-    for g in games:
-        for side in ("home", "away"):
-            pid = _team_probable_pitcher_id(g, side)
-            if not pid:
-                continue
-            era = get_pitcher_season_era(pid, season_year)
-            if (era is None) or (era < cp_min_era):
-                continue
-
-            starts = get_pitcher_last_n_starts(pid, n=cp_last_n, season=season_year, as_of_date=date_str)
-            if len(starts) < max(1, cp_last_n):
-                continue
-            def runs_allowed(s):
-                st = s.get("stat", {})
-                return int(st.get("runs", st.get("earnedRuns", 0)))
-            if not all(runs_allowed(s) >= cp_min_runs for s in starts):
-                continue
-
-            team_name = g.get("teams", {}).get(side, {}).get("team", {}).get("name")
-            pname = get_person_name(pid)
-            recent = [{
-                "date": s.get("date"),
-                "inningsPitched": s.get("stat", {}).get("inningsPitched"),
-                "strikeOuts": int(s.get("stat", {}).get("strikeOuts", 0)),
-                "runs": runs_allowed(s)
-            } for s in starts]
-
-            cold_pitchers_list.append({"player": pname, "team": team_name, "era": era, "recent_starts": recent})
-
-    out = {
-        "date": date_str,
-        "hot_hitters": hot_hitters,
-        "cold_hitters": cold_hitters,
-        "pitcher_streaks": pitch_results,
-        "cold_pitchers": cold_pitchers_list
-    }
-    if debug:
-        out["debug"] = {
-            "hot_counters": hot_counters,
-            "cold_counters": cold_counters,
-            "pitcher_counters": pitch_counters
-        }
-    return jsonify(out)
-
-
-if __name__ == "__main__":
-    # Render sets $PORT; default to 10000 if not present.
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    return SlateScanResponse(
+        date=d.isoformat(),
+        debug={
+            "hot_hitters": dbg_hh,
+            "cold_hitters": dbg_ch,
+            "hot_pitchers": dbg_hp,
+            "cold_pitchers": dbg_cp
+        } if debug else {},
+        hot_hitters=[_serialize_hitter(x) for x in hh],
+        cold_hitters=[_serialize_hitter(x) for x in ch],
+        hot_pitchers=[_serialize_pitcher(x) for x in hp],
+        cold_pitchers=[_serialize_pitcher(x) for x in cp],
+        matchups=matchups
+    )
