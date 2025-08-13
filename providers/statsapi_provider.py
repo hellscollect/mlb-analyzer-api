@@ -7,6 +7,8 @@ import requests
 
 from models import Hitter, Pitcher  # uses your existing Pydantic models
 
+
+# -------- small helpers --------
 def _safe_float(x):
     try:
         return float(x) if x is not None else None
@@ -19,6 +21,7 @@ def _to_dict(x: Any) -> Dict[str, Any]:
     if hasattr(x, "dict"):        # pydantic v1
         return x.dict()
     return dict(x)
+
 
 class StatsApiProvider:
     """
@@ -35,8 +38,10 @@ class StatsApiProvider:
         self.season_override = os.getenv("STATSAPI_SEASON")
         self.hitters_per_team = int(os.getenv("STATSAPI_HITTERS_PER_TEAM", "3"))
         self.timeout = float(os.getenv("STATSAPI_TIMEOUT", "10"))
-        # for main.py /provider_raw debug block compatibility
+
+        # for main.py /provider_raw debug compatibility
         self.key = ""  # StatsAPI requires no key
+
         self._session = requests.Session()
         self._session.headers.update({"User-Agent": "mlb-analyzer/1.0"})
 
@@ -149,32 +154,54 @@ class StatsApiProvider:
             print(f"[statsapi] GET {url} params={params} -> {type(e).__name__}: {e}")
             return {}
 
+    # Build a quick lookup: team_code -> opponent probable pitcher id (for matchup wiring)
+    def _probables_maps(self, game_date: _date) -> Tuple[Dict[str, int], Dict[str, str]]:
+        sched = self._get("/schedule", {"sportId": 1, "date": game_date.isoformat(), "hydrate": "probablePitcher"})
+        opp_prob_by_team: Dict[str, int] = {}
+        opp_code_by_team: Dict[str, str] = {}
+        for d in sched.get("dates", []):
+            for g in d.get("games", []):
+                away = g.get("teams", {}).get("away", {})
+                home = g.get("teams", {}).get("home", {})
+                if not away or not home:
+                    continue
+                away_code = away.get("team", {}).get("abbreviation") or away.get("team", {}).get("teamCode") or away.get("team", {}).get("name")
+                home_code = home.get("team", {}).get("abbreviation") or home.get("team", {}).get("teamCode") or home.get("team", {}).get("name")
+                ap = (away.get("probablePitcher") or {}).get("id")
+                hp = (home.get("probablePitcher") or {}).get("id")
+                # for hitters on AWAY team, they face HOME probable; vice versa
+                if away_code and hp:
+                    opp_prob_by_team[away_code] = int(hp)
+                    opp_code_by_team[away_code] = home_code
+                if home_code and ap:
+                    opp_prob_by_team[home_code] = int(ap)
+                    opp_code_by_team[home_code] = away_code
+        return opp_prob_by_team, opp_code_by_team
+
     # ------------ Raw fetches from StatsAPI ------------
-    def _fetch_schedule(self, game_date: _date) -> Dict[str, Any]:
-        return self._get("/schedule", {"sportId": 1, "date": game_date.isoformat(), "hydrate": "probablePitcher"})
-
     def _fetch_pitcher_rows(self, game_date: _date, limit: Optional[int] = None, team: Optional[str] = None) -> Iterable[Dict[str, Any]]:
-        sched = self._fetch_schedule(game_date)
-        dates = sched.get("dates", [])
-        if not dates:
-            return []
-        games = dates[0].get("games", [])
         season = self._season_of(game_date)
+        # Build entries of (probable_pitcher_id, team_code, opp_code)
+        opp_prob_by_team, opp_code_by_team = self._probables_maps(game_date)
 
-        entries: List[Tuple[int, str, str]] = []  # (pitcher_id, team_code, opp_code)
-        for g in games:
-            away = g.get("teams", {}).get("away", {})
-            home = g.get("teams", {}).get("home", {})
-            if not away or not home:
-                continue
-            away_code = away.get("team", {}).get("abbreviation") or away.get("team", {}).get("teamCode") or away.get("team", {}).get("name")
-            home_code = home.get("team", {}).get("abbreviation") or home.get("team", {}).get("teamCode") or home.get("team", {}).get("name")
-            ap = away.get("probablePitcher") or {}
-            hp = home.get("probablePitcher") or {}
-            if ap.get("id") and (not team or team == away_code):
-                entries.append((ap["id"], away_code, home_code))
-            if hp.get("id") and (not team or team == home_code):
-                entries.append((hp["id"], home_code, away_code))
+        # Invert the opp map to own probables per team (team -> own probable id)
+        # We need own probables to list pitchers; derive from the schedule again:
+        sched = self._get("/schedule", {"sportId": 1, "date": game_date.isoformat(), "hydrate": "probablePitcher"})
+        entries: List[Tuple[int, str, str]] = []
+        for d in sched.get("dates", []):
+            for g in d.get("games", []):
+                away = g.get("teams", {}).get("away", {})
+                home = g.get("teams", {}).get("home", {})
+                if not away or not home:
+                    continue
+                away_code = away.get("team", {}).get("abbreviation") or away.get("team", {}).get("teamCode") or away.get("team", {}).get("name")
+                home_code = home.get("team", {}).get("abbreviation") or home.get("team", {}).get("teamCode") or home.get("team", {}).get("name")
+                ap = (away.get("probablePitcher") or {}).get("id")
+                hp = (home.get("probablePitcher") or {}).get("id")
+                if ap and (not team or team == away_code):
+                    entries.append((int(ap), away_code, home_code))
+                if hp and (not team or team == home_code):
+                    entries.append((int(hp), home_code, away_code))
 
         if limit:
             entries = entries[:limit]
@@ -187,6 +214,7 @@ class StatsApiProvider:
                 continue
             person = ppl[0]
             name = person.get("fullName") or person.get("firstLastName") or str(pid)
+
             era = None
             ks_seq: List[int] = []
             ra_seq: List[int] = []
@@ -204,6 +232,7 @@ class StatsApiProvider:
                         stat = sp.get("stat", {})
                         ks_seq.append(int(stat.get("strikeOuts", 0)))
                         ra_seq.append(int(stat.get("earnedRuns", 0)))
+
             rows.append({
                 "player_id": str(pid),
                 "name": name,
@@ -218,40 +247,41 @@ class StatsApiProvider:
         return rows
 
     def _fetch_hitter_rows(self, game_date: _date, limit: Optional[int] = None, team: Optional[str] = None) -> Iterable[Dict[str, Any]]:
-        sched = self._fetch_schedule(game_date)
-        dates = sched.get("dates", [])
-        if not dates:
-            return []
-        games = dates[0].get("games", [])
         season = self._season_of(game_date)
 
-        # Gather teams on the slate (team id + code + opponent code)
+        # Get opponent probable pitcher id per team, and opponent team code
+        opp_prob_by_team, opp_code_by_team = self._probables_maps(game_date)
+
+        # Build list of (team_id, team_code, opp_code) for teams on today's slate
+        sched = self._get("/schedule", {"sportId": 1, "date": game_date.isoformat(), "hydrate": "probablePitcher"})
         teams: List[Tuple[int, str, str]] = []
-        for g in games:
-            away = g.get("teams", {}).get("away", {})
-            home = g.get("teams", {}).get("home", {})
-            if not away or not home:
-                continue
-            away_id = away.get("team", {}).get("id")
-            home_id = home.get("team", {}).get("id")
-            away_code = away.get("team", {}).get("abbreviation") or away.get("team", {}).get("teamCode")
-            home_code = home.get("team", {}).get("abbreviation") or home.get("team", {}).get("teamCode")
-            if away_id and away_code and (not team or team == away_code):
-                teams.append((away_id, away_code, home_code))
-            if home_id and home_code and (not team or team == home_code):
-                teams.append((home_id, home_code, away_code))
+        for d in sched.get("dates", []):
+            for g in d.get("games", []):
+                away = g.get("teams", {}).get("away", {})
+                home = g.get("teams", {}).get("home", {})
+                if not away or not home:
+                    continue
+                away_id = away.get("team", {}).get("id")
+                home_id = home.get("team", {}).get("id")
+                away_code = away.get("team", {}).get("abbreviation") or away.get("team", {}).get("teamCode")
+                home_code = home.get("team", {}).get("abbreviation") or home.get("team", {}).get("teamCode")
+                if away_id and away_code and (not team or team == away_code):
+                    teams.append((int(away_id), away_code, home_code))
+                if home_id and home_code and (not team or team == home_code):
+                    teams.append((int(home_id), home_code, away_code))
 
         rows: List[Dict[str, Any]] = []
         for tid, tcode, opp_code in teams:
-            # Active roster (position players)
+            # Active roster
             roster = self._get(f"/teams/{tid}/roster", {"rosterType": "active", "season": season}).get("roster") or []
+
             picked = 0
             for r in roster:
                 if picked >= self.hitters_per_team:
                     break
                 pos_abbrev = ((r.get("position") or {}).get("abbreviation") or "").upper()
                 if pos_abbrev in ("P", "SP", "RP"):
-                    continue
+                    continue  # skip pitchers; we want position players
                 person = r.get("person") or {}
                 pid = person.get("id")
                 if not pid:
@@ -292,7 +322,8 @@ class StatsApiProvider:
                     "name": name,
                     "team": tcode,
                     "opponent_team": opp_code,
-                    "probable_pitcher_id": None,  # optional to wire later by matching schedule probables
+                    # face the OPPONENT's probable pitcher (if present)
+                    "probable_pitcher_id": str(opp_prob_by_team.get(tcode)) if opp_prob_by_team.get(tcode) else None,
                     "avg": avg if avg is not None else 0.0,
                     "obp": None,
                     "slg": None,
