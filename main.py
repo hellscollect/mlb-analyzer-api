@@ -11,10 +11,10 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-# IMPORTANT: models live in models.py to avoid circular imports
+# models are in models.py (avoids circular imports with providers)
 from models import Hitter, Pitcher
 
-APP_VERSION = "1.0.5"  # accepts bool OR int flags in query params
+APP_VERSION = "1.0.6"  # slate_scan does single fetch + in-memory filters; bool/int flags accepted everywhere
 
 # ---------- FastAPI app ----------
 app = FastAPI(
@@ -68,7 +68,6 @@ def _provider_path_and_class() -> Tuple[str, str]:
     if ":" in env:
         module_path, class_name = env.split(":", 1)
         return module_path.strip(), class_name.strip()
-    # sane default
     return "providers.statsapi_provider", "StatsApiProvider"
 
 def _load_provider() -> Tuple[Optional[Any], Optional[str]]:
@@ -89,14 +88,20 @@ def _ensure_provider():
         raise HTTPException(status_code=500, detail=f"Provider failed to load: {PROVIDER_ERR}")
 
 def _limit_kwargs(func, **kwargs) -> Dict[str, Any]:
-    """Pass only supported kwargs by inspecting signature names."""
     try:
         params = set(inspect.signature(func).parameters.keys())
         return {k: v for k, v in kwargs.items() if k in params}
     except Exception:
         return kwargs
 
-# ---------- API models for responses (thin wrappers) ----------
+def _to_dict(x: Any) -> Dict[str, Any]:
+    if hasattr(x, "model_dump"):
+        return x.model_dump()
+    if hasattr(x, "dict"):
+        return x.dict()
+    return dict(x)
+
+# ---------- API models ----------
 class HealthResp(BaseModel):
     ok: bool
     provider_loaded: bool
@@ -131,7 +136,6 @@ def provider_raw(
     hitters_raw: Iterable[Dict[str, Any]] = []
     pitchers_raw: Iterable[Dict[str, Any]] = []
 
-    # call private fetches if present
     if hasattr(PROVIDER, "_fetch_hitter_rows"):
         fn = getattr(PROVIDER, "_fetch_hitter_rows")
         hitters_raw = list(fn(**_limit_kwargs(fn, game_date=gdate, limit=limit, team=team)))
@@ -153,6 +157,7 @@ def provider_raw(
         } if _as_bool(debug) else None,
     }
 
+# ---- original filter endpoints (still available) ----
 @app.get("/hot_streak_hitters")
 def hot_streak_hitters(
     date: str = Query(...),
@@ -219,17 +224,111 @@ def cold_pitchers(
         gdate, min_era=min_era, min_runs_each=min_runs_each, last_starts=last_starts, debug=_as_bool(debug)
     )
 
+# ---- efficient slate_scan: single fetch + in-memory filters ----
+def _filter_hot_hitters(hs: List[Hitter], min_avg: float, games: int, require_hit_each: bool) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for h in hs:
+        if (h.avg or 0.0) < min_avg:
+            continue
+        seq = list(h.last_n_hits_each_game or [])
+        if len(seq) < games:
+            continue
+        if require_hit_each and not all((x or 0) >= 1 for x in seq[:games]):
+            continue
+        out.append(_to_dict(h))
+    return out
+
+def _filter_cold_hitters(hs: List[Hitter], min_avg: float, games: int, require_zero_hit_each: bool) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for h in hs:
+        if (h.avg or 0.0) < min_avg:
+            continue
+        seq = list(h.last_n_hits_each_game or [])
+        if len(seq) < games:
+            continue
+        if require_zero_hit_each and not all((x or 0) == 0 for x in seq[:games]):
+            continue
+        if require_zero_hit_each and (h.last_n_hitless_games or 0) < games:
+            continue
+        out.append(_to_dict(h))
+    return out
+
+def _split_pitchers(ps: List[Pitcher], hot_max_era: float, hot_min_ks_each: int, hot_last_starts: int,
+                    cold_min_era: float, cold_min_runs_each: int, cold_last_starts: int) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    hot: List[Dict[str, Any]] = []
+    cold: List[Dict[str, Any]] = []
+    for p in ps:
+        ks = list(p.k_per_start_last_n or [])
+        ra = list(p.runs_allowed_last_n or [])
+        if (p.era or 99.9) <= hot_max_era and len(ks) >= hot_last_starts and all((k or 0) >= hot_min_ks_each for k in ks[:hot_last_starts]):
+            hot.append(_to_dict(p))
+        if (p.era or 0.0) >= cold_min_era and len(ra) >= cold_last_starts and all((r or 0) >= cold_min_runs_each for r in ra[:cold_last_starts]):
+            cold.append(_to_dict(p))
+    return hot, cold
+
 @app.get("/slate_scan")
 def slate_scan(
     date: str = Query(...),
     debug: Union[bool, int] = Query(False, description="true/false or 1/0"),
 ):
+    """
+    Efficient slate scan: fetch hitters & pitchers once, compute all filters locally.
+    Avoids duplicate upstream calls that can trigger connector timeouts.
+    """
     _ensure_provider()
     gdate = _parse_date(date)
-    return PROVIDER.slate_scan(gdate, debug=_as_bool(debug))
+
+    # single fetch pass
+    hitters: List[Hitter] = PROVIDER.get_hitters(gdate)
+    pitchers: List[Pitcher] = PROVIDER.get_pitchers(gdate)
+
+    # compute buckets (same thresholds as before)
+    hot_hitters = _filter_hot_hitters(hitters, min_avg=0.280, games=3, require_hit_each=True)
+    cold_hitters = _filter_cold_hitters(hitters, min_avg=0.275, games=2, require_zero_hit_each=True)
+    hot_pitchers, cold_pitchers = _split_pitchers(
+        pitchers,
+        hot_max_era=4.00, hot_min_ks_each=6, hot_last_starts=3,
+        cold_min_era=4.60, cold_min_runs_each=3, cold_last_starts=2,
+    )
+
+    # join matchups by probable_pitcher_id
+    pid_index = {p["player_id"]: p for p in (hot_pitchers + cold_pitchers)}
+    matchups: List[Dict[str, Any]] = []
+    for h in hot_hitters:
+        pid = h.get("probable_pitcher_id")
+        if pid and pid in pid_index:
+            p = pid_index[pid]
+            matchups.append({
+                "hitter_id": h["player_id"],
+                "hitter_name": h["name"],
+                "hitter_team": h["team"],
+                "pitcher_id": p["player_id"],
+                "pitcher_name": p["name"],
+                "pitcher_team": p["team"],
+                "opponent_team": h.get("opponent_team"),
+                "note": "Hot hitter vs probable pitcher",
+            })
+
+    resp: Dict[str, Any] = {
+        "hot_hitters": hot_hitters,
+        "cold_hitters": cold_hitters,
+        "hot_pitchers": hot_pitchers,
+        "cold_pitchers": cold_pitchers,
+        "matchups": matchups,
+    }
+    if _as_bool(debug):
+        resp["debug"] = {
+            "counts": {
+                "hot_hitters": len(hot_hitters),
+                "cold_hitters": len(cold_hitters),
+                "hot_pitchers": len(hot_pitchers),
+                "cold_pitchers": len(cold_pitchers),
+                "matchups": len(matchups),
+            }
+        }
+    return resp
 
 
 if __name__ == "__main__":
-    # Render runs your start command; keep this for local dev.
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
