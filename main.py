@@ -18,7 +18,7 @@ APP_NAME = "MLB Analyzer API"
 
 app = FastAPI(
     title=APP_NAME,
-    version="1.0.4",
+    version="1.0.5",  # <-- bumped
     description="Custom GPT + API for MLB streak analysis",
 )
 
@@ -49,7 +49,6 @@ def custom_openapi():
     if PUBLIC_BASE_URL:
         servers.append({"url": PUBLIC_BASE_URL})
     else:
-        # Fallback for local/dev preview (won't be used by Actions)
         servers.append({"url": "http://localhost:8000"})
     openapi_schema["servers"] = servers
     app.openapi_schema = openapi_schema
@@ -165,7 +164,6 @@ class SlateScanResp(BaseModel):
     matchups: List[Dict[str, Any]]
     debug: Optional[Dict[str, Any]] = None
 
-# POST request models (for Actions)
 class ProviderRawReq(BaseModel):
     date: Optional[str] = None
     limit: Optional[int] = None
@@ -207,7 +205,13 @@ class DateOnlyReq(BaseModel):
     date: Optional[str] = None
     debug: int = 0
 
-# ---- Diagnostics (POST) ----
+# Smoke test model
+class SmokeReq(BaseModel):
+    date: Optional[str] = None
+    samples: int = 3  # how many names to include per list (keeps response small)
+    debug: int = 1
+
+# Diagnostics
 class DiagDateReq(BaseModel):
     date: Optional[str] = None
 
@@ -436,6 +440,55 @@ def diag_schedule_post(body: DiagDateReq):
     if not hasattr(provider, "debug_schedule"):
         raise HTTPException(status_code=501, detail="Provider missing debug_schedule()")
     return provider.debug_schedule(date=the_date)
+
+# ------------------
+# ONE-SHOT, SMALL PAYLOAD SMOKE TEST (POST)
+# ------------------
+@app.post("/smoke_post", operation_id="smoke_post")
+def smoke_post(body: SmokeReq):
+    """
+    Single, lightweight check that won't exceed GPT payload limits.
+    Returns counts + tiny samples across all lists for the given date.
+    """
+    the_date = parse_date(body.date)
+    samples = max(1, min(10, body.samples))
+
+    # Use slate_scan once, then derive counts + tiny samples client-side
+    resp = safe_call(provider, "slate_scan", date=the_date, debug=True)
+
+    def short_names(items: List[Dict[str, Any]], key="player_name") -> List[str]:
+        out: List[str] = []
+        for it in items:
+            name = it.get(key)
+            if name:
+                out.append(str(name))
+            if len(out) >= samples:
+                break
+        return out
+
+    hot_hitters = resp.get("hot_hitters", [])
+    cold_hitters = resp.get("cold_hitters", [])
+    hot_pitchers = resp.get("hot_pitchers", [])
+    cold_pitchers = resp.get("cold_pitchers", [])
+    matchups = resp.get("matchups", [])
+
+    return {
+        "date": the_date.isoformat(),
+        "counts": {
+            "hot_hitters": len(hot_hitters),
+            "cold_hitters": len(cold_hitters),
+            "hot_pitchers": len(hot_pitchers),
+            "cold_pitchers": len(cold_pitchers),
+            "matchups": len(matchups),
+        },
+        "samples": {
+            "hot_hitters": short_names(hot_hitters),
+            "cold_hitters": short_names(cold_hitters),
+            "hot_pitchers": short_names(hot_pitchers),
+            "cold_pitchers": short_names(cold_pitchers),
+        },
+        "debug": resp.get("debug", {}),
+    }
 
 # ------------------
 # Run local
