@@ -1,5 +1,6 @@
 import os
 import importlib
+import inspect
 from datetime import datetime, timedelta, date as date_cls
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -12,7 +13,7 @@ APP_NAME = "MLB Analyzer API"
 
 app = FastAPI(
     title=APP_NAME,
-    version="1.0.1",
+    version="1.0.2",
     description="Custom GPT + API for MLB streak analysis",
 )
 
@@ -77,6 +78,52 @@ def safe_call(obj: Any, name: str, *args, **kwargs):
         raise HTTPException(status_code=501, detail=f"Provider does not implement {name}()")
     return fn(*args, **kwargs)
 
+def _smart_call_fetch(method_name: str, the_date: date_cls, limit: Optional[int], team: Optional[str]):
+    """
+    Call provider private fetch with whatever parameters it supports.
+    Tries kwargs ('date' or 'game_date', 'limit', 'team'); falls back to positional.
+    """
+    if provider is None:
+        raise HTTPException(status_code=503, detail="Provider not loaded")
+
+    fn = getattr(provider, method_name, None)
+    if not callable(fn):
+        raise HTTPException(status_code=501, detail=f"Provider does not implement {method_name}()")
+
+    sig = inspect.signature(fn)
+    params = sig.parameters
+
+    # Build kwargs based on what the function actually accepts
+    kwargs = {}
+    date_param_name = None
+    if "date" in params:
+        date_param_name = "date"
+    elif "game_date" in params:
+        date_param_name = "game_date"
+
+    if date_param_name:
+        kwargs[date_param_name] = the_date
+
+    if "limit" in params and limit is not None:
+        kwargs["limit"] = limit
+    if "team" in params and team is not None:
+        kwargs["team"] = team
+
+    try:
+        if date_param_name or (not params):  # has a named date param or no params
+            return fn(**kwargs)
+        else:
+            # No named date parameter; try positional first arg as date
+            return fn(the_date, **kwargs)
+    except TypeError:
+        # Final fallback attempts
+        try:
+            return fn(the_date)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Error calling {method_name}: {type(e).__name__}: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error calling {method_name}: {type(e).__name__}: {e}")
+
 # ------------------
 # Models
 # ------------------
@@ -131,8 +178,8 @@ def provider_raw(
     debug: int = Query(0, ge=0, le=1),
 ):
     the_date = parse_date(date)
-    hitters = safe_call(provider, "_fetch_hitter_rows", date=the_date, limit=limit, team=team)
-    pitchers = safe_call(provider, "_fetch_pitcher_rows", date=the_date, limit=limit, team=team)
+    hitters = _smart_call_fetch("_fetch_hitter_rows", the_date, limit, team)
+    pitchers = _smart_call_fetch("_fetch_pitcher_rows", the_date, limit, team)
     out = {
         "meta": {
             "provider_module": provider_module,
@@ -143,7 +190,12 @@ def provider_raw(
         "pitchers_raw": pitchers,
     }
     if debug == 1:
-        out["debug"] = {"args": {"date": the_date.isoformat(), "limit": limit, "team": team}}
+        out["debug"] = {
+            "notes": "Called provider private fetches with signature-aware kwargs.",
+            "hitter_fetch_params": list(inspect.signature(getattr(provider, "_fetch_hitter_rows")).parameters.keys()) if hasattr(provider, "_fetch_hitter_rows") else None,
+            "pitcher_fetch_params": list(inspect.signature(getattr(provider, "_fetch_pitcher_rows")).parameters.keys()) if hasattr(provider, "_fetch_pitcher_rows") else None,
+            "requested_args": {"date": the_date.isoformat(), "limit": limit, "team": team}
+        }
     return out
 
 # ------------------
