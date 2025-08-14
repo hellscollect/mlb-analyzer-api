@@ -217,15 +217,13 @@ def league_scan(req: LeagueScanRequest, request: Request):
     if res_tomorrow["counts"]["matchups"] >= MIN_UPCOMING_GAMES:
         return res_tomorrow
 
-    # If tomorrow also empty, return "best" (likely empty) with helpful 404
-    if best:
-        raise HTTPException(
-            status_code=404,
-            detail={
-                "message": "No upcoming bettable games found; showing empty upcoming set.",
-                "today_or_yday": best,
-                "tomorrow": res_tomorrow,
-                "dates_tried": dates_to_try + [tomorrow],
-            },
-        )
-    raise HTTPException(status_code=404, detail={"message": "No data available at all."})
+    # If tomorrow also empty, return 404 with helpful context
+    raise HTTPException(
+        status_code=404,
+        detail={
+            "message": "No upcoming bettable games found.",
+            "today_or_yday": best,
+            "tomorrow": res_tomorrow,
+            "dates_tried": dates_to_try + [tomorrow],
+        },
+    )
