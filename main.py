@@ -19,7 +19,7 @@ EXTERNAL_URL = (
 
 app = FastAPI(
     title=APP_NAME,
-    version="1.1.1",
+    version="1.1.2",
     description="Custom GPT + API for MLB streak analysis",
     servers=[{"url": EXTERNAL_URL}],
     openapi_url="/openapi.json",
@@ -93,14 +93,31 @@ def _callable(obj: Any, name: str):
 def _call_with_sig(fn, **kwargs):
     """
     Call function with only the kwargs its signature accepts.
-    Useful for adapting to providers with slightly different names.
+    If that fails (e.g., positional-only args), retry with positional args
+    in the provider's parameter order using any provided values.
     """
     if fn is None:
         raise HTTPException(status_code=501, detail="Provider method missing")
     try:
         sig = inspect.signature(fn)
-        allowed = {k: v for k, v in kwargs.items() if k in sig.parameters}
-        return fn(**allowed)
+        allowed_kwargs = {k: v for k, v in kwargs.items() if k in sig.parameters}
+        try:
+            return fn(**allowed_kwargs)
+        except TypeError:
+            # Retry positionally in declared parameter order
+            params = list(sig.parameters.values())
+            args = []
+            for p in params:
+                # Use provided value if we have it, otherwise required params must exist
+                if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD):
+                    if p.name in allowed_kwargs:
+                        args.append(allowed_kwargs[p.name])
+                    elif p.default is not inspect._empty:
+                        args.append(p.default)
+                    else:
+                        # Missing a required arg we don't have a value for -> re-raise
+                        raise
+            return fn(*args)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Provider error calling {fn.__name__}: {type(e).__name__}: {e}")
 
@@ -142,7 +159,7 @@ def _smart_call_fetch(method_name: str, the_date: date_cls, limit: Optional[int]
         raise HTTPException(status_code=500, detail=f"Error calling {method_name}: {type(e).__name__}: {e}")
 
 # ------------------
-# Models (kept here so OpenAPI is complete)
+# Models
 # ------------------
 class HealthResp(BaseModel):
     ok: bool
@@ -289,7 +306,6 @@ def _hot_hitters_fallback(
     debug: bool,
     top_n: int = 25,
 ):
-    # Prefer exact method if implemented
     direct = _callable(provider, "hot_streak_hitters")
     if direct:
         return _call_with_sig(
@@ -300,16 +316,15 @@ def _hot_hitters_fallback(
             require_hit_each=require_hit_each,
             debug=debug,
         )
-    # Fallback to provider's league_* that requires date_str + top_n
     league = _callable(provider, "league_hot_hitters")
     if league:
         return _call_with_sig(
             league,
             date_str=the_date.isoformat(),
-            date=the_date,     # in case provider accepts 'date' instead
+            date=the_date,     # if provider also accepts 'date'
             top_n=top_n,
-            n=top_n,           # alternate name just in case
-            limit=top_n,       # alternate name just in case
+            n=top_n,           # alternate aliases just in case
+            limit=top_n,
             debug=debug,
         )
     raise HTTPException(status_code=501, detail="Provider does not implement hot_streak_hitters() or league_hot_hitters().")
@@ -360,7 +375,6 @@ def _pitcher_streaks_fallback(the_date: date_cls, hot_max_era: float, hot_min_ks
             cold_last_starts=cold_last_starts,
             debug=debug,
         )
-    # If no pitcher method, return empty structure but 200 with a debug note
     return {
         "hot_pitchers": [],
         "cold_pitchers": [],
@@ -375,7 +389,6 @@ def _schedule_for_date(the_date: date_cls, debug: bool):
     sched_fn = _callable(provider, "schedule_for_date")
     if not sched_fn:
         return []
-    # Provider needs date_str; adapt gracefully
     resp = _call_with_sig(
         sched_fn,
         date_str=the_date.isoformat(),
@@ -389,7 +402,7 @@ def _schedule_for_date(the_date: date_cls, debug: bool):
     return resp
 
 # ------------------
-# Hitters / Pitchers streak endpoints (GET + POST)
+# Endpoints
 # ------------------
 @app.get("/hot_streak_hitters", operation_id="hot_streak_hitters")
 def hot_streak_hitters(
@@ -467,7 +480,6 @@ def cold_pitchers(
     debug: int = Query(0, ge=0, le=1),
 ):
     the_date = parse_date(date)
-    # Keep old behavior: if provider lacks this, surface 501
     return safe_call(provider, "cold_pitchers",
         date=the_date, min_era=min_era, min_runs_each=min_runs_each,
         last_starts=last_starts, debug=bool(debug))
@@ -509,7 +521,6 @@ def league_scan(
     hot = _hot_hitters_fallback(the_date, min_avg=0.0, games=5, require_hit_each=False, debug=bool(debug), top_n=limit)
     cold = _cold_hitters_fallback(the_date, min_avg=0.0, games=5, require_zero_hit_each=False, debug=bool(debug), top_n=limit)
 
-    # Normalize to lists
     hot_list = hot if isinstance(hot, list) else hot.get("hot_hitters", []) if isinstance(hot, dict) else []
     cold_list = cold if isinstance(cold, list) else cold.get("cold_hitters", []) if isinstance(cold, dict) else []
 
@@ -532,24 +543,6 @@ def league_scan(
             "provider_class": provider_class,
         }
     return result
-
-# ------------------
-# Legacy slate_scan wrapper (kept intact; provider may not implement)
-# ------------------
-@app.post("/slate_scan_post", response_model=SlateScanResp, operation_id="slate_scan_post")
-def slate_scan_post(req: DateOnlyReq):
-    the_date = parse_date(req.date)
-    resp = safe_call(provider, "slate_scan", date=the_date, debug=bool(req.debug))
-    out = {
-        "hot_hitters": resp.get("hot_hitters", []),
-        "cold_hitters": resp.get("cold_hitters", []),
-        "hot_pitchers": resp.get("hot_pitchers", []),
-        "cold_pitchers": resp.get("cold_pitchers", []),
-        "matchups": resp.get("matchups", []),
-    }
-    if req.debug == 1:
-        out["debug"] = resp.get("debug", {})
-    return out
 
 # ------------------
 # Include routers from routes/
