@@ -11,10 +11,18 @@ import pytz
 
 APP_NAME = "MLB Analyzer API"
 
+# --- Server URL for OpenAPI (required by GPT Actions) ---
+EXTERNAL_URL = (
+    os.getenv("RENDER_EXTERNAL_URL")  # Render sets this automatically
+    or "https://mlb-analyzer-api.onrender.com"  # fallback to your host
+)
+
 app = FastAPI(
     title=APP_NAME,
-    version="1.0.6",
+    version="1.0.9",
     description="Custom GPT + API for MLB streak analysis",
+    servers=[{"url": EXTERNAL_URL}],
+    openapi_url="/openapi.json",
 )
 
 # --- CORS ---
@@ -32,8 +40,12 @@ app.add_middleware(
 _last_provider_error: Optional[str] = None
 
 def load_provider() -> Tuple[Optional[Any], Optional[str], Optional[str]]:
+    """
+    Loads the provider referenced by $MLB_PROVIDER.
+    Default to statsapi provider since it exists in your repo.
+    """
     global _last_provider_error
-    target = os.getenv("MLB_PROVIDER", "providers.simple_provider:SimpleProvider")
+    target = os.getenv("MLB_PROVIDER", "providers.statsapi_provider:StatsApiProvider")
     module_path, _, class_name = target.partition(":")
     try:
         module = importlib.import_module(module_path)
@@ -48,7 +60,7 @@ def load_provider() -> Tuple[Optional[Any], Optional[str], Optional[str]]:
 
 provider, provider_module, provider_class = load_provider()
 
-# expose provider to routers
+# Expose provider to routers
 app.state.provider = provider
 app.state.provider_module = provider_module
 app.state.provider_class = provider_class
@@ -110,7 +122,7 @@ def _smart_call_fetch(method_name: str, the_date: date_cls, limit: Optional[int]
         raise HTTPException(status_code=500, detail=f"Error calling {method_name}: {type(e).__name__}: {e}")
 
 # ------------------
-# Models
+# Models (kept here so OpenAPI is complete)
 # ------------------
 class HealthResp(BaseModel):
     ok: bool
@@ -127,6 +139,47 @@ class SlateScanResp(BaseModel):
     cold_pitchers: List[Dict[str, Any]]
     matchups: List[Dict[str, Any]]
     debug: Optional[Dict[str, Any]] = None
+
+class ProviderRawReq(BaseModel):
+    date: Optional[str] = None
+    limit: Optional[int] = None
+    team: Optional[str] = None
+    debug: int = 0
+
+class HotHittersReq(BaseModel):
+    date: Optional[str] = None
+    min_avg: float = 0.280
+    games: int = 3
+    require_hit_each: bool = True
+    debug: int = 0
+
+class ColdHittersReq(BaseModel):
+    date: Optional[str] = None
+    min_avg: float = 0.275
+    games: int = 2
+    require_zero_hit_each: bool = True
+    debug: int = 0
+
+class PitcherStreaksReq(BaseModel):
+    date: Optional[str] = None
+    hot_max_era: float = 4.0
+    hot_min_ks_each: int = 6
+    hot_last_starts: int = 3
+    cold_min_era: float = 4.6
+    cold_min_runs_each: int = 3
+    cold_last_starts: int = 2
+    debug: int = 0
+
+class ColdPitchersReq(BaseModel):
+    date: Optional[str] = None
+    min_era: float = 4.6
+    min_runs_each: int = 3
+    last_starts: int = 2
+    debug: int = 0
+
+class DateOnlyReq(BaseModel):
+    date: Optional[str] = None
+    debug: int = 0
 
 # ------------------
 # Health
@@ -148,7 +201,7 @@ def health(tz: str = Query("America/New_York", description="IANA timezone for ti
     )
 
 # ------------------
-# Raw provider rows endpoint (temporary)
+# Raw provider rows (debug/temporary)
 # ------------------
 @app.get("/provider_raw", operation_id="provider_raw")
 def provider_raw(
@@ -185,8 +238,18 @@ def provider_raw(
         }
     return out
 
+@app.post("/provider_raw_post", operation_id="provider_raw_post")
+def provider_raw_post(req: ProviderRawReq):
+    the_date = parse_date(req.date)
+    hitters = _smart_call_fetch("_fetch_hitter_rows", the_date, req.limit, req.team)
+    pitchers = _smart_call_fetch("_fetch_pitcher_rows", the_date, req.limit, req.team)
+    out = {"hitters_raw": hitters, "pitchers_raw": pitchers}
+    if req.debug == 1:
+        out["debug"] = {"requested": req.model_dump()}
+    return out
+
 # ------------------
-# Existing endpoints (GET)
+# Hitters / Pitchers streak endpoints (GET + POST)
 # ------------------
 @app.get("/hot_streak_hitters", operation_id="hot_streak_hitters")
 def hot_streak_hitters(
@@ -201,6 +264,13 @@ def hot_streak_hitters(
         date=the_date, min_avg=min_avg, games=games,
         require_hit_each=bool(require_hit_each), debug=bool(debug))
 
+@app.post("/hot_streak_hitters_post", operation_id="hot_streak_hitters_post")
+def hot_streak_hitters_post(req: HotHittersReq):
+    the_date = parse_date(req.date)
+    return safe_call(provider, "hot_streak_hitters",
+        date=the_date, min_avg=req.min_avg, games=req.games,
+        require_hit_each=req.require_hit_each, debug=bool(req.debug))
+
 @app.get("/cold_streak_hitters", operation_id="cold_streak_hitters")
 def cold_streak_hitters(
     date: Optional[str] = Query(None),
@@ -213,6 +283,13 @@ def cold_streak_hitters(
     return safe_call(provider, "cold_streak_hitters",
         date=the_date, min_avg=min_avg, games=games,
         require_zero_hit_each=bool(require_zero_hit_each), debug=bool(debug))
+
+@app.post("/cold_streak_hitters_post", operation_id="cold_streak_hitters_post")
+def cold_streak_hitters_post(req: ColdHittersReq):
+    the_date = parse_date(req.date)
+    return safe_call(provider, "cold_streak_hitters",
+        date=the_date, min_avg=req.min_avg, games=req.games,
+        require_zero_hit_each=req.require_zero_hit_each, debug=bool(req.debug))
 
 @app.get("/pitcher_streaks", operation_id="pitcher_streaks")
 def pitcher_streaks(
@@ -232,6 +309,15 @@ def pitcher_streaks(
         cold_min_runs_each=cold_min_runs_each, cold_last_starts=cold_last_starts,
         debug=bool(debug))
 
+@app.post("/pitcher_streaks_post", operation_id="pitcher_streaks_post")
+def pitcher_streaks_post(req: PitcherStreaksReq):
+    the_date = parse_date(req.date)
+    return safe_call(provider, "pitcher_streaks",
+        date=the_date, hot_max_era=req.hot_max_era, hot_min_ks_each=req.hot_min_ks_each,
+        hot_last_starts=req.hot_last_starts, cold_min_era=req.cold_min_era,
+        cold_min_runs_each=req.cold_min_runs_each, cold_last_starts=req.cold_last_starts,
+        debug=bool(req.debug))
+
 @app.get("/cold_pitchers", operation_id="cold_pitchers")
 def cold_pitchers(
     date: Optional[str] = Query(None),
@@ -245,82 +331,6 @@ def cold_pitchers(
         date=the_date, min_era=min_era, min_runs_each=min_runs_each,
         last_starts=last_starts, debug=bool(debug))
 
-# ------------------
-# POST wrappers (Actions)
-# ------------------
-class ProviderRawReq(BaseModel):
-    date: Optional[str] = None
-    limit: Optional[int] = None
-    team: Optional[str] = None
-    debug: int = 0
-
-@app.post("/provider_raw_post", operation_id="provider_raw_post")
-def provider_raw_post(req: ProviderRawReq):
-    the_date = parse_date(req.date)
-    hitters = _smart_call_fetch("_fetch_hitter_rows", the_date, req.limit, req.team)
-    pitchers = _smart_call_fetch("_fetch_pitcher_rows", the_date, req.limit, req.team)
-    out = {
-        "hitters_raw": hitters,
-        "pitchers_raw": pitchers,
-    }
-    if req.debug == 1:
-        out["debug"] = {"requested": req.model_dump()}
-    return out
-
-class HotHittersReq(BaseModel):
-    date: Optional[str] = None
-    min_avg: float = 0.280
-    games: int = 3
-    require_hit_each: bool = True
-    debug: int = 0
-
-@app.post("/hot_streak_hitters_post", operation_id="hot_streak_hitters_post")
-def hot_streak_hitters_post(req: HotHittersReq):
-    the_date = parse_date(req.date)
-    return safe_call(provider, "hot_streak_hitters",
-        date=the_date, min_avg=req.min_avg, games=req.games,
-        require_hit_each=req.require_hit_each, debug=bool(req.debug))
-
-class ColdHittersReq(BaseModel):
-    date: Optional[str] = None
-    min_avg: float = 0.275
-    games: int = 2
-    require_zero_hit_each: bool = True
-    debug: int = 0
-
-@app.post("/cold_streak_hitters_post", operation_id="cold_streak_hitters_post")
-def cold_streak_hitters_post(req: ColdHittersReq):
-    the_date = parse_date(req.date)
-    return safe_call(provider, "cold_streak_hitters",
-        date=the_date, min_avg=req.min_avg, games=req.games,
-        require_zero_hit_each=req.require_zero_hit_each, debug=bool(req.debug))
-
-class PitcherStreaksReq(BaseModel):
-    date: Optional[str] = None
-    hot_max_era: float = 4.0
-    hot_min_ks_each: int = 6
-    hot_last_starts: int = 3
-    cold_min_era: float = 4.6
-    cold_min_runs_each: int = 3
-    cold_last_starts: int = 2
-    debug: int = 0
-
-@app.post("/pitcher_streaks_post", operation_id="pitcher_streaks_post")
-def pitcher_streaks_post(req: PitcherStreaksReq):
-    the_date = parse_date(req.date)
-    return safe_call(provider, "pitcher_streaks",
-        date=the_date, hot_max_era=req.hot_max_era, hot_min_ks_each=req.hot_min_ks_each,
-        hot_last_starts=req.hot_last_starts, cold_min_era=req.cold_min_era,
-        cold_min_runs_each=req.cold_min_runs_each, cold_last_starts=req.cold_last_starts,
-        debug=bool(req.debug))
-
-class ColdPitchersReq(BaseModel):
-    date: Optional[str] = None
-    min_era: float = 4.6
-    min_runs_each: int = 3
-    last_starts: int = 2
-    debug: int = 0
-
 @app.post("/cold_pitchers_post", operation_id="cold_pitchers_post")
 def cold_pitchers_post(req: ColdPitchersReq):
     the_date = parse_date(req.date)
@@ -328,10 +338,9 @@ def cold_pitchers_post(req: ColdPitchersReq):
         date=the_date, min_era=req.min_era, min_runs_each=req.min_runs_each,
         last_starts=req.last_starts, debug=bool(req.debug))
 
-class DateOnlyReq(BaseModel):
-    date: Optional[str] = None
-    debug: int = 0
-
+# ------------------
+# Legacy slate_scan wrapper (kept intact; provider may not implement)
+# ------------------
 @app.post("/slate_scan_post", response_model=SlateScanResp, operation_id="slate_scan_post")
 def slate_scan_post(req: DateOnlyReq):
     the_date = parse_date(req.date)
@@ -348,8 +357,9 @@ def slate_scan_post(req: DateOnlyReq):
     return out
 
 # ------------------
-# include routers from routes/
+# Include routers from routes/
 # ------------------
+# Important: /league_scan_post is defined in routes/league_scan.py (no slate dependency).
 from routes.league_scan import router as league_scan_router
 app.include_router(league_scan_router)
 
