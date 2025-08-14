@@ -1,4 +1,3 @@
-# routes/league_scan.py
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 from datetime import datetime, timedelta, date, time
@@ -8,15 +7,13 @@ import requests
 router = APIRouter()
 ET = ZoneInfo("America/New_York")
 
-# --- behavior switches (no user params needed) ---
-ALWAYS_FILTER_TO_UPCOMING = True    # always exclude games that already started (ET)
-MIN_UPCOMING_GAMES = 1              # if fewer than this remain today, auto-pivot to tomorrow
+ALWAYS_FILTER_TO_UPCOMING = True
+MIN_UPCOMING_GAMES = 1
 
 class LeagueScanRequest(BaseModel):
-    date: str = "today"   # "today" | "yesterday" | "YYYY-MM-DD"
+    date: str = "today"
     debug: int | None = 1
 
-# ---------------- helpers ----------------
 def _now_et() -> datetime:
     return datetime.now(ET)
 
@@ -159,17 +156,10 @@ def _unify_payload(d: str, games: list, hot: list, cold: list, source: str, smok
         }
     }
 
-# ---------------- main route ----------------
 @router.post("/league_scan_post")
 def league_scan(req: LeagueScanRequest, request: Request):
-    """
-    Always returns only bettable (not-yet-started) games/players.
-    If none remain today, auto-pivots to tomorrow. Late-night ET also
-    allows today→yesterday for data availability when needed.
-    """
     base = str(request.base_url).rstrip("/")
     primary = _normalize_date(req.date)
-
     dates_to_try: list[str] = [primary]
     if _is_late_night_et():
         yday = (date.fromisoformat(primary) - timedelta(days=1)).isoformat()
@@ -178,7 +168,6 @@ def league_scan(req: LeagueScanRequest, request: Request):
     tomorrow = (date.fromisoformat(primary) + timedelta(days=1)).isoformat()
 
     def run_for_date(d: str):
-        # 1) smoke
         smoke = _try_smoke(base, d, req.debug)
         if smoke:
             games = smoke.get("matchups", []) or []
@@ -190,8 +179,6 @@ def league_scan(req: LeagueScanRequest, request: Request):
                 hot = _filter_players_by_teams(hot, scope)
                 cold = _filter_players_by_teams(cold, scope)
             return _unify_payload(d, games, hot, cold, "smoke", smoke_debug=smoke.get("debug", {}))
-
-        # 2) composed
         parts = _compose_from_parts(base, d, req.debug)
         games, hot, cold = parts["games"], parts["hot"], parts["cold"]
         if ALWAYS_FILTER_TO_UPCOMING:
@@ -203,7 +190,6 @@ def league_scan(req: LeagueScanRequest, request: Request):
             return _unify_payload(d, games, hot, cold, "composed")
         return _unify_payload(d, [], [], [], "none")
 
-    # Pass 1: today / (late-night) yesterday
     best = None
     for d in dates_to_try:
         res = run_for_date(d)
@@ -211,13 +197,9 @@ def league_scan(req: LeagueScanRequest, request: Request):
             return res
         if not best or res["counts"]["matchups"] > best["counts"]["matchups"]:
             best = res
-
-    # Pass 2: tomorrow fallback
     res_tomorrow = run_for_date(tomorrow)
     if res_tomorrow["counts"]["matchups"] >= MIN_UPCOMING_GAMES:
         return res_tomorrow
-
-    # If tomorrow also empty, return 404 with helpful context
     raise HTTPException(
         status_code=404,
         detail={
