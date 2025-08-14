@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import ORJSONResponse
 from pydantic import BaseModel
 import pytz
 
@@ -17,12 +18,17 @@ EXTERNAL_URL = (
     or "https://mlb-analyzer-api.onrender.com"  # fallback to your host
 )
 
+# --- Ensure UTF-8 in JSON responses to avoid mojibake of names with accents ---
+class UTF8ORJSONResponse(ORJSONResponse):
+    media_type = "application/json; charset=utf-8"
+
 app = FastAPI(
     title=APP_NAME,
     version="1.0.9",
     description="Custom GPT + API for MLB streak analysis",
     servers=[{"url": EXTERNAL_URL}],
     openapi_url="/openapi.json",
+    default_response_class=UTF8ORJSONResponse,  # <= explicit UTF-8
 )
 
 # --- CORS ---
@@ -182,8 +188,18 @@ class DateOnlyReq(BaseModel):
     debug: int = 0
 
 # ------------------
-# Health
+# Meta / Health
 # ------------------
+@app.get("/", tags=["meta"])
+def root():
+    return {
+        "service": APP_NAME,
+        "status": "ok",
+        "version": app.version,
+        "docs": "/docs",
+        "health": "/health",
+    }
+
 @app.get("/health", response_model=HealthResp, operation_id="health")
 def health(tz: str = Query("America/New_York", description="IANA timezone for timestamp echo")):
     try:
