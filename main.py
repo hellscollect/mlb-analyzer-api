@@ -6,7 +6,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import ORJSONResponse
 from pydantic import BaseModel
 import pytz
 
@@ -18,17 +17,12 @@ EXTERNAL_URL = (
     or "https://mlb-analyzer-api.onrender.com"  # fallback to your host
 )
 
-# --- Ensure UTF-8 in JSON responses to avoid mojibake of names with accents ---
-class UTF8ORJSONResponse(ORJSONResponse):
-    media_type = "application/json; charset=utf-8"
-
 app = FastAPI(
     title=APP_NAME,
-    version="1.0.9",
+    version="1.1.0",
     description="Custom GPT + API for MLB streak analysis",
     servers=[{"url": EXTERNAL_URL}],
     openapi_url="/openapi.json",
-    default_response_class=UTF8ORJSONResponse,  # <= explicit UTF-8
 )
 
 # --- CORS ---
@@ -89,6 +83,23 @@ def parse_date(d: Optional[str]) -> date_cls:
         return datetime.strptime(d, "%Y-%m-%d").date()
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid date; use today|yesterday|tomorrow|YYYY-MM-DD")
+
+def _callable(obj: Any, name: str):
+    if obj is None:
+        return None
+    fn = getattr(obj, name, None)
+    return fn if callable(fn) else None
+
+def _call_with_sig(fn, **kwargs):
+    """Call function with only the kwargs its signature accepts."""
+    if fn is None:
+        raise HTTPException(status_code=501, detail="Provider method missing")
+    try:
+        sig = inspect.signature(fn)
+        allowed = {k: v for k, v in kwargs.items() if k in sig.parameters}
+        return fn(**allowed)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Provider error calling {fn.__name__}: {type(e).__name__}: {e}")
 
 def safe_call(obj: Any, name: str, *args, **kwargs):
     if obj is None:
@@ -188,18 +199,8 @@ class DateOnlyReq(BaseModel):
     debug: int = 0
 
 # ------------------
-# Meta / Health
+# Health
 # ------------------
-@app.get("/", tags=["meta"])
-def root():
-    return {
-        "service": APP_NAME,
-        "status": "ok",
-        "version": app.version,
-        "docs": "/docs",
-        "health": "/health",
-    }
-
 @app.get("/health", response_model=HealthResp, operation_id="health")
 def health(tz: str = Query("America/New_York", description="IANA timezone for timestamp echo")):
     try:
@@ -227,6 +228,11 @@ def provider_raw(
     debug: int = Query(0, ge=0, le=1),
 ):
     the_date = parse_date(date)
+    # Original private fetchers are not implemented by StatsApiProvider -> return 501 to be explicit.
+    hitter_fetch = _callable(provider, "_fetch_hitter_rows")
+    pitcher_fetch = _callable(provider, "_fetch_pitcher_rows")
+    if not hitter_fetch or not pitcher_fetch:
+        raise HTTPException(status_code=501, detail="Provider does not implement _fetch_hitter_rows()/_fetch_pitcher_rows()")
     hitters = _smart_call_fetch("_fetch_hitter_rows", the_date, limit, team)
     pitchers = _smart_call_fetch("_fetch_pitcher_rows", the_date, limit, team)
     out = {
@@ -243,8 +249,8 @@ def provider_raw(
         provider_key_present = bool(getattr(provider, "key", "") or os.getenv("DATA_API_KEY"))
         out["debug"] = {
             "notes": "Called provider private fetches with signature-aware kwargs.",
-            "hitter_fetch_params": list(inspect.signature(getattr(provider, "_fetch_hitter_rows")).parameters.keys()) if hasattr(provider, "_fetch_hitter_rows") else None,
-            "pitcher_fetch_params": list(inspect.signature(getattr(provider, "_fetch_pitcher_rows")).parameters.keys()) if hasattr(provider, "_fetch_pitcher_rows") else None,
+            "hitter_fetch_exists": bool(hitter_fetch),
+            "pitcher_fetch_exists": bool(pitcher_fetch),
             "requested_args": {"date": the_date.isoformat(), "limit": limit, "team": team},
             "provider_config": {
                 "fake_mode": os.getenv("PROD_USE_FAKE", "0") in ("1", "true", "True", "YES", "yes"),
@@ -257,12 +263,69 @@ def provider_raw(
 @app.post("/provider_raw_post", operation_id="provider_raw_post")
 def provider_raw_post(req: ProviderRawReq):
     the_date = parse_date(req.date)
+    hitter_fetch = _callable(provider, "_fetch_hitter_rows")
+    pitcher_fetch = _callable(provider, "_fetch_pitcher_rows")
+    if not hitter_fetch or not pitcher_fetch:
+        raise HTTPException(status_code=501, detail="Provider does not implement _fetch_hitter_rows()/_fetch_pitcher_rows()")
     hitters = _smart_call_fetch("_fetch_hitter_rows", the_date, req.limit, req.team)
     pitchers = _smart_call_fetch("_fetch_pitcher_rows", the_date, req.limit, req.team)
     out = {"hitters_raw": hitters, "pitchers_raw": pitchers}
     if req.debug == 1:
         out["debug"] = {"requested": req.model_dump()}
     return out
+
+# ------------------
+# Compatibility wrappers for this provider (league_* fallbacks)
+# ------------------
+def _hot_hitters_fallback(the_date: date_cls, min_avg: float, games: int, require_hit_each: bool, debug: bool):
+    # Prefer exact method if implemented
+    direct = _callable(provider, "hot_streak_hitters")
+    if direct:
+        return _call_with_sig(direct, date=the_date, min_avg=min_avg, games=games,
+                              require_hit_each=require_hit_each, debug=debug)
+    # Fallback to league method (implemented by StatsApiProvider)
+    league = _callable(provider, "league_hot_hitters")
+    if league:
+        return _call_with_sig(league, date=the_date, games=games, min_avg=min_avg,
+                              require_hit_each=require_hit_each, debug=debug)
+    raise HTTPException(status_code=501, detail="Provider does not implement hot_streak_hitters() or league_hot_hitters().")
+
+def _cold_hitters_fallback(the_date: date_cls, min_avg: float, games: int, require_zero_hit_each: bool, debug: bool):
+    direct = _callable(provider, "cold_streak_hitters")
+    if direct:
+        return _call_with_sig(direct, date=the_date, min_avg=min_avg, games=games,
+                              require_zero_hit_each=require_zero_hit_each, debug=debug)
+    league = _callable(provider, "league_cold_hitters")
+    if league:
+        return _call_with_sig(league, date=the_date, games=games, min_avg=min_avg,
+                              require_zero_hit_each=require_zero_hit_each, debug=debug)
+    raise HTTPException(status_code=501, detail="Provider does not implement cold_streak_hitters() or league_cold_hitters().")
+
+def _pitcher_streaks_fallback(the_date: date_cls, hot_max_era: float, hot_min_ks_each: int, hot_last_starts: int,
+                              cold_min_era: float, cold_min_runs_each: int, cold_last_starts: int, debug: bool):
+    direct = _callable(provider, "pitcher_streaks")
+    if direct:
+        return _call_with_sig(
+            direct,
+            date=the_date,
+            hot_max_era=hot_max_era,
+            hot_min_ks_each=hot_min_ks_each,
+            hot_last_starts=hot_last_starts,
+            cold_min_era=cold_min_era,
+            cold_min_runs_each=cold_min_runs_each,
+            cold_last_starts=cold_last_starts,
+            debug=debug,
+        )
+    # If no pitcher method, return empty structure but 200 with a debug note
+    return {
+        "hot_pitchers": [],
+        "cold_pitchers": [],
+        "debug": {
+            "note": "pitcher_streaks not implemented by provider; returning empty lists",
+            "provider_module": provider_module,
+            "provider_class": provider_class,
+        },
+    }
 
 # ------------------
 # Hitters / Pitchers streak endpoints (GET + POST)
@@ -276,16 +339,12 @@ def hot_streak_hitters(
     debug: int = Query(0, ge=0, le=1),
 ):
     the_date = parse_date(date)
-    return safe_call(provider, "hot_streak_hitters",
-        date=the_date, min_avg=min_avg, games=games,
-        require_hit_each=bool(require_hit_each), debug=bool(debug))
+    return _hot_hitters_fallback(the_date, min_avg, games, bool(require_hit_each), bool(debug))
 
 @app.post("/hot_streak_hitters_post", operation_id="hot_streak_hitters_post")
 def hot_streak_hitters_post(req: HotHittersReq):
     the_date = parse_date(req.date)
-    return safe_call(provider, "hot_streak_hitters",
-        date=the_date, min_avg=req.min_avg, games=req.games,
-        require_hit_each=req.require_hit_each, debug=bool(req.debug))
+    return _hot_hitters_fallback(the_date, req.min_avg, req.games, req.require_hit_each, bool(req.debug))
 
 @app.get("/cold_streak_hitters", operation_id="cold_streak_hitters")
 def cold_streak_hitters(
@@ -296,16 +355,12 @@ def cold_streak_hitters(
     debug: int = Query(0, ge=0, le=1),
 ):
     the_date = parse_date(date)
-    return safe_call(provider, "cold_streak_hitters",
-        date=the_date, min_avg=min_avg, games=games,
-        require_zero_hit_each=bool(require_zero_hit_each), debug=bool(debug))
+    return _cold_hitters_fallback(the_date, min_avg, games, bool(require_zero_hit_each), bool(debug))
 
 @app.post("/cold_streak_hitters_post", operation_id="cold_streak_hitters_post")
 def cold_streak_hitters_post(req: ColdHittersReq):
     the_date = parse_date(req.date)
-    return safe_call(provider, "cold_streak_hitters",
-        date=the_date, min_avg=req.min_avg, games=req.games,
-        require_zero_hit_each=req.require_zero_hit_each, debug=bool(req.debug))
+    return _cold_hitters_fallback(the_date, req.min_avg, req.games, req.require_zero_hit_each, bool(req.debug))
 
 @app.get("/pitcher_streaks", operation_id="pitcher_streaks")
 def pitcher_streaks(
@@ -319,20 +374,18 @@ def pitcher_streaks(
     debug: int = Query(0, ge=0, le=1),
 ):
     the_date = parse_date(date)
-    return safe_call(provider, "pitcher_streaks",
-        date=the_date, hot_max_era=hot_max_era, hot_min_ks_each=hot_min_ks_each,
-        hot_last_starts=hot_last_starts, cold_min_era=cold_min_era,
-        cold_min_runs_each=cold_min_runs_each, cold_last_starts=cold_last_starts,
-        debug=bool(debug))
+    return _pitcher_streaks_fallback(
+        the_date, hot_max_era, hot_min_ks_each, hot_last_starts,
+        cold_min_era, cold_min_runs_each, cold_last_starts, bool(debug)
+    )
 
 @app.post("/pitcher_streaks_post", operation_id="pitcher_streaks_post")
 def pitcher_streaks_post(req: PitcherStreaksReq):
     the_date = parse_date(req.date)
-    return safe_call(provider, "pitcher_streaks",
-        date=the_date, hot_max_era=req.hot_max_era, hot_min_ks_each=req.hot_min_ks_each,
-        hot_last_starts=req.hot_last_starts, cold_min_era=req.cold_min_era,
-        cold_min_runs_each=req.cold_min_runs_each, cold_last_starts=req.cold_last_starts,
-        debug=bool(req.debug))
+    return _pitcher_streaks_fallback(
+        the_date, req.hot_max_era, req.hot_min_ks_each, req.hot_last_starts,
+        req.cold_min_era, req.cold_min_runs_each, req.cold_last_starts, bool(req.debug)
+    )
 
 @app.get("/cold_pitchers", operation_id="cold_pitchers")
 def cold_pitchers(
@@ -343,6 +396,7 @@ def cold_pitchers(
     debug: int = Query(0, ge=0, le=1),
 ):
     the_date = parse_date(date)
+    # Keep old behavior: if provider lacks this, surface 501
     return safe_call(provider, "cold_pitchers",
         date=the_date, min_era=min_era, min_runs_each=min_runs_each,
         last_starts=last_starts, debug=bool(debug))
@@ -353,6 +407,61 @@ def cold_pitchers_post(req: ColdPitchersReq):
     return safe_call(provider, "cold_pitchers",
         date=the_date, min_era=req.min_era, min_runs_each=req.min_runs_each,
         last_starts=req.last_starts, debug=bool(req.debug))
+
+# ------------------
+# League scan (GET convenience wrapper using provider's league_* methods)
+# ------------------
+@app.get("/league_scan", operation_id="league_scan")
+def league_scan(
+    date: Optional[str] = Query(None, description="today|yesterday|tomorrow|YYYY-MM-DD"),
+    limit: int = Query(15, ge=1, le=100),
+    debug: int = Query(0, ge=0, le=1),
+):
+    the_date = parse_date(date)
+    logs: List[str] = []
+    result: Dict[str, Any] = {"date": the_date.isoformat()}
+
+    # Matchups / schedule
+    sched_fn = _callable(provider, "schedule_for_date")
+    matchups: List[Dict[str, Any]] = []
+    if sched_fn:
+        logs.append("provider_call:schedule_for_date:found:schedule_for_date")
+        sched = _call_with_sig(sched_fn, date=the_date)
+        # Assume provider already shapes these; pass through
+        if isinstance(sched, list):
+            matchups = sched
+        elif isinstance(sched, dict) and "matchups" in sched:
+            matchups = sched.get("matchups") or []
+    else:
+        logs.append("provider_call:schedule_for_date:missing")
+
+    # Hot / Cold hitters via league_* (fallbacks)
+    hot = _hot_hitters_fallback(the_date, min_avg=0.0, games=5, require_hit_each=False, debug=bool(debug))
+    cold = _cold_hitters_fallback(the_date, min_avg=0.0, games=5, require_zero_hit_each=False, debug=bool(debug))
+
+    # Truncate to limit
+    hot_top = (hot or [])[:limit] if isinstance(hot, list) else (hot.get("hot_hitters", [])[:limit] if isinstance(hot, dict) else [])
+    cold_top = (cold or [])[:limit] if isinstance(cold, list) else (cold.get("cold_hitters", [])[:limit] if isinstance(cold, dict) else [])
+
+    result["counts"] = {
+        "matchups": len(matchups),
+        "hot_hitters": len(hot_top),
+        "cold_hitters": len(cold_top),
+    }
+    result["top"] = {
+        "hot_hitters": hot_top,
+        "cold_hitters": cold_top,
+    }
+    result["matchups"] = matchups
+
+    if debug == 1:
+        result["debug"] = {
+            "schedule_source": "schedule_for_date" if sched_fn else "(missing)",
+            "logs": logs,
+            "provider_module": provider_module,
+            "provider_class": provider_class,
+        }
+    return result
 
 # ------------------
 # Legacy slate_scan wrapper (kept intact; provider may not implement)
@@ -375,9 +484,13 @@ def slate_scan_post(req: DateOnlyReq):
 # ------------------
 # Include routers from routes/
 # ------------------
-# Important: /league_scan_post is defined in routes/league_scan.py (no slate dependency).
-from routes.league_scan import router as league_scan_router
-app.include_router(league_scan_router)
+# Important: /league_scan_post may also exist in routes/league_scan.py in your repo.
+try:
+    from routes.league_scan import router as league_scan_router
+    app.include_router(league_scan_router)
+except Exception as _e:
+    # If the routes module is absent in this deployment, ignore.
+    pass
 
 # ------------------
 # Run local
