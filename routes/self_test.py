@@ -6,6 +6,10 @@ import pytz
 from fastapi import APIRouter, Query, Request
 from fastapi.responses import JSONResponse
 
+# Force UTF-8 so names like “Agustín Ramírez” render correctly everywhere
+class UTF8JSONResponse(JSONResponse):
+    media_type = "application/json; charset=utf-8"
+
 router = APIRouter()
 
 # ------------------
@@ -101,7 +105,7 @@ def _check_call(provider: Any, method_name: str, **kwargs) -> Dict[str, Any]:
 # ------------------
 # Endpoint
 # ------------------
-@router.get("/self_test", response_class=JSONResponse)
+@router.get("/self_test", response_class=UTF8JSONResponse)
 def self_test(
     request: Request,
     date: Optional[str] = Query(None, description="today|yesterday|tomorrow|YYYY-MM-DD"),
@@ -138,6 +142,7 @@ def self_test(
         "schedule_for_date": _check_call(
             provider, "schedule_for_date", date_str=the_date.isoformat(), date=the_date, debug=bool(debug)
         ),
+        # Direct-only probes (OK to be false; your public endpoints adapt)
         "hot_streak_hitters": _take_n(
             _check_call(provider, "hot_streak_hitters", date=the_date, min_avg=0.0, games=5, require_hit_each=False, debug=bool(debug)),
             limit
@@ -164,7 +169,8 @@ def self_test(
         else:
             try:
                 res = _call_with_sig(fn, date=the_date, game_date=the_date, limit=50, team=None)
-                fetch_probe[name] = {"ok": True, "result_sample": _deep_fix(res[:3] if isinstance(res, list) else res)}
+                sample = res[:3] if isinstance(res, list) else res
+                fetch_probe[name] = {"ok": True, "result_sample": _deep_fix(sample)}
             except Exception as e:
                 fetch_probe[name] = {"ok": False, "error": str(e)}
     checks["provider_raw_probe"] = {"ok": True, "result": fetch_probe}
