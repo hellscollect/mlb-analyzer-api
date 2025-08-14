@@ -186,7 +186,7 @@ def provider_raw(
         out["debug"] = {
             "notes": "Called provider private fetches with signature-aware kwargs.",
             "hitter_fetch_params": list(inspect.signature(getattr(provider, "_fetch_hitter_rows")).parameters.keys()) if hasattr(provider, "_fetch_hitter_rows") else None,
-            "pitcher_fetch_params": list(inspect.signature(getattr(provider, "_fetch_pitcher_rows")).parameters.keys()) if hasattr(provider, "_fetch_pitcher_rows") else None,
+            "pitcher_fetch_params": list(inspect_signature(getattr(provider, "_fetch_pitcher_rows")).parameters.keys()) if hasattr(provider, "_fetch_pitcher_rows") else None,
             "requested_args": {"date": the_date.isoformat(), "limit": limit, "team": team},
             "provider_config": {
                 "fake_mode": os.getenv("PROD_USE_FAKE", "0") in ("1", "true", "True", "YES", "yes"),
@@ -345,6 +345,7 @@ class DateOnlyReq(BaseModel):
 
 @app.post("/slate_scan_post", response_model=SlateScanResp, operation_id="slate_scan_post")
 def slate_scan_post(req: DateOnlyReq):
+    # Keep existing behavior (this will 501 if provider lacks slate_scan)
     the_date = parse_date(req.date)
     resp = safe_call(provider, "slate_scan", date=the_date, debug=bool(req.debug))
     out = {
@@ -359,148 +360,73 @@ def slate_scan_post(req: DateOnlyReq):
     return out
 
 # ------------------
-# Helpers for upcoming-only league scan
+# Helpers for league scan (no slate dependency)
 # ------------------
-def _parse_et_time_str(s: Optional[str]) -> Optional[time_cls]:
-    if not s or not isinstance(s, str):
-        return None
-    s = s.strip()
-    for fmt in ("%H:%M", "%H:%M:%S", "%I:%M %p", "%I:%M:%S %p"):
-        try:
-            return datetime.strptime(s, fmt).time()
-        except ValueError:
-            continue
-    return None
+def _safe_hot(date_obj: date_cls, debug: bool) -> List[Dict[str, Any]]:
+    try:
+        return safe_call(provider, "hot_streak_hitters",
+                         date=date_obj, min_avg=0.280, games=3,
+                         require_hit_each=True, debug=debug)
+    except Exception:
+        return []
 
-def _game_has_started(game: Dict[str, Any], now_dt: datetime) -> bool:
-    status = str(game.get("status") or game.get("game_status") or "").strip().lower()
-    if status in {"in progress", "live", "final", "completed", "game over", "end"}:
-        return True
-    et_time_str = game.get("et_time") or game.get("game_time_et") or game.get("start_time_et")
-    t = _parse_et_time_str(et_time_str)
-    if t is None:
-        iso_dt = game.get("game_datetime_et") or game.get("start_datetime_et")
-        if iso_dt:
-            try:
-                dt = datetime.fromisoformat(iso_dt)
-                if dt.tzinfo is None:
-                    dt = ET_TZ.localize(dt)
-                return now_dt >= dt
-            except Exception:
-                return False
-        return status not in {"scheduled", "pregame", "preview"}
-    sched_dt = ET_TZ.localize(datetime.combine(now_dt.date(), t))
-    return now_dt >= sched_dt
-
-def _filter_upcoming_games(games: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    now = now_et()
-    return [g for g in games or [] if not _game_has_started(g, now)]
-
-def _teams_from_games(games: List[Dict[str, Any]]) -> set:
-    teams = set()
-    for g in games or []:
-        home = g.get("home_name") or g.get("home_team") or g.get("homeTeam") or g.get("home")
-        away = g.get("away_name") or g.get("away_team") or g.get("awayTeam") or g.get("away")
-        if isinstance(home, dict): home = home.get("name") or home.get("abbr") or home.get("team_name")
-        if isinstance(away, dict): away = away.get("name") or away.get("abbr") or away.get("team_name")
-        if home: teams.add(str(home))
-        if away: teams.add(str(away))
-    return teams
-
-def _filter_players_by_teams(players: List[Dict[str, Any]], team_names: set) -> List[Dict[str, Any]]:
-    if not players or not team_names:
-        return players or []
-    out = []
-    for p in players:
-        tn = p.get("team_name") or p.get("team") or p.get("teamAbbr")
-        if tn and str(tn) in team_names:
-            out.append(p)
-    return out
+def _safe_cold(date_obj: date_cls, debug: bool) -> List[Dict[str, Any]]:
+    try:
+        return safe_call(provider, "cold_streak_hitters",
+                         date=date_obj, min_avg=0.275, games=2,
+                         require_zero_hit_each=True, debug=debug)
+    except Exception:
+        return []
 
 # ------------------
-# NEW: full-league compact scan (upcoming-only + tomorrow fallback) COMPOSED (no provider.league_scan dependency)
+# NEW: /league_scan_post without slate_scan or league_scan provider dependency
 # ------------------
 @app.post("/league_scan_post", response_model=LeagueScanResp, operation_id="league_scan_post")
 def league_scan_post(req: LeagueScanReq):
     """
-    Compose league scan from existing provider methods:
-      - matchups via provider.slate_scan (if available)
-      - hot/cold hitters via provider hot/cold functions
-    Then filter to not-yet-started games (ET) and, if none remain today, fall back to tomorrow.
+    Returns hot/cold hitters for the requested date (no slate/matchups dependency).
+    If both lists are empty for the requested date, auto-tries tomorrow.
+    matchups is an empty list until the provider exposes schedule/matchups.
     """
     primary_date = parse_date(req.date)
     tomorrow_date = primary_date + timedelta(days=1)
+    debug_flag = bool(req.debug)
 
     def run_for(d: date_cls) -> Dict[str, Any]:
-        # 1) matchups from slate_scan (if implemented)
-        matchups = []
-        slate_debug = {}
-        try:
-            slate = safe_call(provider, "slate_scan", date=d, debug=False)
-            matchups = slate.get("matchups", []) if isinstance(slate, dict) else []
-            if isinstance(slate.get("debug"), dict):
-                slate_debug = slate["debug"]
-        except HTTPException as e:
-            if e.status_code != 501:
-                raise
-        except Exception:
-            pass
-
-        # 2) hot/cold hitters
-        try:
-            hot = safe_call(provider, "hot_streak_hitters", date=d, min_avg=0.280, games=3, require_hit_each=True, debug=bool(req.debug))
-        except Exception:
-            hot = []
-        try:
-            cold = safe_call(provider, "cold_streak_hitters", date=d, min_avg=0.275, games=2, require_zero_hit_each=True, debug=bool(req.debug))
-        except Exception:
-            cold = []
-
-        # 3) filter to upcoming-only + restrict hitters to upcoming teams
-        upcoming = _filter_upcoming_games(matchups)
-        scope = _teams_from_games(upcoming)
-        hot_f = _filter_players_by_teams(hot or [], scope)
-        cold_f = _filter_players_by_teams(cold or [], scope)
-
-        # 4) Optional trim to top_n for very long lists
+        hot = _safe_hot(d, debug_flag)
+        cold = _safe_cold(d, debug_flag)
         top_n = int(req.top_n) if req.top_n and req.top_n > 0 else 15
-        if len(hot_f) > top_n: hot_f = hot_f[:top_n]
-        if len(cold_f) > top_n: cold_f = cold_f[:top_n]
-
-        out = {
+        if len(hot) > top_n: hot = hot[:top_n]
+        if len(cold) > top_n: cold = cold[:top_n]
+        return {
             "date": d.isoformat(),
             "counts": {
-                "matchups": len(upcoming),
-                "hot_hitters": len(hot_f),
-                "cold_hitters": len(cold_f),
+                "matchups": 0,
+                "hot_hitters": len(hot),
+                "cold_hitters": len(cold),
             },
             "top": {
-                "hot_hitters": hot_f,
-                "cold_hitters": cold_f,
+                "hot_hitters": hot,
+                "cold_hitters": cold,
             },
-            "matchups": upcoming,
+            "matchups": [],
             "debug": {
-                "source": "composed",
-                "upcoming_filter": True,
+                "source": "hot_cold_only",
+                "note": "Provider lacks slate/matchups; returning hitters only.",
                 "requested_top_n": top_n,
             },
         }
-        if slate_debug:
-            out["debug"]["slate_debug"] = slate_debug
-        return out
 
-    # Try requested date first
     out_primary = run_for(primary_date)
-    if out_primary["counts"]["matchups"] >= 1:
+    if out_primary["counts"]["hot_hitters"] > 0 or out_primary["counts"]["cold_hitters"] > 0:
         return out_primary
 
-    # If no upcoming games remain for the requested date, pivot to tomorrow
     out_tomorrow = run_for(tomorrow_date)
-    if out_tomorrow["counts"]["matchups"] >= 1:
+    if out_tomorrow["counts"]["hot_hitters"] > 0 or out_tomorrow["counts"]["cold_hitters"] > 0:
+        out_tomorrow["debug"]["fallback"] = "tomorrow_used_no_hitters_today"
         return out_tomorrow
 
-    # Still nothing — return primary with explicit reason
-    out_primary["debug"]["fallback"] = "no_upcoming_today_or_tomorrow"
+    out_primary["debug"]["fallback"] = "no_hitters_today_or_tomorrow"
     return out_primary
 
 # ------------------
