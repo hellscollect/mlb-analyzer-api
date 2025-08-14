@@ -19,8 +19,8 @@ class UTF8JSONResponse(JSONResponse):
 
 # --- Server URL for OpenAPI (required by GPT Actions) ---
 EXTERNAL_URL = (
-    os.getenv("RENDER_EXTERNAL_URL")  # Render sets this automatically
-    or "https://mlb-analyzer-api.onrender.com"  # fallback to your host
+    os.getenv("RENDER_EXTERNAL_URL")
+    or "https://mlb-analyzer-api.onrender.com"
 )
 
 app = FastAPI(
@@ -29,7 +29,7 @@ app = FastAPI(
     description="Custom GPT + API for MLB streak analysis",
     servers=[{"url": EXTERNAL_URL}],
     openapi_url="/openapi.json",
-    default_response_class=UTF8JSONResponse,  # ensure charset=utf-8 header
+    default_response_class=UTF8JSONResponse,
 )
 
 # --- CORS ---
@@ -183,8 +183,20 @@ def _deep_fix(obj: Any) -> Any:
         return _fix_text(obj)
     return obj
 
+def _take_n(obj: Any, n: int) -> Any:
+    if isinstance(obj, list):
+        return obj[:n]
+    if isinstance(obj, dict):
+        out = dict(obj)
+        if "hot_hitters" in out and isinstance(out["hot_hitters"], list):
+            out["hot_hitters"] = out["hot_hitters"][:n]
+        if "cold_hitters" in out and isinstance(out["cold_hitters"], list):
+            out["cold_hitters"] = out["cold_hitters"][:n]
+        return out
+    return obj
+
 # ------------------
-# Models
+# Models (kept here so OpenAPI is complete)
 # ------------------
 class HealthResp(BaseModel):
     ok: bool
@@ -213,7 +225,8 @@ class HotHittersReq(BaseModel):
     min_avg: float = 0.280
     games: int = 3
     require_hit_each: bool = True
-    top_n: int = 25
+    top_n: Optional[int] = None  # prefer this
+    limit: Optional[int] = None  # accept this too
     debug: int = 0
 
 class ColdHittersReq(BaseModel):
@@ -221,7 +234,8 @@ class ColdHittersReq(BaseModel):
     min_avg: float = 0.275
     games: int = 2
     require_zero_hit_each: bool = True
-    top_n: int = 25
+    top_n: Optional[int] = None
+    limit: Optional[int] = None
     debug: int = 0
 
 class PitcherStreaksReq(BaseModel):
@@ -330,7 +344,7 @@ def provider_raw_post(req: ProviderRawReq):
     return out
 
 # ------------------
-# Compatibility wrappers for this provider (league_* + date_str adapters)
+# Compatibility wrappers (adapters for league_* + date_str + top_n)
 # ------------------
 def _hot_hitters_fallback(
     the_date: date_cls,
@@ -342,17 +356,19 @@ def _hot_hitters_fallback(
 ):
     direct = _callable(provider, "hot_streak_hitters")
     if direct:
-        return _deep_fix(_call_with_sig(
+        res = _call_with_sig(
             direct,
             date=the_date,
             min_avg=min_avg,
             games=games,
             require_hit_each=require_hit_each,
             debug=debug,
-        ))
+        )
+        return _take_n(_deep_fix(res), top_n)
+
     league = _callable(provider, "league_hot_hitters")
     if league:
-        return _deep_fix(_call_with_sig(
+        res = _call_with_sig(
             league,
             date_str=the_date.isoformat(),
             date=the_date,
@@ -360,7 +376,9 @@ def _hot_hitters_fallback(
             n=top_n,
             limit=top_n,
             debug=debug,
-        ))
+        )
+        return _take_n(_deep_fix(res), top_n)
+
     raise HTTPException(status_code=501, detail="Provider does not implement hot_streak_hitters() or league_hot_hitters().")
 
 def _cold_hitters_fallback(
@@ -373,17 +391,19 @@ def _cold_hitters_fallback(
 ):
     direct = _callable(provider, "cold_streak_hitters")
     if direct:
-        return _deep_fix(_call_with_sig(
+        res = _call_with_sig(
             direct,
             date=the_date,
             min_avg=min_avg,
             games=games,
             require_zero_hit_each=require_zero_hit_each,
             debug=debug,
-        ))
+        )
+        return _take_n(_deep_fix(res), top_n)
+
     league = _callable(provider, "league_cold_hitters")
     if league:
-        return _deep_fix(_call_with_sig(
+        res = _call_with_sig(
             league,
             date_str=the_date.isoformat(),
             date=the_date,
@@ -391,7 +411,9 @@ def _cold_hitters_fallback(
             n=top_n,
             limit=top_n,
             debug=debug,
-        ))
+        )
+        return _take_n(_deep_fix(res), top_n)
+
     raise HTTPException(status_code=501, detail="Provider does not implement cold_streak_hitters() or league_cold_hitters().")
 
 def _pitcher_streaks_fallback(the_date: date_cls, hot_max_era: float, hot_min_ks_each: int, hot_last_starts: int,
@@ -436,7 +458,7 @@ def _schedule_for_date(the_date: date_cls, debug: bool):
     return _deep_fix(resp)
 
 # ------------------
-# Endpoints
+# Hitters / Pitchers streak endpoints (GET + POST)
 # ------------------
 @app.get("/hot_streak_hitters", operation_id="hot_streak_hitters")
 def hot_streak_hitters(
@@ -444,20 +466,23 @@ def hot_streak_hitters(
     min_avg: float = Query(0.280),
     games: int = Query(3, ge=1),
     require_hit_each: int = Query(1, ge=0, le=1),
-    top_n: int = Query(25, ge=1, le=200),
+    limit: Optional[int] = Query(None, ge=1, le=200),   # keep old client param
+    top_n: Optional[int] = Query(None, ge=1, le=200),   # also accept top_n
     debug: int = Query(0, ge=0, le=1),
 ):
     the_date = parse_date(date)
+    n = top_n or limit or 25
     data = _hot_hitters_fallback(
-        the_date, min_avg, games, bool(require_hit_each), bool(debug), top_n=top_n
+        the_date, min_avg, games, bool(require_hit_each), bool(debug), top_n=n
     )
     return data
 
 @app.post("/hot_streak_hitters_post", operation_id="hot_streak_hitters_post")
 def hot_streak_hitters_post(req: HotHittersReq):
     the_date = parse_date(req.date)
+    n = (req.top_n or req.limit or 25)
     data = _hot_hitters_fallback(
-        the_date, req.min_avg, req.games, req.require_hit_each, bool(req.debug), top_n=req.top_n
+        the_date, req.min_avg, req.games, req.require_hit_each, bool(req.debug), top_n=n
     )
     return data
 
@@ -467,20 +492,23 @@ def cold_streak_hitters(
     min_avg: float = Query(0.275),
     games: int = Query(2, ge=1),
     require_zero_hit_each: int = Query(1, ge=0, le=1),
-    top_n: int = Query(25, ge=1, le=200),
+    limit: Optional[int] = Query(None, ge=1, le=200),
+    top_n: Optional[int] = Query(None, ge=1, le=200),
     debug: int = Query(0, ge=0, le=1),
 ):
     the_date = parse_date(date)
+    n = top_n or limit or 25
     data = _cold_hitters_fallback(
-        the_date, min_avg, games, bool(require_zero_hit_each), bool(debug), top_n=top_n
+        the_date, min_avg, games, bool(require_zero_hit_each), bool(debug), top_n=n
     )
     return data
 
 @app.post("/cold_streak_hitters_post", operation_id="cold_streak_hitters_post")
 def cold_streak_hitters_post(req: ColdHittersReq):
     the_date = parse_date(req.date)
+    n = (req.top_n or req.limit or 25)
     data = _cold_hitters_fallback(
-        the_date, req.min_avg, req.games, req.require_zero_hit_each, bool(req.debug), top_n=req.top_n
+        the_date, req.min_avg, req.games, req.require_zero_hit_each, bool(req.debug), top_n=n
     )
     return data
 
@@ -559,7 +587,7 @@ def league_scan(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"schedule_for_date failed: {type(e).__name__}: {e}")
 
-    # Hot / Cold hitters via league_* (uses date_str + top_n)
+    # Hot / Cold hitters via adapters
     hot = _hot_hitters_fallback(the_date, min_avg=0.0, games=5, require_hit_each=False, debug=bool(debug), top_n=limit)
     cold = _cold_hitters_fallback(the_date, min_avg=0.0, games=5, require_zero_hit_each=False, debug=bool(debug), top_n=limit)
 
@@ -593,6 +621,7 @@ try:
     from routes.league_scan import router as league_scan_router
     app.include_router(league_scan_router)
 except Exception:
+    # Optional router; ignore if not present
     pass
 
 # ------------------
