@@ -1,7 +1,3 @@
-# main.py
-
-from __future__ import annotations
-
 import os
 import importlib
 import inspect
@@ -10,7 +6,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.openapi.utils import get_openapi
 from pydantic import BaseModel
 import pytz
 
@@ -18,7 +13,7 @@ APP_NAME = "MLB Analyzer API"
 
 app = FastAPI(
     title=APP_NAME,
-    version="1.0.7",
+    version="1.0.5",
     description="Custom GPT + API for MLB streak analysis",
 )
 
@@ -31,26 +26,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- OpenAPI servers patch ---
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
-
-def custom_openapi():
-    if app.openapi_schema:
-        return app.openapi_schema
-    openapi_schema = get_openapi(
-        title=app.title,
-        version=app.version,
-        description=app.description,
-        routes=app.routes,
-    )
-    servers = [{"url": PUBLIC_BASE_URL or "http://localhost:8000"}]
-    openapi_schema["servers"] = servers
-    app.openapi_schema = openapi_schema
-    return app.openapi_schema
-
-app.openapi = custom_openapi  # type: ignore
-
-# --- Provider loading ---
+# ------------------
+# Provider loading
+# ------------------
 _last_provider_error: Optional[str] = None
 
 def load_provider() -> Tuple[Optional[Any], Optional[str], Optional[str]]:
@@ -70,7 +48,9 @@ def load_provider() -> Tuple[Optional[Any], Optional[str], Optional[str]]:
 
 provider, provider_module, provider_class = load_provider()
 
-# --- Utilities ---
+# ------------------
+# Utilities
+# ------------------
 def parse_date(d: Optional[str]) -> date_cls:
     tz = pytz.timezone("America/New_York")
     now = datetime.now(tz).date()
@@ -123,7 +103,9 @@ def _smart_call_fetch(method_name: str, the_date: date_cls, limit: Optional[int]
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error calling {method_name}: {type(e).__name__}: {e}")
 
-# --- Models ---
+# ------------------
+# Models
+# ------------------
 class HealthResp(BaseModel):
     ok: bool
     provider_loaded: bool
@@ -140,65 +122,22 @@ class SlateScanResp(BaseModel):
     matchups: List[Dict[str, Any]]
     debug: Optional[Dict[str, Any]] = None
 
-class ProviderRawReq(BaseModel):
+# NEW: compact full-league scan
+class LeagueScanReq(BaseModel):
     date: Optional[str] = None
-    limit: Optional[int] = None
-    team: Optional[str] = None
+    top_n: int = 15
     debug: int = 0
 
-class HotHittersReq(BaseModel):
-    date: Optional[str] = None
-    min_avg: float = 0.280
-    games: int = 3
-    require_hit_each: bool = True
-    debug: int = 0
+class LeagueScanResp(BaseModel):
+    date: str
+    counts: Dict[str, int]
+    top: Dict[str, List[Dict[str, Any]]]
+    matchups: List[Dict[str, Any]]
+    debug: Optional[Dict[str, Any]] = None
 
-class ColdHittersReq(BaseModel):
-    date: Optional[str] = None
-    min_avg: float = 0.275
-    games: int = 2
-    require_zero_hit_each: bool = True
-    debug: int = 0
-
-class PitcherStreaksReq(BaseModel):
-    date: Optional[str] = None
-    hot_max_era: float = 4.00
-    hot_min_ks_each: int = 6
-    hot_last_starts: int = 3
-    cold_min_era: float = 4.60
-    cold_min_runs_each: int = 3
-    cold_last_starts: int = 2
-    debug: int = 0
-
-class ColdPitchersReq(BaseModel):
-    date: Optional[str] = None
-    min_era: float = 4.60
-    min_runs_each: int = 3
-    last_starts: int = 2
-    debug: int = 0
-
-class DateOnlyReq(BaseModel):
-    date: Optional[str] = None
-    debug: int = 0
-
-class SlateScanReq(BaseModel):
-    date: Optional[str] = None
-    max_teams: int = 16
-    per_team: int = 8
-    debug: int = 1
-
-# Lightweight smoke test
-class SmokeReq(BaseModel):
-    date: Optional[str] = None
-    max_teams: int = 6
-    per_team: int = 2
-    debug: int = 1
-
-# Diagnostics
-class DiagDateReq(BaseModel):
-    date: Optional[str] = None
-
-# --- Health ---
+# ------------------
+# Health
+# ------------------
 @app.get("/health", response_model=HealthResp, operation_id="health")
 def health(tz: str = Query("America/New_York", description="IANA timezone for timestamp echo")):
     try:
@@ -215,7 +154,9 @@ def health(tz: str = Query("America/New_York", description="IANA timezone for ti
         now_local=now_str,
     )
 
-# --- Raw provider rows (GET) ---
+# ------------------
+# Raw provider rows endpoint (temporary)
+# ------------------
 @app.get("/provider_raw", operation_id="provider_raw")
 def provider_raw(
     date: Optional[str] = Query(None),
@@ -251,7 +192,9 @@ def provider_raw(
         }
     return out
 
-# --- Existing GET endpoints ---
+# ------------------
+# Existing endpoints (GET)
+# ------------------
 @app.get("/hot_streak_hitters", operation_id="hot_streak_hitters")
 def hot_streak_hitters(
     date: Optional[str] = Query(None),
@@ -309,88 +252,97 @@ def cold_pitchers(
         date=the_date, min_era=min_era, min_runs_each=min_runs_each,
         last_starts=last_starts, debug=bool(debug))
 
-@app.get("/slate_scan", response_model=SlateScanResp, operation_id="slate_scan")
-def slate_scan(
-    date: Optional[str] = Query(None),
-    max_teams: int = Query(16, ge=2, le=30),
-    per_team: int = Query(8, ge=1, le=15),
-    debug: int = Query(0, ge=0, le=1),
-):
-    the_date = parse_date(date)
-    resp = safe_call(provider, "slate_scan", date=the_date, max_teams=max_teams, per_team=per_team, debug=bool(debug))
-    out = {
-        "hot_hitters": resp.get("hot_hitters", []),
-        "cold_hitters": resp.get("cold_hitters", []),
-        "hot_pitchers": resp.get("hot_pitchers", []),
-        "cold_pitchers": resp.get("cold_pitchers", []),
-        "matchups": resp.get("matchups", []),
-    }
-    if debug == 1:
-        out["debug"] = resp.get("debug", {})
-    return out
+# ------------------
+# POST wrappers for Actions
+# ------------------
+class ProviderRawReq(BaseModel):
+    date: Optional[str] = None
+    limit: Optional[int] = None
+    team: Optional[str] = None
+    debug: int = 0
 
-# --- POST wrappers (for Actions) ---
 @app.post("/provider_raw_post", operation_id="provider_raw_post")
-def provider_raw_post(body: ProviderRawReq):
-    the_date = parse_date(body.date)
-    hitters = _smart_call_fetch("_fetch_hitter_rows", the_date, body.limit, body.team)
-    pitchers = _smart_call_fetch("_fetch_pitcher_rows", the_date, body.limit, body.team)
+def provider_raw_post(req: ProviderRawReq):
+    the_date = parse_date(req.date)
+    hitters = _smart_call_fetch("_fetch_hitter_rows", the_date, req.limit, req.team)
+    pitchers = _smart_call_fetch("_fetch_pitcher_rows", the_date, req.limit, req.team)
     out = {
-        "meta": {
-            "provider_module": provider_module,
-            "provider_class": provider_class,
-            "date": the_date.isoformat(),
-        },
         "hitters_raw": hitters,
         "pitchers_raw": pitchers,
     }
-    if body.debug == 1:
-        provider_base = getattr(provider, "base", None)
-        provider_key_present = bool(getattr(provider, "key", "") or os.getenv("DATA_API_KEY"))
-        out["debug"] = {
-            "requested_args": {"date": the_date.isoformat(), "limit": body.limit, "team": body.team},
-            "provider_config": {
-                "data_api_base": provider_base or "(unset)",
-                "has_api_key": provider_key_present,
-            }
-        }
+    if req.debug == 1:
+        out["debug"] = {"requested": req.model_dump()}
     return out
 
+class HotHittersReq(BaseModel):
+    date: Optional[str] = None
+    min_avg: float = 0.280
+    games: int = 3
+    require_hit_each: bool = True
+    debug: int = 0
+
 @app.post("/hot_streak_hitters_post", operation_id="hot_streak_hitters_post")
-def hot_streak_hitters_post(body: HotHittersReq):
-    the_date = parse_date(body.date)
+def hot_streak_hitters_post(req: HotHittersReq):
+    the_date = parse_date(req.date)
     return safe_call(provider, "hot_streak_hitters",
-        date=the_date, min_avg=body.min_avg, games=body.games,
-        require_hit_each=bool(body.require_hit_each), debug=bool(body.debug))
+        date=the_date, min_avg=req.min_avg, games=req.games,
+        require_hit_each=req.require_hit_each, debug=bool(req.debug))
+
+class ColdHittersReq(BaseModel):
+    date: Optional[str] = None
+    min_avg: float = 0.275
+    games: int = 2
+    require_zero_hit_each: bool = True
+    debug: int = 0
 
 @app.post("/cold_streak_hitters_post", operation_id="cold_streak_hitters_post")
-def cold_streak_hitters_post(body: ColdHittersReq):
-    the_date = parse_date(body.date)
+def cold_streak_hitters_post(req: ColdHittersReq):
+    the_date = parse_date(req.date)
     return safe_call(provider, "cold_streak_hitters",
-        date=the_date, min_avg=body.min_avg, games=body.games,
-        require_zero_hit_each=bool(body.require_zero_hit_each), debug=bool(body.debug))
+        date=the_date, min_avg=req.min_avg, games=req.games,
+        require_zero_hit_each=req.require_zero_hit_each, debug=bool(req.debug))
+
+class PitcherStreaksReq(BaseModel):
+    date: Optional[str] = None
+    hot_max_era: float = 4.0
+    hot_min_ks_each: int = 6
+    hot_last_starts: int = 3
+    cold_min_era: float = 4.6
+    cold_min_runs_each: int = 3
+    cold_last_starts: int = 2
+    debug: int = 0
 
 @app.post("/pitcher_streaks_post", operation_id="pitcher_streaks_post")
-def pitcher_streaks_post(body: PitcherStreaksReq):
-    the_date = parse_date(body.date)
+def pitcher_streaks_post(req: PitcherStreaksReq):
+    the_date = parse_date(req.date)
     return safe_call(provider, "pitcher_streaks",
-        date=the_date, hot_max_era=body.hot_max_era, hot_min_ks_each=body.hot_min_ks_each,
-        hot_last_starts=body.hot_last_starts, cold_min_era=body.cold_min_era,
-        cold_min_runs_each=body.cold_min_runs_each, cold_last_starts=body.cold_last_starts,
-        debug=bool(body.debug))
+        date=the_date, hot_max_era=req.hot_max_era, hot_min_ks_each=req.hot_min_ks_each,
+        hot_last_starts=req.hot_last_starts, cold_min_era=req.cold_min_era,
+        cold_min_runs_each=req.cold_min_runs_each, cold_last_starts=req.cold_last_starts,
+        debug=bool(req.debug))
+
+class ColdPitchersReq(BaseModel):
+    date: Optional[str] = None
+    min_era: float = 4.6
+    min_runs_each: int = 3
+    last_starts: int = 2
+    debug: int = 0
 
 @app.post("/cold_pitchers_post", operation_id="cold_pitchers_post")
-def cold_pitchers_post(body: ColdPitchersReq):
-    the_date = parse_date(body.date)
+def cold_pitchers_post(req: ColdPitchersReq):
+    the_date = parse_date(req.date)
     return safe_call(provider, "cold_pitchers",
-        date=the_date, min_era=body.min_era, min_runs_each=body.min_runs_each,
-        last_starts=body.last_starts, debug=bool(body.debug))
+        date=the_date, min_era=req.min_era, min_runs_each=req.min_runs_each,
+        last_starts=req.last_starts, debug=bool(req.debug))
+
+class DateOnlyReq(BaseModel):
+    date: Optional[str] = None
+    debug: int = 0
 
 @app.post("/slate_scan_post", response_model=SlateScanResp, operation_id="slate_scan_post")
-def slate_scan_post(body: SlateScanReq):
-    the_date = parse_date(body.date)
-    resp = safe_call(provider, "slate_scan",
-        date=the_date, max_teams=body.max_teams, per_team=body.per_team, debug=bool(body.debug))
+def slate_scan_post(req: DateOnlyReq):
+    the_date = parse_date(req.date)
+    resp = safe_call(provider, "slate_scan", date=the_date, debug=bool(req.debug))
     out = {
         "hot_hitters": resp.get("hot_hitters", []),
         "cold_hitters": resp.get("cold_hitters", []),
@@ -398,28 +350,20 @@ def slate_scan_post(body: SlateScanReq):
         "cold_pitchers": resp.get("cold_pitchers", []),
         "matchups": resp.get("matchups", []),
     }
-    if body.debug == 1:
+    if req.debug == 1:
         out["debug"] = resp.get("debug", {})
     return out
 
-# --- Diagnostics (POST) ---
-@app.post("/diag_schedule_post", operation_id="diag_schedule_post")
-def diag_schedule_post(body: DiagDateReq):
-    the_date = parse_date(body.date)
-    if provider is None:
-        raise HTTPException(status_code=503, detail="Provider not loaded")
-    if not hasattr(provider, "debug_schedule"):
-        raise HTTPException(status_code=501, detail="Provider missing debug_schedule()")
-    return provider.debug_schedule(date=the_date)
+# NEW: full-league compact scan (all teams/players, top-N only)
+@app.post("/league_scan_post", response_model=LeagueScanResp, operation_id="league_scan_post")
+def league_scan_post(req: LeagueScanReq):
+    the_date = parse_date(req.date)
+    resp = safe_call(provider, "league_scan", date=the_date, top_n=int(req.top_n), debug=bool(req.debug))
+    return resp
 
-# --- ONE-SHOT, SMALL PAYLOAD SMOKE TEST (POST) ---
-@app.post("/smoke_post", operation_id="smoke_post")
-def smoke_post(body: SmokeReq):
-    the_date = parse_date(body.date)
-    return safe_call(provider, "light_slate",
-        date=the_date, max_teams=body.max_teams, per_team=body.per_team, debug=bool(body.debug))
-
-# --- Run local ---
+# ------------------
+# Run local
+# ------------------
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=True)
