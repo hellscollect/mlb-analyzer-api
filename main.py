@@ -19,7 +19,7 @@ EXTERNAL_URL = (
 
 app = FastAPI(
     title=APP_NAME,
-    version="1.1.0",
+    version="1.1.1",
     description="Custom GPT + API for MLB streak analysis",
     servers=[{"url": EXTERNAL_URL}],
     openapi_url="/openapi.json",
@@ -91,7 +91,10 @@ def _callable(obj: Any, name: str):
     return fn if callable(fn) else None
 
 def _call_with_sig(fn, **kwargs):
-    """Call function with only the kwargs its signature accepts."""
+    """
+    Call function with only the kwargs its signature accepts.
+    Useful for adapting to providers with slightly different names.
+    """
     if fn is None:
         raise HTTPException(status_code=501, detail="Provider method missing")
     try:
@@ -168,6 +171,7 @@ class HotHittersReq(BaseModel):
     min_avg: float = 0.280
     games: int = 3
     require_hit_each: bool = True
+    top_n: int = 25
     debug: int = 0
 
 class ColdHittersReq(BaseModel):
@@ -175,6 +179,7 @@ class ColdHittersReq(BaseModel):
     min_avg: float = 0.275
     games: int = 2
     require_zero_hit_each: bool = True
+    top_n: int = 25
     debug: int = 0
 
 class PitcherStreaksReq(BaseModel):
@@ -228,7 +233,6 @@ def provider_raw(
     debug: int = Query(0, ge=0, le=1),
 ):
     the_date = parse_date(date)
-    # Original private fetchers are not implemented by StatsApiProvider -> return 501 to be explicit.
     hitter_fetch = _callable(provider, "_fetch_hitter_rows")
     pitcher_fetch = _callable(provider, "_fetch_pitcher_rows")
     if not hitter_fetch or not pitcher_fetch:
@@ -275,30 +279,70 @@ def provider_raw_post(req: ProviderRawReq):
     return out
 
 # ------------------
-# Compatibility wrappers for this provider (league_* fallbacks)
+# Compatibility wrappers for this provider (league_* + date_str adapters)
 # ------------------
-def _hot_hitters_fallback(the_date: date_cls, min_avg: float, games: int, require_hit_each: bool, debug: bool):
+def _hot_hitters_fallback(
+    the_date: date_cls,
+    min_avg: float,
+    games: int,
+    require_hit_each: bool,
+    debug: bool,
+    top_n: int = 25,
+):
     # Prefer exact method if implemented
     direct = _callable(provider, "hot_streak_hitters")
     if direct:
-        return _call_with_sig(direct, date=the_date, min_avg=min_avg, games=games,
-                              require_hit_each=require_hit_each, debug=debug)
-    # Fallback to league method (implemented by StatsApiProvider)
+        return _call_with_sig(
+            direct,
+            date=the_date,
+            min_avg=min_avg,
+            games=games,
+            require_hit_each=require_hit_each,
+            debug=debug,
+        )
+    # Fallback to provider's league_* that requires date_str + top_n
     league = _callable(provider, "league_hot_hitters")
     if league:
-        return _call_with_sig(league, date=the_date, games=games, min_avg=min_avg,
-                              require_hit_each=require_hit_each, debug=debug)
+        return _call_with_sig(
+            league,
+            date_str=the_date.isoformat(),
+            date=the_date,     # in case provider accepts 'date' instead
+            top_n=top_n,
+            n=top_n,           # alternate name just in case
+            limit=top_n,       # alternate name just in case
+            debug=debug,
+        )
     raise HTTPException(status_code=501, detail="Provider does not implement hot_streak_hitters() or league_hot_hitters().")
 
-def _cold_hitters_fallback(the_date: date_cls, min_avg: float, games: int, require_zero_hit_each: bool, debug: bool):
+def _cold_hitters_fallback(
+    the_date: date_cls,
+    min_avg: float,
+    games: int,
+    require_zero_hit_each: bool,
+    debug: bool,
+    top_n: int = 25,
+):
     direct = _callable(provider, "cold_streak_hitters")
     if direct:
-        return _call_with_sig(direct, date=the_date, min_avg=min_avg, games=games,
-                              require_zero_hit_each=require_zero_hit_each, debug=debug)
+        return _call_with_sig(
+            direct,
+            date=the_date,
+            min_avg=min_avg,
+            games=games,
+            require_zero_hit_each=require_zero_hit_each,
+            debug=debug,
+        )
     league = _callable(provider, "league_cold_hitters")
     if league:
-        return _call_with_sig(league, date=the_date, games=games, min_avg=min_avg,
-                              require_zero_hit_each=require_zero_hit_each, debug=debug)
+        return _call_with_sig(
+            league,
+            date_str=the_date.isoformat(),
+            date=the_date,
+            top_n=top_n,
+            n=top_n,
+            limit=top_n,
+            debug=debug,
+        )
     raise HTTPException(status_code=501, detail="Provider does not implement cold_streak_hitters() or league_cold_hitters().")
 
 def _pitcher_streaks_fallback(the_date: date_cls, hot_max_era: float, hot_min_ks_each: int, hot_last_starts: int,
@@ -327,6 +371,23 @@ def _pitcher_streaks_fallback(the_date: date_cls, hot_max_era: float, hot_min_ks
         },
     }
 
+def _schedule_for_date(the_date: date_cls, debug: bool):
+    sched_fn = _callable(provider, "schedule_for_date")
+    if not sched_fn:
+        return []
+    # Provider needs date_str; adapt gracefully
+    resp = _call_with_sig(
+        sched_fn,
+        date_str=the_date.isoformat(),
+        date=the_date,  # if provider accepts a date instead
+        debug=debug,
+    )
+    if isinstance(resp, list):
+        return resp
+    if isinstance(resp, dict) and "matchups" in resp:
+        return resp.get("matchups") or []
+    return resp
+
 # ------------------
 # Hitters / Pitchers streak endpoints (GET + POST)
 # ------------------
@@ -336,15 +397,20 @@ def hot_streak_hitters(
     min_avg: float = Query(0.280),
     games: int = Query(3, ge=1),
     require_hit_each: int = Query(1, ge=0, le=1),
+    top_n: int = Query(25, ge=1, le=200),
     debug: int = Query(0, ge=0, le=1),
 ):
     the_date = parse_date(date)
-    return _hot_hitters_fallback(the_date, min_avg, games, bool(require_hit_each), bool(debug))
+    return _hot_hitters_fallback(
+        the_date, min_avg, games, bool(require_hit_each), bool(debug), top_n=top_n
+    )
 
 @app.post("/hot_streak_hitters_post", operation_id="hot_streak_hitters_post")
 def hot_streak_hitters_post(req: HotHittersReq):
     the_date = parse_date(req.date)
-    return _hot_hitters_fallback(the_date, req.min_avg, req.games, req.require_hit_each, bool(req.debug))
+    return _hot_hitters_fallback(
+        the_date, req.min_avg, req.games, req.require_hit_each, bool(req.debug), top_n=req.top_n
+    )
 
 @app.get("/cold_streak_hitters", operation_id="cold_streak_hitters")
 def cold_streak_hitters(
@@ -352,15 +418,20 @@ def cold_streak_hitters(
     min_avg: float = Query(0.275),
     games: int = Query(2, ge=1),
     require_zero_hit_each: int = Query(1, ge=0, le=1),
+    top_n: int = Query(25, ge=1, le=200),
     debug: int = Query(0, ge=0, le=1),
 ):
     the_date = parse_date(date)
-    return _cold_hitters_fallback(the_date, min_avg, games, bool(require_zero_hit_each), bool(debug))
+    return _cold_hitters_fallback(
+        the_date, min_avg, games, bool(require_zero_hit_each), bool(debug), top_n=top_n
+    )
 
 @app.post("/cold_streak_hitters_post", operation_id="cold_streak_hitters_post")
 def cold_streak_hitters_post(req: ColdHittersReq):
     the_date = parse_date(req.date)
-    return _cold_hitters_fallback(the_date, req.min_avg, req.games, req.require_zero_hit_each, bool(req.debug))
+    return _cold_hitters_fallback(
+        the_date, req.min_avg, req.games, req.require_zero_hit_each, bool(req.debug), top_n=req.top_n
+    )
 
 @app.get("/pitcher_streaks", operation_id="pitcher_streaks")
 def pitcher_streaks(
@@ -414,49 +485,48 @@ def cold_pitchers_post(req: ColdPitchersReq):
 @app.get("/league_scan", operation_id="league_scan")
 def league_scan(
     date: Optional[str] = Query(None, description="today|yesterday|tomorrow|YYYY-MM-DD"),
-    limit: int = Query(15, ge=1, le=100),
+    limit: int = Query(15, ge=1, le=200),
     debug: int = Query(0, ge=0, le=1),
 ):
     the_date = parse_date(date)
     logs: List[str] = []
     result: Dict[str, Any] = {"date": the_date.isoformat()}
 
-    # Matchups / schedule
-    sched_fn = _callable(provider, "schedule_for_date")
-    matchups: List[Dict[str, Any]] = []
-    if sched_fn:
-        logs.append("provider_call:schedule_for_date:found:schedule_for_date")
-        sched = _call_with_sig(sched_fn, date=the_date)
-        # Assume provider already shapes these; pass through
-        if isinstance(sched, list):
-            matchups = sched
-        elif isinstance(sched, dict) and "matchups" in sched:
-            matchups = sched.get("matchups") or []
-    else:
-        logs.append("provider_call:schedule_for_date:missing")
+    # Matchups / schedule (provider expects date_str)
+    try:
+        matchups = _schedule_for_date(the_date, bool(debug))
+        logs.append("provider_call:schedule_for_date:ok")
+    except HTTPException as e:
+        if e.status_code == 501:
+            logs.append("provider_call:schedule_for_date:missing")
+            matchups = []
+        else:
+            raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"schedule_for_date failed: {type(e).__name__}: {e}")
 
-    # Hot / Cold hitters via league_* (fallbacks)
-    hot = _hot_hitters_fallback(the_date, min_avg=0.0, games=5, require_hit_each=False, debug=bool(debug))
-    cold = _cold_hitters_fallback(the_date, min_avg=0.0, games=5, require_zero_hit_each=False, debug=bool(debug))
+    # Hot / Cold hitters via league_* (uses date_str + top_n)
+    hot = _hot_hitters_fallback(the_date, min_avg=0.0, games=5, require_hit_each=False, debug=bool(debug), top_n=limit)
+    cold = _cold_hitters_fallback(the_date, min_avg=0.0, games=5, require_zero_hit_each=False, debug=bool(debug), top_n=limit)
 
-    # Truncate to limit
-    hot_top = (hot or [])[:limit] if isinstance(hot, list) else (hot.get("hot_hitters", [])[:limit] if isinstance(hot, dict) else [])
-    cold_top = (cold or [])[:limit] if isinstance(cold, list) else (cold.get("cold_hitters", [])[:limit] if isinstance(cold, dict) else [])
+    # Normalize to lists
+    hot_list = hot if isinstance(hot, list) else hot.get("hot_hitters", []) if isinstance(hot, dict) else []
+    cold_list = cold if isinstance(cold, list) else cold.get("cold_hitters", []) if isinstance(cold, dict) else []
 
     result["counts"] = {
         "matchups": len(matchups),
-        "hot_hitters": len(hot_top),
-        "cold_hitters": len(cold_top),
+        "hot_hitters": len(hot_list),
+        "cold_hitters": len(cold_list),
     }
     result["top"] = {
-        "hot_hitters": hot_top,
-        "cold_hitters": cold_top,
+        "hot_hitters": hot_list[:limit],
+        "cold_hitters": cold_list[:limit],
     }
     result["matchups"] = matchups
 
     if debug == 1:
         result["debug"] = {
-            "schedule_source": "schedule_for_date" if sched_fn else "(missing)",
+            "schedule_source": "schedule_for_date",
             "logs": logs,
             "provider_module": provider_module,
             "provider_class": provider_class,
@@ -484,11 +554,10 @@ def slate_scan_post(req: DateOnlyReq):
 # ------------------
 # Include routers from routes/
 # ------------------
-# Important: /league_scan_post may also exist in routes/league_scan.py in your repo.
 try:
     from routes.league_scan import router as league_scan_router
     app.include_router(league_scan_router)
-except Exception as _e:
+except Exception:
     # If the routes module is absent in this deployment, ignore.
     pass
 
