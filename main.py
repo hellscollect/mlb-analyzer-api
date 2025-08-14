@@ -1,7 +1,7 @@
 import os
 import importlib
 import inspect
-from datetime import datetime, timedelta, date as date_cls, time as time_cls
+from datetime import datetime, timedelta, date as date_cls
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, Query, HTTPException
@@ -52,9 +52,6 @@ provider, provider_module, provider_class = load_provider()
 # ------------------
 # Utilities
 # ------------------
-def now_et() -> datetime:
-    return datetime.now(ET_TZ)
-
 def parse_date(d: Optional[str]) -> date_cls:
     tz = ET_TZ
     now = datetime.now(tz).date()
@@ -186,7 +183,7 @@ def provider_raw(
         out["debug"] = {
             "notes": "Called provider private fetches with signature-aware kwargs.",
             "hitter_fetch_params": list(inspect.signature(getattr(provider, "_fetch_hitter_rows")).parameters.keys()) if hasattr(provider, "_fetch_hitter_rows") else None,
-            "pitcher_fetch_params": list(inspect_signature(getattr(provider, "_fetch_pitcher_rows")).parameters.keys()) if hasattr(provider, "_fetch_pitcher_rows") else None,
+            "pitcher_fetch_params": list(inspect.signature(getattr(provider, "_fetch_pitcher_rows")).parameters.keys()) if hasattr(provider, "_fetch_pitcher_rows") else None,
             "requested_args": {"date": the_date.isoformat(), "limit": limit, "team": team},
             "provider_config": {
                 "fake_mode": os.getenv("PROD_USE_FAKE", "0") in ("1", "true", "True", "YES", "yes"),
@@ -345,7 +342,7 @@ class DateOnlyReq(BaseModel):
 
 @app.post("/slate_scan_post", response_model=SlateScanResp, operation_id="slate_scan_post")
 def slate_scan_post(req: DateOnlyReq):
-    # Keep existing behavior (this will 501 if provider lacks slate_scan)
+    # Unchanged; will 501 if provider doesn't have slate_scan()
     the_date = parse_date(req.date)
     resp = safe_call(provider, "slate_scan", date=the_date, debug=bool(req.debug))
     out = {
@@ -379,9 +376,9 @@ def _safe_cold(date_obj: date_cls, debug: bool) -> List[Dict[str, Any]]:
         return []
 
 # ------------------
-# NEW: /league_scan_post without slate_scan or league_scan provider dependency
+# /league_scan_post WITHOUT slate_scan dependency
 # ------------------
-@app.post("/league_scan_post", response_model=LeagueScanResp, operation_id="league_scan_post")
+@app.post("/league_scan_post", response_model=LeagueScanResp, operation_id="league_scan_post_v2")
 def league_scan_post(req: LeagueScanReq):
     """
     Returns hot/cold hitters for the requested date (no slate/matchups dependency).
