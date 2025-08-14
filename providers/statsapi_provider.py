@@ -1,8 +1,10 @@
 # providers/statsapi_provider.py
 from __future__ import annotations
+
 import os, sys
 from typing import Any, Dict, List, Optional, Tuple
 from datetime import date as date_cls, datetime, timezone
+from statistics import mean
 from zoneinfo import ZoneInfo
 import httpx
 
@@ -17,7 +19,7 @@ class StatsApiProvider:
     Endpoints used:
       - /api/v1/schedule?date=YYYY-MM-DD&sportId=1&hydrate=probablePitcher
       - /api/v1/teams/{team_id}/roster?rosterType=active
-      - /api/v1/people/{player_id}/stats?stats=season&group=hitting|pitching&season=YYYY
+      - /api/v1/people/{player_id}/stats?stats=season|gameLog&group=hitting|pitching&season=YYYY
     """
 
     def __init__(self):
@@ -62,14 +64,9 @@ class StatsApiProvider:
 
     # -------- time helpers --------
     def _to_et_str(self, game_date_utc: Optional[str]) -> Optional[str]:
-        """
-        Convert MLB 'gameDate' (UTC ISO8601) -> 'YYYY-MM-DD HH:MM ET'
-        Returns None if the input is missing or malformed.
-        """
         if not game_date_utc:
             return None
         try:
-            # MLB gameDate is Zulu (UTC), e.g. "2025-08-13T18:10:00Z"
             if game_date_utc.endswith("Z"):
                 dt_utc = datetime.fromisoformat(game_date_utc.replace("Z", "+00:00"))
             else:
@@ -84,17 +81,12 @@ class StatsApiProvider:
 
     # -------- schedule helpers --------
     def _schedule_games(self, d: date_cls) -> List[Dict[str, Any]]:
-        """
-        Return the raw list of games for the date (already de-nested from 'dates').
-        We ask MLB to hydrate probable pitchers directly in the schedule payload.
-        """
         try:
             sch = self._get(
                 "/api/v1/schedule",
                 {
                     "date": d.isoformat(),
                     "sportId": 1,
-                    # Hydrate probable pitchers so we get IDs + names when available
                     "hydrate": "probablePitcher",
                 },
             )
@@ -112,9 +104,6 @@ class StatsApiProvider:
         return games
 
     def _teams_playing_on(self, d: date_cls) -> List[Dict[str, Any]]:
-        """
-        Build a unique team list from schedule JSON.
-        """
         games = self._schedule_games(d)
         teams: List[Dict[str, Any]] = []
         for g in games:
@@ -135,15 +124,6 @@ class StatsApiProvider:
         return out
 
     def _build_matchups(self, d: date_cls) -> List[Dict[str, Any]]:
-        """
-        Construct matchup objects from schedule (no extra API calls):
-          - gamePk
-          - gameDate (UTC ISO) + et_time (America/New_York)
-          - status (e.g., "Preview", "Live", "Final")
-          - venue name
-          - home/away team ids & names
-          - probable pitchers (ids & names) if present
-        """
         games = self._schedule_games(d)
         matchups: List[Dict[str, Any]] = []
         for g in games:
@@ -163,7 +143,7 @@ class StatsApiProvider:
             matchups.append({
                 "game_pk": g.get("gamePk"),
                 "game_date_utc": game_date_utc,
-                "et_time": et_time,  # NEW: friendly ET string
+                "et_time": et_time,  # Friendly ET string
                 "status": status,
                 "venue": venue_name,
                 "home": {
@@ -197,6 +177,32 @@ class StatsApiProvider:
         splits = stats[0].get("splits") or []
         return (splits[0].get("stat") if splits else {}) or {}
 
+    def _player_game_logs(self, player_id: int, season_year: int, group: str, limit: int = 30) -> List[Dict[str, Any]]:
+        """
+        Returns most recent game logs (descending by date in API). We'll re-sort oldest->newest for streak math.
+        """
+        data = self._get(
+            f"/api/v1/people/{player_id}/stats",
+            {"stats": "gameLog", "group": group, "season": season_year},
+        )
+        stats = data.get("stats") or []
+        if not stats:
+            return []
+        splits = (stats[0].get("splits") or [])[:limit]
+        # Normalize minimal fields we need
+        logs: List[Dict[str, Any]] = []
+        for s in splits:
+            stat = s.get("stat") or {}
+            logs.append({
+                "date": s.get("date"),  # e.g., "2025-08-10"
+                "hits": _safe_int(stat.get("hits")) or 0,
+                "atBats": _safe_int(stat.get("atBats")) or 0,
+                "avg": _safe_float(stat.get("avg")),  # per-game AVG, often None; not used in core calc
+            })
+        # API returns most recent first; reverse to oldest->newest for run detection
+        logs.reverse()
+        return logs
+
     # -------- helpers to bound work --------
     def _sampled_roster_rows(
         self,
@@ -205,9 +211,6 @@ class StatsApiProvider:
         max_teams: int,
         per_team: int
     ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-        """
-        Returns (hitter_rows, pitcher_rows) bounded by `max_teams` and `per_team` each.
-        """
         year = date.year
         hitters_rows: List[Dict[str, Any]] = []
         pitchers_rows: List[Dict[str, Any]] = []
@@ -239,6 +242,7 @@ class StatsApiProvider:
                     "ops": _safe_float(stat.get("ops")),
                     "hr": _safe_int(stat.get("homeRuns")),
                     "rbi": _safe_int(stat.get("rbi")),
+                    "pa": _safe_int((stat.get("plateAppearances"))),
                     "gamesPlayed": _safe_int(stat.get("gamesPlayed")),
                 })
 
@@ -266,128 +270,257 @@ class StatsApiProvider:
 
         return hitters_rows, pitchers_rows
 
-    # -------- rows for provider_raw (legacy, unbounded with optional limit) --------
-    def _fetch_hitter_rows(self, date: date_cls, limit: Optional[int] = None, team: Optional[str] = None) -> List[Dict[str, Any]]:
-        year = date.year
-        rows: List[Dict[str, Any]] = []
-        for t in self._teams_playing_on(date):
-            if team and team.lower() not in (t.get("name") or "").lower():
-                continue
-            roster = self._team_roster(t["id"])
-            for r in roster:
-                p = r.get("person") or {}
-                pid = p.get("id")
-                pname = p.get("fullName")
-                if not pid:
-                    continue
-                try:
-                    stat = self._player_season_stats(pid, year, "hitting")
-                except Exception as e:
-                    self._log("hitting stat error:", e)
-                    stat = {}
-                rows.append({
-                    "player_id": pid,
-                    "player_name": pname,
-                    "team_id": t["id"],
-                    "team_name": t["name"],
-                    "avg": _safe_float(stat.get("avg")),
-                    "ops": _safe_float(stat.get("ops")),
-                    "hr": _safe_int(stat.get("homeRuns")),
-                    "rbi": _safe_int(stat.get("rbi")),
-                    "gamesPlayed": _safe_int(stat.get("gamesPlayed")),
-                })
-                if limit and len(rows) >= limit:
-                    return rows
-        return rows
+    # -------- slump & surge analytics (hitters) --------
+    @staticmethod
+    def _current_hitless_streak(logs: List[Dict[str, Any]]) -> int:
+        """
+        Count consecutive games with 0 hits from the most recent game backward.
+        'logs' must be oldest->newest.
+        """
+        streak = 0
+        for g in reversed(logs):
+            if (g.get("hits") or 0) == 0 and (g.get("atBats") or 0) > 0:
+                streak += 1
+            else:
+                break
+        return streak
 
-    def _fetch_pitcher_rows(self, date: date_cls, limit: Optional[int] = None, team: Optional[str] = None) -> List[Dict[str, Any]]:
-        year = date.year
-        rows: List[Dict[str, Any]] = []
-        for t in self._teams_playing_on(date):
-            if team and team.lower() not in (t.get("name") or "").lower():
+    @staticmethod
+    def _hitless_run_lengths(logs: List[Dict[str, Any]]) -> List[int]:
+        """
+        Identify lengths of all hitless runs across the season logs (oldest->newest).
+        Excludes games with 0 AB (DNP/pinch-run only).
+        """
+        runs: List[int] = []
+        cur = 0
+        for g in logs:
+            ab = g.get("atBats") or 0
+            hits = g.get("hits") or 0
+            if ab == 0:
+                # treat as neutral separator — end any current run
+                if cur > 0:
+                    runs.append(cur)
+                    cur = 0
                 continue
-            roster = self._team_roster(t["id"])
-            for r in roster:
-                p = r.get("person") or {}
-                pid = p.get("id")
-                pname = p.get("fullName")
-                if not pid:
-                    continue
-                pos_abbr = (r.get("position") or {}).get("abbreviation", "")
-                if pos_abbr != "P":
-                    continue
-                try:
-                    stat = self._player_season_stats(pid, year, "pitching")
-                except Exception as e:
-                    self._log("pitching stat error:", e)
-                    stat = {}
-                rows.append({
-                    "player_id": pid,
-                    "player_name": pname,
-                    "team_id": t["id"],
-                    "team_name": t["name"],
-                    "era": _safe_float(stat.get("era")),
-                    "so": _safe_int(stat.get("strikeOuts")),
-                    "whip": _safe_float(stat.get("whip")),
-                    "gamesStarted": _safe_int(stat.get("gamesStarted")),
-                })
-                if limit and len(rows) >= limit:
-                    return rows
-        return rows
+            if hits == 0:
+                cur += 1
+            else:
+                if cur > 0:
+                    runs.append(cur)
+                    cur = 0
+        if cur > 0:
+            runs.append(cur)
+        return runs
 
-    # -------- public endpoints (heuristics for now) --------
+    @staticmethod
+    def _base_slump_weight(n: int) -> int:
+        # 1 -> 1, 2 -> 3, 3 -> 5, >=4 -> 7
+        if n <= 0: return 0
+        if n == 1: return 1
+        if n == 2: return 3
+        if n == 3: return 5
+        return 7
+
+    @staticmethod
+    def _quality_multiplier(season_avg: Optional[float]) -> float:
+        # Map .270 -> 1.00, .300 -> 1.15, .330 -> 1.30 (linear between)
+        if not season_avg:
+            return 1.0
+        a = season_avg
+        if a <= 0.270: return 1.0
+        if a >= 0.330: return 1.30
+        # linear interpolation
+        return 1.0 + (a - 0.270) * (0.30 / 0.060)  # 1.0 -> 1.30 over .270-.330
+
+    def _cold_hitter_score(self, season_avg: Optional[float], logs: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Compute slump score using:
+          - current hitless streak length
+          - average hitless-run length (season)
+          - rarity index = current / max(0.75, avg_run)
+          - base weight curve (1->1, 2->3, 3->5, 4+->7)
+          - quality multiplier based on season AVG
+        """
+        ch = self._current_hitless_streak(logs)
+        runs = self._hitless_run_lengths(logs)
+        avg_run = mean(runs) if runs else 0.7  # default small if none recorded
+        rarity = ch / max(0.75, avg_run)
+        rarity = max(0.5, min(2.0, rarity))  # clamp
+
+        base = self._base_slump_weight(ch)
+        qual = self._quality_multiplier(season_avg)
+
+        score = base * rarity * qual
+        return {
+            "current_hitless_streak": ch,
+            "avg_hitless_run": round(avg_run, 2),
+            "rarity_index": round(rarity, 2),
+            "slump_score": round(score, 2),
+        }
+
+    def _hot_hitter_score(self, season_avg: Optional[float], logs: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Hot = recent 5-game AVG outperforming season AVG with some contact.
+        """
+        recent = logs[-5:] if len(logs) >= 5 else logs[:]
+        ab = sum((g.get("atBats") or 0) for g in recent)
+        hits = sum((g.get("hits") or 0) for g in recent)
+        recent_avg = (hits / ab) if ab > 0 else 0.0
+        uplift = (recent_avg - (season_avg or 0.0))
+        return {
+            "recent_avg_5": round(recent_avg, 3),
+            "season_avg": round((season_avg or 0.0), 3),
+            "avg_uplift": round(uplift, 3),
+            "hot_score": round(max(0.0, uplift) * 100, 1),  # simple scaled score
+        }
+
+    # -------- public endpoints (hitters/pitchers) --------
     def hot_streak_hitters(self, *, date: date_cls, min_avg: float, games: int, require_hit_each: bool, debug: bool) -> Dict[str, Any]:
-        hitters = self._fetch_hitter_rows(date, limit=None, team=None)
-        hot = [h for h in hitters if (h.get("avg") or 0.0) >= float(min_avg)]
-        out: Dict[str, Any] = {"items": hot}
+        """
+        Uses game logs for last-5 outperformance vs season.
+        Only include hitters with season AVG >= 0.250.
+        """
+        year = date.year
+        hit_rows, _ = self._sampled_roster_rows(date=date, max_teams=16, per_team=8)
+        out_items: List[Dict[str, Any]] = []
+
+        for h in hit_rows:
+            season_avg = h.get("avg") or 0.0
+            if season_avg < 0.250:
+                continue
+            pid = h["player_id"]
+            try:
+                logs = self._player_game_logs(pid, year, "hitting", limit=30)
+            except Exception as e:
+                self._log("hot logs error:", pid, e)
+                logs = []
+
+            hot = self._hot_hitter_score(season_avg, logs)
+            if hot["avg_uplift"] <= 0.0:
+                continue
+
+            out_items.append({
+                **h,
+                **hot,
+            })
+
+        # Rank by hot score (bigger uplift first)
+        out_items.sort(key=lambda x: (x.get("hot_score") or 0.0, x.get("recent_avg_5") or 0.0), reverse=True)
+
+        result: Dict[str, Any] = {"items": out_items}
         if debug:
-            out["debug"] = {"note": "Heuristic = season AVG >= min_avg",
-                            "last_schedule_status": self._last_schedule_status, "error": self._last_error}
-        return out
+            result["debug"] = {"note": "Hot = recent 5G AVG above season AVG", "count": len(out_items)}
+        return result
 
     def cold_streak_hitters(self, *, date: date_cls, min_avg: float, games: int, require_zero_hit_each: bool, debug: bool) -> Dict[str, Any]:
-        hitters = self._fetch_hitter_rows(date, limit=None, team=None)
-        cold = [h for h in hitters if (h.get("avg") or 1.0) < float(min_avg)]
-        out: Dict[str, Any] = {"items": cold}
+        """
+        TRUE cold = good hitters (season AVG >= .270) currently hitless N games,
+        weighted by how uncommon long hitless runs are for them this season.
+        """
+        year = date.year
+        hit_rows, _ = self._sampled_roster_rows(date=date, max_teams=16, per_team=8)
+        out_items: List[Dict[str, Any]] = []
+
+        for h in hit_rows:
+            season_avg = h.get("avg") or 0.0
+            pa = h.get("pa") or 0
+            if season_avg < 0.270 or pa < 50:
+                continue
+            pid = h["player_id"]
+            try:
+                logs = self._player_game_logs(pid, year, "hitting", limit=30)
+            except Exception as e:
+                self._log("cold logs error:", pid, e)
+                logs = []
+
+            cold = self._cold_hitter_score(season_avg, logs)
+            if cold["current_hitless_streak"] <= 0:
+                continue
+
+            out_items.append({
+                **h,
+                **cold,
+                # Optional: last 5-game hit chart for readability
+                "last5_hits": [(g.get("hits") or 0) for g in logs[-5:]],
+            })
+
+        # Rank by slump_score desc, then season AVG desc
+        out_items.sort(
+            key=lambda x: (
+                x.get("slump_score") or 0.0,
+                x.get("avg") or 0.0
+            ),
+            reverse=True,
+        )
+
+        result: Dict[str, Any] = {"items": out_items}
         if debug:
-            out["debug"] = {"note": "Heuristic = season AVG < min_avg",
-                            "last_schedule_status": self._last_schedule_status, "error": self._last_error}
-        return out
+            result["debug"] = {"note": "Cold = hitless streak weighted by rarity among good hitters", "count": len(out_items)}
+        return result
 
     def pitcher_streaks(self, *, date: date_cls, hot_max_era: float, hot_min_ks_each: int, hot_last_starts: int,
                         cold_min_era: float, cold_min_runs_each: int, cold_last_starts: int, debug: bool) -> Dict[str, Any]:
-        pitchers = self._fetch_pitcher_rows(date, limit=None, team=None)
-        hot = [p for p in pitchers if (p.get("era") or 99.9) <= float(hot_max_era)]
-        cold = [p for p in pitchers if (p.get("era") or 0.0) >= float(cold_min_era)]
+        # (unchanged — season heuristics; pitcher game-log variant can be added later)
+        _, pit_rows = self._sampled_roster_rows(date=date, max_teams=16, per_team=8)
+        hot = [p for p in pit_rows if (p.get("era") or 99.9) <= float(hot_max_era)]
+        cold = [p for p in pit_rows if (p.get("era") or 0.0) >= float(cold_min_era)]
         out: Dict[str, Any] = {"hot": hot, "cold": cold}
         if debug:
-            out["debug"] = {"note": "Heuristic = hot ERA ≤ hot_max_era; cold ERA ≥ cold_min_era",
-                            "last_schedule_status": self._last_schedule_status, "error": self._last_error}
+            out["debug"] = {"note": "Heuristic = hot ERA ≤ hot_max_era; cold ERA ≥ cold_min_era"}
         return out
 
     def cold_pitchers(self, *, date: date_cls, min_era: float, min_runs_each: int, last_starts: int, debug: bool) -> Dict[str, Any]:
-        pitchers = self._fetch_pitcher_rows(date, limit=None, team=None)
-        cold = [p for p in pitchers if (p.get("era") or 0.0) >= float(min_era)]
+        _, pit_rows = self._sampled_roster_rows(date=date, max_teams=16, per_team=8)
+        cold = [p for p in pit_rows if (p.get("era") or 0.0) >= float(min_era)]
         out: Dict[str, Any] = {"items": cold}
         if debug:
-            out["debug"] = {"note": "Heuristic = season ERA ≥ min_era",
-                            "last_schedule_status": self._last_schedule_status, "error": self._last_error}
+            out["debug"] = {"note": "Heuristic = season ERA ≥ min_era"}
         return out
 
     def slate_scan(self, *, date: date_cls, max_teams: int = 16, per_team: int = 8, debug: bool = False) -> Dict[str, Any]:
         """
-        BOUNDED full-slate scan: caps team count and players per team to avoid timeouts and huge payloads.
-        Now also returns per-game matchups with probable pitchers, game time (UTC + ET), and venue.
+        BOUNDED full-slate scan:
+          - matchups with ET & probables
+          - hot/cold hitters using game logs and season baselines
         """
         per_team = max(1, min(15, per_team))
         max_teams = max(2, min(30, max_teams))
 
+        # Build roster samples first
         hitters_rows, pitchers_rows = self._sampled_roster_rows(date=date, max_teams=max_teams, per_team=per_team)
 
-        # Heuristics (season-based stand-ins for "streaks")
-        hot_hitters = [h for h in hitters_rows if (h.get("avg") or 0.0) >= 0.300]
-        cold_hitters = [h for h in hitters_rows if (h.get("avg") or 1.0) < 0.220]
+        # Build hot/cold hitters via logs
+        year = date.year
+        hot_hitters: List[Dict[str, Any]] = []
+        cold_hitters: List[Dict[str, Any]] = []
 
+        for h in hitters_rows:
+            pid = h["player_id"]
+            season_avg = h.get("avg") or 0.0
+            pa = h.get("pa") or 0
+            try:
+                logs = self._player_game_logs(pid, year, "hitting", limit=30)
+            except Exception as e:
+                self._log("slate logs error:", pid, e)
+                logs = []
+
+            # HOT: recent 5 above season, baseline >= .250
+            if season_avg >= 0.250:
+                hot = self._hot_hitter_score(season_avg, logs)
+                if hot["avg_uplift"] > 0.0:
+                    hot_hitters.append({**h, **hot})
+
+            # COLD: good hitter baseline and positive hitless streak
+            if season_avg >= 0.270 and pa >= 50:
+                cold = self._cold_hitter_score(season_avg, logs)
+                if cold["current_hitless_streak"] > 0:
+                    cold_hitters.append({**h, **cold, "last5_hits": [(g.get("hits") or 0) for g in logs[-5:]]})
+
+        # Rank lists
+        hot_hitters.sort(key=lambda x: (x.get("hot_score") or 0.0, x.get("recent_avg_5") or 0.0), reverse=True)
+        cold_hitters.sort(key=lambda x: (x.get("slump_score") or 0.0, x.get("avg") or 0.0), reverse=True)
+
+        # Pitchers (season heuristics for now)
         hot_pitchers = [p for p in pitchers_rows if (p.get("era") or 99.9) <= 3.50]
         cold_pitchers = [p for p in pitchers_rows if (p.get("era") or 0.0) >= 4.60]
 
@@ -411,71 +544,11 @@ class StatsApiProvider:
                     "hitters_rows": len(hitters_rows),
                     "pitchers_rows": len(pitchers_rows),
                     "matchups": len(matchups),
+                    "hot_hitters": len(hot_hitters),
+                    "cold_hitters": len(cold_hitters),
                 }
             }
         return out
-
-    # -------- ultra-light summary for GPT tests --------
-    def light_slate(self, *, date: date_cls, max_teams: int = 6, per_team: int = 2, debug: bool = True) -> Dict[str, Any]:
-        teams = self._teams_playing_on(date)
-        games_count = len(teams) // 2 if teams else 0
-        teams = teams[:max_teams]
-
-        year = date.year
-        hitters_samples: List[str] = []
-        pitchers_samples: List[str] = []
-
-        try:
-            for t in teams:
-                roster = self._team_roster(t["id"])
-                hitters = [r for r in roster if ((r.get("position") or {}).get("abbreviation")) != "P"]
-                pitchers = [r for r in roster if ((r.get("position") or {}).get("abbreviation")) == "P"]
-
-                for r in hitters[:per_team]:
-                    p = r.get("person") or {}
-                    pid = p.get("id")
-                    pname = p.get("fullName") or "Unknown"
-                    if pid:
-                        try:
-                            _ = self._player_season_stats(pid, year, "hitting")
-                        except Exception as e:
-                            self._log("light_slate hitting stat err:", e)
-                        hitters_samples.append(pname)
-
-                for r in pitchers[:per_team]:
-                    p = r.get("person") or {}
-                    pid = p.get("id")
-                    pname = p.get("fullName") or "Unknown"
-                    if pid:
-                        try:
-                            _ = self._player_season_stats(pid, year, "pitching")
-                        except Exception as e:
-                            self._log("light_slate pitching stat err:", e)
-                        pitchers_samples.append(pname)
-        except Exception as e:
-            self._last_error = f"light_slate_error: {e}"
-            self._log(self._last_error)
-
-        result = {
-            "date": date.isoformat(),
-            "games_count_est": games_count,
-            "counts": {
-                "sampled_teams": len(teams),
-                "sampled_hitters": len(hitters_samples),
-                "sampled_pitchers": len(pitchers_samples),
-            },
-            "samples": {
-                "hitters": hitters_samples[:10],
-                "pitchers": pitchers_samples[:10],
-            },
-        }
-        if debug:
-            result["debug"] = {
-                "base": self.base,
-                "last_schedule_status": self._last_schedule_status,
-                "error": self._last_error,
-            }
-        return result
 
     # -------- diagnostics --------
     def debug_schedule(self, *, date: date_cls) -> Dict[str, Any]:
