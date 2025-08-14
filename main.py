@@ -617,11 +617,17 @@ def league_scan(
 # ------------------
 # Include routers from routes/
 # ------------------
+# Try to include optional routers without crashing if they're absent.
 try:
-    from routes.league_scan import router as league_scan_router
+    from routes.league_scan import router as league_scan_router  # typically defines /league_scan_post
     app.include_router(league_scan_router)
 except Exception:
-    # Optional router; ignore if not present
+    pass
+
+try:
+    from routes.self_test import router as self_test_router  # NEW: combined diagnostics
+    app.include_router(self_test_router)
+except Exception:
     pass
 
 # ------------------
