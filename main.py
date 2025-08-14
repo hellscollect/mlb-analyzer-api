@@ -10,11 +10,10 @@ from pydantic import BaseModel
 import pytz
 
 APP_NAME = "MLB Analyzer API"
-ET_TZ = pytz.timezone("America/New_York")
 
 app = FastAPI(
     title=APP_NAME,
-    version="1.0.5",
+    version="1.0.6",
     description="Custom GPT + API for MLB streak analysis",
 )
 
@@ -49,11 +48,17 @@ def load_provider() -> Tuple[Optional[Any], Optional[str], Optional[str]]:
 
 provider, provider_module, provider_class = load_provider()
 
+# Make provider visible to routers
+app.state.provider = provider
+app.state.provider_module = provider_module
+app.state.provider_class = provider_class
+app.state.last_provider_error = _last_provider_error
+
 # ------------------
 # Utilities
 # ------------------
 def parse_date(d: Optional[str]) -> date_cls:
-    tz = ET_TZ
+    tz = pytz.timezone("America/New_York")
     now = datetime.now(tz).date()
     if not d or d.lower() == "today":
         return now
@@ -105,7 +110,7 @@ def _smart_call_fetch(method_name: str, the_date: date_cls, limit: Optional[int]
         raise HTTPException(status_code=500, detail=f"Error calling {method_name}: {type(e).__name__}: {e}")
 
 # ------------------
-# Models
+# Models (shared in this file for existing endpoints)
 # ------------------
 class HealthResp(BaseModel):
     ok: bool
@@ -123,19 +128,6 @@ class SlateScanResp(BaseModel):
     matchups: List[Dict[str, Any]]
     debug: Optional[Dict[str, Any]] = None
 
-# Kept for schema compatibility in Actions/GPT
-class LeagueScanReq(BaseModel):
-    date: Optional[str] = None
-    top_n: int = 15
-    debug: int = 0
-
-class LeagueScanResp(BaseModel):
-    date: str
-    counts: Dict[str, int]
-    top: Dict[str, List[Dict[str, Any]]]
-    matchups: List[Dict[str, Any]]
-    debug: Optional[Dict[str, Any]] = None
-
 # ------------------
 # Health
 # ------------------
@@ -144,7 +136,7 @@ def health(tz: str = Query("America/New_York", description="IANA timezone for ti
     try:
         zone = pytz.timezone(tz)
     except Exception:
-        zone = ET_TZ
+        zone = pytz.timezone("America/New_York")
     now_str = datetime.now(zone).strftime("%Y-%m-%d %H:%M:%S %Z")
     return HealthResp(
         ok=True,
@@ -254,7 +246,7 @@ def cold_pitchers(
         last_starts=last_starts, debug=bool(debug))
 
 # ------------------
-# POST wrappers for Actions
+# POST wrappers (Actions)
 # ------------------
 class ProviderRawReq(BaseModel):
     date: Optional[str] = None
@@ -342,7 +334,6 @@ class DateOnlyReq(BaseModel):
 
 @app.post("/slate_scan_post", response_model=SlateScanResp, operation_id="slate_scan_post")
 def slate_scan_post(req: DateOnlyReq):
-    # Unchanged; may 501 if provider lacks slate_scan()
     the_date = parse_date(req.date)
     resp = safe_call(provider, "slate_scan", date=the_date, debug=bool(req.debug))
     out = {
@@ -357,75 +348,10 @@ def slate_scan_post(req: DateOnlyReq):
     return out
 
 # ------------------
-# Helpers for league scan (no slate dependency)
+# Include routers from routes/
 # ------------------
-def _safe_hot(date_obj: date_cls, debug: bool) -> List[Dict[str, Any]]:
-    try:
-        return safe_call(provider, "hot_streak_hitters",
-                         date=date_obj, min_avg=0.280, games=3,
-                         require_hit_each=True, debug=debug)
-    except Exception:
-        return []
-
-def _safe_cold(date_obj: date_cls, debug: bool) -> List[Dict[str, Any]]:
-    try:
-        return safe_call(provider, "cold_streak_hitters",
-                         date=date_obj, min_avg=0.275, games=2,
-                         require_zero_hit_each=True, debug=debug)
-    except Exception:
-        return []
-
-# ------------------
-# NEW: slate-free league scan endpoint (fresh path + operation_id)
-# ------------------
-@app.post("/league_compact_post2", response_model=LeagueScanResp, operation_id="league_compact_post2")
-def league_compact_post2(req: LeagueScanReq):
-    """
-    Slate-free league scan:
-      - Returns hot/cold hitters only (no slate/matchups dependency).
-      - If both are empty for the requested date, auto-tries tomorrow.
-      - matchups is an empty list until provider exposes schedule/matchups.
-    """
-    primary_date = parse_date(req.date)
-    tomorrow_date = primary_date + timedelta(days=1)
-    debug_flag = bool(req.debug)
-
-    def run_for(d: date_cls) -> Dict[str, Any]:
-        hot = _safe_hot(d, debug_flag)
-        cold = _safe_cold(d, debug_flag)
-        top_n = int(req.top_n) if req.top_n and req.top_n > 0 else 15
-        if len(hot) > top_n: hot = hot[:top_n]
-        if len(cold) > top_n: cold = cold[:top_n]
-        return {
-            "date": d.isoformat(),
-            "counts": {
-                "matchups": 0,
-                "hot_hitters": len(hot),
-                "cold_hitters": len(cold),
-            },
-            "top": {
-                "hot_hitters": hot,
-                "cold_hitters": cold,
-            },
-            "matchups": [],
-            "debug": {
-                "source": "hot_cold_only",
-                "note": "Provider lacks slate/matchups; returning hitters only.",
-                "requested_top_n": top_n,
-            },
-        }
-
-    out_primary = run_for(primary_date)
-    if out_primary["counts"]["hot_hitters"] > 0 or out_primary["counts"]["cold_hitters"] > 0:
-        return out_primary
-
-    out_tomorrow = run_for(tomorrow_date)
-    if out_tomorrow["counts"]["hot_hitters"] > 0 or out_tomorrow["counts"]["cold_hitters"] > 0:
-        out_tomorrow["debug"]["fallback"] = "tomorrow_used_no_hitters_today"
-        return out_tomorrow
-
-    out_primary["debug"]["fallback"] = "no_hitters_today_or_tomorrow"
-    return out_primary
+from routes.league_scan import router as league_scan_router
+app.include_router(league_scan_router)
 
 # ------------------
 # Run local
