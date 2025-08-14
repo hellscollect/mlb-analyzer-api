@@ -342,7 +342,7 @@ class DateOnlyReq(BaseModel):
 
 @app.post("/slate_scan_post", response_model=SlateScanResp, operation_id="slate_scan_post")
 def slate_scan_post(req: DateOnlyReq):
-    # Unchanged; will 501 if provider doesn't have slate_scan()
+    # Unchanged; may 501 if provider lacks slate_scan()
     the_date = parse_date(req.date)
     resp = safe_call(provider, "slate_scan", date=the_date, debug=bool(req.debug))
     out = {
@@ -376,14 +376,15 @@ def _safe_cold(date_obj: date_cls, debug: bool) -> List[Dict[str, Any]]:
         return []
 
 # ------------------
-# /league_scan_post WITHOUT slate_scan dependency
+# NEW: slate-free league scan endpoint (fresh path + operation_id)
 # ------------------
-@app.post("/league_scan_post", response_model=LeagueScanResp, operation_id="league_scan_post_v2")
-def league_scan_post(req: LeagueScanReq):
+@app.post("/league_compact_post2", response_model=LeagueScanResp, operation_id="league_compact_post2")
+def league_compact_post2(req: LeagueScanReq):
     """
-    Returns hot/cold hitters for the requested date (no slate/matchups dependency).
-    If both lists are empty for the requested date, auto-tries tomorrow.
-    matchups is an empty list until the provider exposes schedule/matchups.
+    Slate-free league scan:
+      - Returns hot/cold hitters only (no slate/matchups dependency).
+      - If both are empty for the requested date, auto-tries tomorrow.
+      - matchups is an empty list until provider exposes schedule/matchups.
     """
     primary_date = parse_date(req.date)
     tomorrow_date = primary_date + timedelta(days=1)
