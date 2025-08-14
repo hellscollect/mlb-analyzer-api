@@ -126,7 +126,7 @@ class SlateScanResp(BaseModel):
     matchups: List[Dict[str, Any]]
     debug: Optional[Dict[str, Any]] = None
 
-# NEW: compact full-league scan (original schema)
+# Kept for schema compatibility in Actions/GPT
 class LeagueScanReq(BaseModel):
     date: Optional[str] = None
     top_n: int = 15
@@ -359,7 +359,7 @@ def slate_scan_post(req: DateOnlyReq):
     return out
 
 # ------------------
-# Helpers for upcoming-only filtering
+# Helpers for upcoming-only league scan
 # ------------------
 def _parse_et_time_str(s: Optional[str]) -> Optional[time_cls]:
     if not s or not isinstance(s, str):
@@ -376,11 +376,9 @@ def _game_has_started(game: Dict[str, Any], now_dt: datetime) -> bool:
     status = str(game.get("status") or game.get("game_status") or "").strip().lower()
     if status in {"in progress", "live", "final", "completed", "game over", "end"}:
         return True
-    # Try explicit ET time strings
     et_time_str = game.get("et_time") or game.get("game_time_et") or game.get("start_time_et")
     t = _parse_et_time_str(et_time_str)
     if t is None:
-        # Try ISO ET datetime fields
         iso_dt = game.get("game_datetime_et") or game.get("start_datetime_et")
         if iso_dt:
             try:
@@ -390,7 +388,6 @@ def _game_has_started(game: Dict[str, Any], now_dt: datetime) -> bool:
                 return now_dt >= dt
             except Exception:
                 return False
-        # If we can't tell, assume not started unless status says otherwise
         return status not in {"scheduled", "pregame", "preview"}
     sched_dt = ET_TZ.localize(datetime.combine(now_dt.date(), t))
     return now_dt >= sched_dt
@@ -421,50 +418,55 @@ def _filter_players_by_teams(players: List[Dict[str, Any]], team_names: set) -> 
     return out
 
 # ------------------
-# NEW: full-league compact scan (upcoming-only + tomorrow fallback)
+# NEW: full-league compact scan (upcoming-only + tomorrow fallback) COMPOSED (no provider.league_scan dependency)
 # ------------------
-class LeagueScanReq(BaseModel):
-    date: Optional[str] = None
-    top_n: int = 15
-    debug: int = 0
-
-class LeagueScanResp(BaseModel):
-    date: str
-    counts: Dict[str, int]
-    top: Dict[str, List[Dict[str, Any]]]
-    matchups: List[Dict[str, Any]]
-    debug: Optional[Dict[str, Any]] = None
-
 @app.post("/league_scan_post", response_model=LeagueScanResp, operation_id="league_scan_post")
 def league_scan_post(req: LeagueScanReq):
     """
-    Always returns only not-yet-started (ET) matchups + hitters for those teams.
-    If none remain for the requested date, auto-fallback to tomorrow.
+    Compose league scan from existing provider methods:
+      - matchups via provider.slate_scan (if available)
+      - hot/cold hitters via provider hot/cold functions
+    Then filter to not-yet-started games (ET) and, if none remain today, fall back to tomorrow.
     """
     primary_date = parse_date(req.date)
     tomorrow_date = primary_date + timedelta(days=1)
 
     def run_for(d: date_cls) -> Dict[str, Any]:
-        # Call provider.league_scan as-is (your provider composes full-league top + matchups)
-        resp = safe_call(provider, "league_scan", date=d, top_n=int(req.top_n), debug=bool(req.debug))
-        # Handle both possible shapes:
-        matchups = resp.get("matchups", []) or []
-        # top dict (preferred) OR flat lists (back-compat)
-        top_dict = resp.get("top") or {}
-        hot = top_dict.get("hot_hitters") if isinstance(top_dict, dict) else None
-        cold = top_dict.get("cold_hitters") if isinstance(top_dict, dict) else None
-        if hot is None and "hot_hitters" in resp:  # back-compat
-            hot = resp.get("hot_hitters", [])
-        if cold is None and "cold_hitters" in resp:  # back-compat
-            cold = resp.get("cold_hitters", [])
+        # 1) matchups from slate_scan (if implemented)
+        matchups = []
+        slate_debug = {}
+        try:
+            slate = safe_call(provider, "slate_scan", date=d, debug=False)
+            matchups = slate.get("matchups", []) if isinstance(slate, dict) else []
+            if isinstance(slate.get("debug"), dict):
+                slate_debug = slate["debug"]
+        except HTTPException as e:
+            if e.status_code != 501:
+                raise
+        except Exception:
+            pass
 
-        # Upcoming-only filter
+        # 2) hot/cold hitters
+        try:
+            hot = safe_call(provider, "hot_streak_hitters", date=d, min_avg=0.280, games=3, require_hit_each=True, debug=bool(req.debug))
+        except Exception:
+            hot = []
+        try:
+            cold = safe_call(provider, "cold_streak_hitters", date=d, min_avg=0.275, games=2, require_zero_hit_each=True, debug=bool(req.debug))
+        except Exception:
+            cold = []
+
+        # 3) filter to upcoming-only + restrict hitters to upcoming teams
         upcoming = _filter_upcoming_games(matchups)
         scope = _teams_from_games(upcoming)
         hot_f = _filter_players_by_teams(hot or [], scope)
         cold_f = _filter_players_by_teams(cold or [], scope)
 
-        # Rebuild a unified payload in your original schema
+        # 4) Optional trim to top_n for very long lists
+        top_n = int(req.top_n) if req.top_n and req.top_n > 0 else 15
+        if len(hot_f) > top_n: hot_f = hot_f[:top_n]
+        if len(cold_f) > top_n: cold_f = cold_f[:top_n]
+
         out = {
             "date": d.isoformat(),
             "counts": {
@@ -478,14 +480,13 @@ def league_scan_post(req: LeagueScanReq):
             },
             "matchups": upcoming,
             "debug": {
-                "source": "provider.league_scan",
-                "requested_top_n": int(req.top_n),
+                "source": "composed",
                 "upcoming_filter": True,
+                "requested_top_n": top_n,
             },
         }
-        # Pass through provider's debug if present
-        if isinstance(resp.get("debug"), dict):
-            out["debug"]["provider_debug"] = resp["debug"]
+        if slate_debug:
+            out["debug"]["slate_debug"] = slate_debug
         return out
 
     # Try requested date first
@@ -493,12 +494,12 @@ def league_scan_post(req: LeagueScanReq):
     if out_primary["counts"]["matchups"] >= 1:
         return out_primary
 
-    # If nothing left to bet today, pivot to tomorrow
+    # If no upcoming games remain for the requested date, pivot to tomorrow
     out_tomorrow = run_for(tomorrow_date)
     if out_tomorrow["counts"]["matchups"] >= 1:
         return out_tomorrow
 
-    # If still nothing, return the primary (empty upcoming) with context
+    # Still nothing — return primary with explicit reason
     out_primary["debug"]["fallback"] = "no_upcoming_today_or_tomorrow"
     return out_primary
 
