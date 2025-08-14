@@ -19,7 +19,7 @@ EXTERNAL_URL = (
 
 app = FastAPI(
     title=APP_NAME,
-    version="1.1.2",
+    version="1.1.3",
     description="Custom GPT + API for MLB streak analysis",
     servers=[{"url": EXTERNAL_URL}],
     openapi_url="/openapi.json",
@@ -108,14 +108,12 @@ def _call_with_sig(fn, **kwargs):
             params = list(sig.parameters.values())
             args = []
             for p in params:
-                # Use provided value if we have it, otherwise required params must exist
                 if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD):
                     if p.name in allowed_kwargs:
                         args.append(allowed_kwargs[p.name])
                     elif p.default is not inspect._empty:
                         args.append(p.default)
                     else:
-                        # Missing a required arg we don't have a value for -> re-raise
                         raise
             return fn(*args)
     except Exception as e:
@@ -157,6 +155,26 @@ def _smart_call_fetch(method_name: str, the_date: date_cls, limit: Optional[int]
             raise HTTPException(status_code=500, detail=f"Error calling {method_name}: {type(e).__name__}: {e}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error calling {method_name}: {type(e).__name__}: {e}")
+
+# --- Mojibake fixer (applies latin1->utf8 when common markers appear) ---
+def _fix_text(s: Any) -> Any:
+    if not isinstance(s, str):
+        return s
+    if "Ã" in s or "Â" in s:
+        try:
+            return s.encode("latin1").decode("utf-8")
+        except Exception:
+            return s
+    return s
+
+def _deep_fix(obj: Any) -> Any:
+    if isinstance(obj, dict):
+        return { _fix_text(k): _deep_fix(v) for k, v in obj.items() }
+    if isinstance(obj, list):
+        return [ _deep_fix(x) for x in obj ]
+    if isinstance(obj, str):
+        return _fix_text(obj)
+    return obj
 
 # ------------------
 # Models
@@ -221,8 +239,17 @@ class DateOnlyReq(BaseModel):
     debug: int = 0
 
 # ------------------
-# Health
+# Health + simple root
 # ------------------
+@app.get("/", operation_id="root")
+def root():
+    return {
+        "app": APP_NAME,
+        "version": "1.1.3",
+        "docs": f"{EXTERNAL_URL}/docs",
+        "health": f"{EXTERNAL_URL}/health?tz=America/New_York",
+    }
+
 @app.get("/health", response_model=HealthResp, operation_id="health")
 def health(tz: str = Query("America/New_York", description="IANA timezone for timestamp echo")):
     try:
@@ -262,8 +289,8 @@ def provider_raw(
             "provider_class": provider_class,
             "date": the_date.isoformat(),
         },
-        "hitters_raw": hitters,
-        "pitchers_raw": pitchers,
+        "hitters_raw": _deep_fix(hitters),
+        "pitchers_raw": _deep_fix(pitchers),
     }
     if debug == 1:
         provider_base = getattr(provider, "base", None)
@@ -290,7 +317,7 @@ def provider_raw_post(req: ProviderRawReq):
         raise HTTPException(status_code=501, detail="Provider does not implement _fetch_hitter_rows()/_fetch_pitcher_rows()")
     hitters = _smart_call_fetch("_fetch_hitter_rows", the_date, req.limit, req.team)
     pitchers = _smart_call_fetch("_fetch_pitcher_rows", the_date, req.limit, req.team)
-    out = {"hitters_raw": hitters, "pitchers_raw": pitchers}
+    out = {"hitters_raw": _deep_fix(hitters), "pitchers_raw": _deep_fix(pitchers)}
     if req.debug == 1:
         out["debug"] = {"requested": req.model_dump()}
     return out
@@ -321,9 +348,9 @@ def _hot_hitters_fallback(
         return _call_with_sig(
             league,
             date_str=the_date.isoformat(),
-            date=the_date,     # if provider also accepts 'date'
+            date=the_date,
             top_n=top_n,
-            n=top_n,           # alternate aliases just in case
+            n=top_n,
             limit=top_n,
             debug=debug,
         )
@@ -392,7 +419,7 @@ def _schedule_for_date(the_date: date_cls, debug: bool):
     resp = _call_with_sig(
         sched_fn,
         date_str=the_date.isoformat(),
-        date=the_date,  # if provider accepts a date instead
+        date=the_date,
         debug=debug,
     )
     if isinstance(resp, list):
@@ -414,16 +441,18 @@ def hot_streak_hitters(
     debug: int = Query(0, ge=0, le=1),
 ):
     the_date = parse_date(date)
-    return _hot_hitters_fallback(
+    data = _hot_hitters_fallback(
         the_date, min_avg, games, bool(require_hit_each), bool(debug), top_n=top_n
     )
+    return _deep_fix(data)
 
 @app.post("/hot_streak_hitters_post", operation_id="hot_streak_hitters_post")
 def hot_streak_hitters_post(req: HotHittersReq):
     the_date = parse_date(req.date)
-    return _hot_hitters_fallback(
+    data = _hot_hitters_fallback(
         the_date, req.min_avg, req.games, req.require_hit_each, bool(req.debug), top_n=req.top_n
     )
+    return _deep_fix(data)
 
 @app.get("/cold_streak_hitters", operation_id="cold_streak_hitters")
 def cold_streak_hitters(
@@ -435,16 +464,18 @@ def cold_streak_hitters(
     debug: int = Query(0, ge=0, le=1),
 ):
     the_date = parse_date(date)
-    return _cold_hitters_fallback(
+    data = _cold_hitters_fallback(
         the_date, min_avg, games, bool(require_zero_hit_each), bool(debug), top_n=top_n
     )
+    return _deep_fix(data)
 
 @app.post("/cold_streak_hitters_post", operation_id="cold_streak_hitters_post")
 def cold_streak_hitters_post(req: ColdHittersReq):
     the_date = parse_date(req.date)
-    return _cold_hitters_fallback(
+    data = _cold_hitters_fallback(
         the_date, req.min_avg, req.games, req.require_zero_hit_each, bool(req.debug), top_n=req.top_n
     )
+    return _deep_fix(data)
 
 @app.get("/pitcher_streaks", operation_id="pitcher_streaks")
 def pitcher_streaks(
@@ -458,18 +489,20 @@ def pitcher_streaks(
     debug: int = Query(0, ge=0, le=1),
 ):
     the_date = parse_date(date)
-    return _pitcher_streaks_fallback(
+    data = _pitcher_streaks_fallback(
         the_date, hot_max_era, hot_min_ks_each, hot_last_starts,
         cold_min_era, cold_min_runs_each, cold_last_starts, bool(debug)
     )
+    return _deep_fix(data)
 
 @app.post("/pitcher_streaks_post", operation_id="pitcher_streaks_post")
 def pitcher_streaks_post(req: PitcherStreaksReq):
     the_date = parse_date(req.date)
-    return _pitcher_streaks_fallback(
+    data = _pitcher_streaks_fallback(
         the_date, req.hot_max_era, req.hot_min_ks_each, req.hot_last_starts,
         req.cold_min_era, req.cold_min_runs_each, req.cold_last_starts, bool(req.debug)
     )
+    return _deep_fix(data)
 
 @app.get("/cold_pitchers", operation_id="cold_pitchers")
 def cold_pitchers(
@@ -480,19 +513,21 @@ def cold_pitchers(
     debug: int = Query(0, ge=0, le=1),
 ):
     the_date = parse_date(date)
-    return safe_call(provider, "cold_pitchers",
+    data = safe_call(provider, "cold_pitchers",
         date=the_date, min_era=min_era, min_runs_each=min_runs_each,
         last_starts=last_starts, debug=bool(debug))
+    return _deep_fix(data)
 
 @app.post("/cold_pitchers_post", operation_id="cold_pitchers_post")
 def cold_pitchers_post(req: ColdPitchersReq):
     the_date = parse_date(req.date)
-    return safe_call(provider, "cold_pitchers",
+    data = safe_call(provider, "cold_pitchers",
         date=the_date, min_era=req.min_era, min_runs_each=req.min_runs_each,
         last_starts=req.last_starts, debug=bool(req.debug))
+    return _deep_fix(data)
 
 # ------------------
-# League scan (GET convenience wrapper using provider's league_* methods)
+# League scan (GET convenience wrapper using provider’s league_* methods)
 # ------------------
 @app.get("/league_scan", operation_id="league_scan")
 def league_scan(
@@ -530,10 +565,10 @@ def league_scan(
         "cold_hitters": len(cold_list),
     }
     result["top"] = {
-        "hot_hitters": hot_list[:limit],
-        "cold_hitters": cold_list[:limit],
+        "hot_hitters": _deep_fix(hot_list[:limit]),
+        "cold_hitters": _deep_fix(cold_list[:limit]),
     }
-    result["matchups"] = matchups
+    result["matchups"] = _deep_fix(matchups)
 
     if debug == 1:
         result["debug"] = {
@@ -551,7 +586,6 @@ try:
     from routes.league_scan import router as league_scan_router
     app.include_router(league_scan_router)
 except Exception:
-    # If the routes module is absent in this deployment, ignore.
     pass
 
 # ------------------
