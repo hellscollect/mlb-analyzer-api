@@ -1,7 +1,7 @@
 import os
 import importlib
 import inspect
-from datetime import datetime, timedelta, date as date_cls
+from datetime import datetime, timedelta, date as date_cls, time as time_cls
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, Query, HTTPException
@@ -10,6 +10,7 @@ from pydantic import BaseModel
 import pytz
 
 APP_NAME = "MLB Analyzer API"
+ET_TZ = pytz.timezone("America/New_York")
 
 app = FastAPI(
     title=APP_NAME,
@@ -51,8 +52,11 @@ provider, provider_module, provider_class = load_provider()
 # ------------------
 # Utilities
 # ------------------
+def now_et() -> datetime:
+    return datetime.now(ET_TZ)
+
 def parse_date(d: Optional[str]) -> date_cls:
-    tz = pytz.timezone("America/New_York")
+    tz = ET_TZ
     now = datetime.now(tz).date()
     if not d or d.lower() == "today":
         return now
@@ -122,7 +126,7 @@ class SlateScanResp(BaseModel):
     matchups: List[Dict[str, Any]]
     debug: Optional[Dict[str, Any]] = None
 
-# NEW: compact full-league scan
+# NEW: compact full-league scan (original schema)
 class LeagueScanReq(BaseModel):
     date: Optional[str] = None
     top_n: int = 15
@@ -143,7 +147,7 @@ def health(tz: str = Query("America/New_York", description="IANA timezone for ti
     try:
         zone = pytz.timezone(tz)
     except Exception:
-        zone = pytz.timezone("America/New_York")
+        zone = ET_TZ
     now_str = datetime.now(zone).strftime("%Y-%m-%d %H:%M:%S %Z")
     return HealthResp(
         ok=True,
@@ -354,12 +358,149 @@ def slate_scan_post(req: DateOnlyReq):
         out["debug"] = resp.get("debug", {})
     return out
 
-# NEW: full-league compact scan (all teams/players, top-N only)
+# ------------------
+# Helpers for upcoming-only filtering
+# ------------------
+def _parse_et_time_str(s: Optional[str]) -> Optional[time_cls]:
+    if not s or not isinstance(s, str):
+        return None
+    s = s.strip()
+    for fmt in ("%H:%M", "%H:%M:%S", "%I:%M %p", "%I:%M:%S %p"):
+        try:
+            return datetime.strptime(s, fmt).time()
+        except ValueError:
+            continue
+    return None
+
+def _game_has_started(game: Dict[str, Any], now_dt: datetime) -> bool:
+    status = str(game.get("status") or game.get("game_status") or "").strip().lower()
+    if status in {"in progress", "live", "final", "completed", "game over", "end"}:
+        return True
+    # Try explicit ET time strings
+    et_time_str = game.get("et_time") or game.get("game_time_et") or game.get("start_time_et")
+    t = _parse_et_time_str(et_time_str)
+    if t is None:
+        # Try ISO ET datetime fields
+        iso_dt = game.get("game_datetime_et") or game.get("start_datetime_et")
+        if iso_dt:
+            try:
+                dt = datetime.fromisoformat(iso_dt)
+                if dt.tzinfo is None:
+                    dt = ET_TZ.localize(dt)
+                return now_dt >= dt
+            except Exception:
+                return False
+        # If we can't tell, assume not started unless status says otherwise
+        return status not in {"scheduled", "pregame", "preview"}
+    sched_dt = ET_TZ.localize(datetime.combine(now_dt.date(), t))
+    return now_dt >= sched_dt
+
+def _filter_upcoming_games(games: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    now = now_et()
+    return [g for g in games or [] if not _game_has_started(g, now)]
+
+def _teams_from_games(games: List[Dict[str, Any]]) -> set:
+    teams = set()
+    for g in games or []:
+        home = g.get("home_name") or g.get("home_team") or g.get("homeTeam") or g.get("home")
+        away = g.get("away_name") or g.get("away_team") or g.get("awayTeam") or g.get("away")
+        if isinstance(home, dict): home = home.get("name") or home.get("abbr") or home.get("team_name")
+        if isinstance(away, dict): away = away.get("name") or away.get("abbr") or away.get("team_name")
+        if home: teams.add(str(home))
+        if away: teams.add(str(away))
+    return teams
+
+def _filter_players_by_teams(players: List[Dict[str, Any]], team_names: set) -> List[Dict[str, Any]]:
+    if not players or not team_names:
+        return players or []
+    out = []
+    for p in players:
+        tn = p.get("team_name") or p.get("team") or p.get("teamAbbr")
+        if tn and str(tn) in team_names:
+            out.append(p)
+    return out
+
+# ------------------
+# NEW: full-league compact scan (upcoming-only + tomorrow fallback)
+# ------------------
+class LeagueScanReq(BaseModel):
+    date: Optional[str] = None
+    top_n: int = 15
+    debug: int = 0
+
+class LeagueScanResp(BaseModel):
+    date: str
+    counts: Dict[str, int]
+    top: Dict[str, List[Dict[str, Any]]]
+    matchups: List[Dict[str, Any]]
+    debug: Optional[Dict[str, Any]] = None
+
 @app.post("/league_scan_post", response_model=LeagueScanResp, operation_id="league_scan_post")
 def league_scan_post(req: LeagueScanReq):
-    the_date = parse_date(req.date)
-    resp = safe_call(provider, "league_scan", date=the_date, top_n=int(req.top_n), debug=bool(req.debug))
-    return resp
+    """
+    Always returns only not-yet-started (ET) matchups + hitters for those teams.
+    If none remain for the requested date, auto-fallback to tomorrow.
+    """
+    primary_date = parse_date(req.date)
+    tomorrow_date = primary_date + timedelta(days=1)
+
+    def run_for(d: date_cls) -> Dict[str, Any]:
+        # Call provider.league_scan as-is (your provider composes full-league top + matchups)
+        resp = safe_call(provider, "league_scan", date=d, top_n=int(req.top_n), debug=bool(req.debug))
+        # Handle both possible shapes:
+        matchups = resp.get("matchups", []) or []
+        # top dict (preferred) OR flat lists (back-compat)
+        top_dict = resp.get("top") or {}
+        hot = top_dict.get("hot_hitters") if isinstance(top_dict, dict) else None
+        cold = top_dict.get("cold_hitters") if isinstance(top_dict, dict) else None
+        if hot is None and "hot_hitters" in resp:  # back-compat
+            hot = resp.get("hot_hitters", [])
+        if cold is None and "cold_hitters" in resp:  # back-compat
+            cold = resp.get("cold_hitters", [])
+
+        # Upcoming-only filter
+        upcoming = _filter_upcoming_games(matchups)
+        scope = _teams_from_games(upcoming)
+        hot_f = _filter_players_by_teams(hot or [], scope)
+        cold_f = _filter_players_by_teams(cold or [], scope)
+
+        # Rebuild a unified payload in your original schema
+        out = {
+            "date": d.isoformat(),
+            "counts": {
+                "matchups": len(upcoming),
+                "hot_hitters": len(hot_f),
+                "cold_hitters": len(cold_f),
+            },
+            "top": {
+                "hot_hitters": hot_f,
+                "cold_hitters": cold_f,
+            },
+            "matchups": upcoming,
+            "debug": {
+                "source": "provider.league_scan",
+                "requested_top_n": int(req.top_n),
+                "upcoming_filter": True,
+            },
+        }
+        # Pass through provider's debug if present
+        if isinstance(resp.get("debug"), dict):
+            out["debug"]["provider_debug"] = resp["debug"]
+        return out
+
+    # Try requested date first
+    out_primary = run_for(primary_date)
+    if out_primary["counts"]["matchups"] >= 1:
+        return out_primary
+
+    # If nothing left to bet today, pivot to tomorrow
+    out_tomorrow = run_for(tomorrow_date)
+    if out_tomorrow["counts"]["matchups"] >= 1:
+        return out_tomorrow
+
+    # If still nothing, return the primary (empty upcoming) with context
+    out_primary["debug"]["fallback"] = "no_upcoming_today_or_tomorrow"
+    return out_primary
 
 # ------------------
 # Run local
