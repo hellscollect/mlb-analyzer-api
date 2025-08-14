@@ -11,7 +11,7 @@ from pydantic import BaseModel
 import pytz
 
 APP_NAME = "MLB Analyzer API"
-APP_VERSION = "1.1.4"
+APP_VERSION = "1.1.5"
 
 # --- Force UTF-8 on every JSON response (prevents mojibake in some clients) ---
 class UTF8JSONResponse(JSONResponse):
@@ -264,9 +264,18 @@ class DateOnlyReq(BaseModel):
 # ------------------
 @app.get("/", operation_id="root")
 def root():
+    tz = pytz.timezone("America/New_York")
     return {
         "app": APP_NAME,
         "version": APP_VERSION,
+        "date": datetime.now(tz).date().isoformat(),
+        "now_local": datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S %Z"),
+        "provider": {
+            "loaded": provider is not None,
+            "module": provider_module,
+            "class": provider_class,
+            "last_error": _last_provider_error,
+        },
         "docs": f"{EXTERNAL_URL}/docs",
         "health": f"{EXTERNAL_URL}/health?tz=America/New_York",
     }
@@ -344,7 +353,7 @@ def provider_raw_post(req: ProviderRawReq):
     return out
 
 # ------------------
-# Compatibility wrappers (adapters for league_* + date_str + top_n)
+# Compatibility wrappers (prefer league_*; fallback to direct hot_/cold_*)
 # ------------------
 def _hot_hitters_fallback(
     the_date: date_cls,
@@ -354,32 +363,41 @@ def _hot_hitters_fallback(
     debug: bool,
     top_n: int = 25,
 ):
-    direct = _callable(provider, "hot_streak_hitters")
-    if direct:
-        res = _call_with_sig(
-            direct,
-            date=the_date,
-            min_avg=min_avg,
-            games=games,
-            require_hit_each=require_hit_each,
-            debug=debug,
-        )
-        return _take_n(_deep_fix(res), top_n)
-
+    # 1) Prefer league_* (proven working in self_test)
     league = _callable(provider, "league_hot_hitters")
     if league:
-        res = _call_with_sig(
-            league,
-            date_str=the_date.isoformat(),
-            date=the_date,
-            top_n=top_n,
-            n=top_n,
-            limit=top_n,
-            debug=debug,
-        )
-        return _take_n(_deep_fix(res), top_n)
+        try:
+            res = _call_with_sig(
+                league,
+                date_str=the_date.isoformat(),
+                date=the_date,
+                top_n=top_n,
+                n=top_n,
+                limit=top_n,
+                debug=debug,
+            )
+            return _take_n(_deep_fix(res), top_n)
+        except Exception:
+            # Fall through to direct
+            pass
 
-    raise HTTPException(status_code=501, detail="Provider does not implement hot_streak_hitters() or league_hot_hitters().")
+    # 2) Fallback to direct hot_streak_hitters if provider has it
+    direct = _callable(provider, "hot_streak_hitters")
+    if direct:
+        try:
+            res = _call_with_sig(
+                direct,
+                date=the_date,
+                min_avg=min_avg,
+                games=games,
+                require_hit_each=require_hit_each,
+                debug=debug,
+            )
+            return _take_n(_deep_fix(res), top_n)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"hot_streak_hitters failed after league_* attempt: {type(e).__name__}: {e}")
+
+    raise HTTPException(status_code=501, detail="Provider does not implement league_hot_hitters() or hot_streak_hitters().")
 
 def _cold_hitters_fallback(
     the_date: date_cls,
@@ -389,32 +407,41 @@ def _cold_hitters_fallback(
     debug: bool,
     top_n: int = 25,
 ):
-    direct = _callable(provider, "cold_streak_hitters")
-    if direct:
-        res = _call_with_sig(
-            direct,
-            date=the_date,
-            min_avg=min_avg,
-            games=games,
-            require_zero_hit_each=require_zero_hit_each,
-            debug=debug,
-        )
-        return _take_n(_deep_fix(res), top_n)
-
+    # 1) Prefer league_* (proven working in self_test)
     league = _callable(provider, "league_cold_hitters")
     if league:
-        res = _call_with_sig(
-            league,
-            date_str=the_date.isoformat(),
-            date=the_date,
-            top_n=top_n,
-            n=top_n,
-            limit=top_n,
-            debug=debug,
-        )
-        return _take_n(_deep_fix(res), top_n)
+        try:
+            res = _call_with_sig(
+                league,
+                date_str=the_date.isoformat(),
+                date=the_date,
+                top_n=top_n,
+                n=top_n,
+                limit=top_n,
+                debug=debug,
+            )
+            return _take_n(_deep_fix(res), top_n)
+        except Exception:
+            # Fall through to direct
+            pass
 
-    raise HTTPException(status_code=501, detail="Provider does not implement cold_streak_hitters() or league_cold_hitters().")
+    # 2) Fallback to direct cold_streak_hitters if provider has it
+    direct = _callable(provider, "cold_streak_hitters")
+    if direct:
+        try:
+            res = _call_with_sig(
+                direct,
+                date=the_date,
+                min_avg=min_avg,
+                games=games,
+                require_zero_hit_each=require_zero_hit_each,
+                debug=debug,
+            )
+            return _take_n(_deep_fix(res), top_n)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"cold_streak_hitters failed after league_* attempt: {type(e).__name__}: {e}")
+
+    raise HTTPException(status_code=501, detail="Provider does not implement league_cold_hitters() or cold_streak_hitters().")
 
 def _pitcher_streaks_fallback(the_date: date_cls, hot_max_era: float, hot_min_ks_each: int, hot_last_starts: int,
                               cold_min_era: float, cold_min_runs_each: int, cold_last_starts: int, debug: bool):
@@ -587,7 +614,7 @@ def league_scan(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"schedule_for_date failed: {type(e).__name__}: {e}")
 
-    # Hot / Cold hitters via adapters
+    # Hot / Cold hitters via adapters (prefer league_*, fallback to direct)
     hot = _hot_hitters_fallback(the_date, min_avg=0.0, games=5, require_hit_each=False, debug=bool(debug), top_n=limit)
     cold = _cold_hitters_fallback(the_date, min_avg=0.0, games=5, require_zero_hit_each=False, debug=bool(debug), top_n=limit)
 
@@ -617,14 +644,16 @@ def league_scan(
 # ------------------
 # Include routers from routes/
 # ------------------
-# Ensure self-test routes are mounted (this file exists in your repo)
-from routes.self_test import router as self_test_router
-app.include_router(self_test_router)
-
-# Optional router; ignore if not present
+# Optional routers; include if present
 try:
     from routes.league_scan import router as league_scan_router
     app.include_router(league_scan_router)
+except Exception:
+    pass
+
+try:
+    from routes.self_test import router as self_test_router
+    app.include_router(self_test_router)
 except Exception:
     pass
 
