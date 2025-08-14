@@ -48,7 +48,7 @@ def load_provider() -> Tuple[Optional[Any], Optional[str], Optional[str]]:
 
 provider, provider_module, provider_class = load_provider()
 
-# Make provider visible to routers
+# expose provider to routers
 app.state.provider = provider
 app.state.provider_module = provider_module
 app.state.provider_class = provider_class
@@ -110,7 +110,7 @@ def _smart_call_fetch(method_name: str, the_date: date_cls, limit: Optional[int]
         raise HTTPException(status_code=500, detail=f"Error calling {method_name}: {type(e).__name__}: {e}")
 
 # ------------------
-# Models (shared in this file for existing endpoints)
+# Models
 # ------------------
 class HealthResp(BaseModel):
     ok: bool
@@ -348,7 +348,7 @@ def slate_scan_post(req: DateOnlyReq):
     return out
 
 # ------------------
-# Include routers from routes/
+# include routers from routes/
 # ------------------
 from routes.league_scan import router as league_scan_router
 app.include_router(league_scan_router)
