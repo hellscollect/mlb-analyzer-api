@@ -6,10 +6,16 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import pytz
 
 APP_NAME = "MLB Analyzer API"
+APP_VERSION = "1.1.4"
+
+# --- Force UTF-8 on every JSON response (prevents mojibake in some clients) ---
+class UTF8JSONResponse(JSONResponse):
+    media_type = "application/json; charset=utf-8"
 
 # --- Server URL for OpenAPI (required by GPT Actions) ---
 EXTERNAL_URL = (
@@ -19,10 +25,11 @@ EXTERNAL_URL = (
 
 app = FastAPI(
     title=APP_NAME,
-    version="1.1.3",
+    version=APP_VERSION,
     description="Custom GPT + API for MLB streak analysis",
     servers=[{"url": EXTERNAL_URL}],
     openapi_url="/openapi.json",
+    default_response_class=UTF8JSONResponse,  # ensure charset=utf-8 header
 )
 
 # --- CORS ---
@@ -156,7 +163,7 @@ def _smart_call_fetch(method_name: str, the_date: date_cls, limit: Optional[int]
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error calling {method_name}: {type(e).__name__}: {e}")
 
-# --- Mojibake fixer (applies latin1->utf8 when common markers appear) ---
+# --- Mojibake fixer (latin1->utf8 for typical "Ã", "Â" artifacts) ---
 def _fix_text(s: Any) -> Any:
     if not isinstance(s, str):
         return s
@@ -245,7 +252,7 @@ class DateOnlyReq(BaseModel):
 def root():
     return {
         "app": APP_NAME,
-        "version": "1.1.3",
+        "version": APP_VERSION,
         "docs": f"{EXTERNAL_URL}/docs",
         "health": f"{EXTERNAL_URL}/health?tz=America/New_York",
     }
@@ -335,17 +342,17 @@ def _hot_hitters_fallback(
 ):
     direct = _callable(provider, "hot_streak_hitters")
     if direct:
-        return _call_with_sig(
+        return _deep_fix(_call_with_sig(
             direct,
             date=the_date,
             min_avg=min_avg,
             games=games,
             require_hit_each=require_hit_each,
             debug=debug,
-        )
+        ))
     league = _callable(provider, "league_hot_hitters")
     if league:
-        return _call_with_sig(
+        return _deep_fix(_call_with_sig(
             league,
             date_str=the_date.isoformat(),
             date=the_date,
@@ -353,7 +360,7 @@ def _hot_hitters_fallback(
             n=top_n,
             limit=top_n,
             debug=debug,
-        )
+        ))
     raise HTTPException(status_code=501, detail="Provider does not implement hot_streak_hitters() or league_hot_hitters().")
 
 def _cold_hitters_fallback(
@@ -366,17 +373,17 @@ def _cold_hitters_fallback(
 ):
     direct = _callable(provider, "cold_streak_hitters")
     if direct:
-        return _call_with_sig(
+        return _deep_fix(_call_with_sig(
             direct,
             date=the_date,
             min_avg=min_avg,
             games=games,
             require_zero_hit_each=require_zero_hit_each,
             debug=debug,
-        )
+        ))
     league = _callable(provider, "league_cold_hitters")
     if league:
-        return _call_with_sig(
+        return _deep_fix(_call_with_sig(
             league,
             date_str=the_date.isoformat(),
             date=the_date,
@@ -384,14 +391,14 @@ def _cold_hitters_fallback(
             n=top_n,
             limit=top_n,
             debug=debug,
-        )
+        ))
     raise HTTPException(status_code=501, detail="Provider does not implement cold_streak_hitters() or league_cold_hitters().")
 
 def _pitcher_streaks_fallback(the_date: date_cls, hot_max_era: float, hot_min_ks_each: int, hot_last_starts: int,
                               cold_min_era: float, cold_min_runs_each: int, cold_last_starts: int, debug: bool):
     direct = _callable(provider, "pitcher_streaks")
     if direct:
-        return _call_with_sig(
+        return _deep_fix(_call_with_sig(
             direct,
             date=the_date,
             hot_max_era=hot_max_era,
@@ -401,7 +408,7 @@ def _pitcher_streaks_fallback(the_date: date_cls, hot_max_era: float, hot_min_ks
             cold_min_runs_each=cold_min_runs_each,
             cold_last_starts=cold_last_starts,
             debug=debug,
-        )
+        ))
     return {
         "hot_pitchers": [],
         "cold_pitchers": [],
@@ -423,10 +430,10 @@ def _schedule_for_date(the_date: date_cls, debug: bool):
         debug=debug,
     )
     if isinstance(resp, list):
-        return resp
+        return _deep_fix(resp)
     if isinstance(resp, dict) and "matchups" in resp:
-        return resp.get("matchups") or []
-    return resp
+        return _deep_fix(resp.get("matchups") or [])
+    return _deep_fix(resp)
 
 # ------------------
 # Endpoints
@@ -444,7 +451,7 @@ def hot_streak_hitters(
     data = _hot_hitters_fallback(
         the_date, min_avg, games, bool(require_hit_each), bool(debug), top_n=top_n
     )
-    return _deep_fix(data)
+    return data
 
 @app.post("/hot_streak_hitters_post", operation_id="hot_streak_hitters_post")
 def hot_streak_hitters_post(req: HotHittersReq):
@@ -452,7 +459,7 @@ def hot_streak_hitters_post(req: HotHittersReq):
     data = _hot_hitters_fallback(
         the_date, req.min_avg, req.games, req.require_hit_each, bool(req.debug), top_n=req.top_n
     )
-    return _deep_fix(data)
+    return data
 
 @app.get("/cold_streak_hitters", operation_id="cold_streak_hitters")
 def cold_streak_hitters(
@@ -467,7 +474,7 @@ def cold_streak_hitters(
     data = _cold_hitters_fallback(
         the_date, min_avg, games, bool(require_zero_hit_each), bool(debug), top_n=top_n
     )
-    return _deep_fix(data)
+    return data
 
 @app.post("/cold_streak_hitters_post", operation_id="cold_streak_hitters_post")
 def cold_streak_hitters_post(req: ColdHittersReq):
@@ -475,7 +482,7 @@ def cold_streak_hitters_post(req: ColdHittersReq):
     data = _cold_hitters_fallback(
         the_date, req.min_avg, req.games, req.require_zero_hit_each, bool(req.debug), top_n=req.top_n
     )
-    return _deep_fix(data)
+    return data
 
 @app.get("/pitcher_streaks", operation_id="pitcher_streaks")
 def pitcher_streaks(
@@ -493,7 +500,7 @@ def pitcher_streaks(
         the_date, hot_max_era, hot_min_ks_each, hot_last_starts,
         cold_min_era, cold_min_runs_each, cold_last_starts, bool(debug)
     )
-    return _deep_fix(data)
+    return data
 
 @app.post("/pitcher_streaks_post", operation_id="pitcher_streaks_post")
 def pitcher_streaks_post(req: PitcherStreaksReq):
@@ -502,7 +509,7 @@ def pitcher_streaks_post(req: PitcherStreaksReq):
         the_date, req.hot_max_era, req.hot_min_ks_each, req.hot_last_starts,
         req.cold_min_era, req.cold_min_runs_each, req.cold_last_starts, bool(req.debug)
     )
-    return _deep_fix(data)
+    return data
 
 @app.get("/cold_pitchers", operation_id="cold_pitchers")
 def cold_pitchers(
