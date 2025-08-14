@@ -143,7 +143,7 @@ class StatsApiProvider:
             matchups.append({
                 "game_pk": g.get("gamePk"),
                 "game_date_utc": game_date_utc,
-                "et_time": et_time,  # Friendly ET string
+                "et_time": et_time,
                 "status": status,
                 "venue": venue_name,
                 "home": {
@@ -178,9 +178,6 @@ class StatsApiProvider:
         return (splits[0].get("stat") if splits else {}) or {}
 
     def _player_game_logs(self, player_id: int, season_year: int, group: str, limit: int = 30) -> List[Dict[str, Any]]:
-        """
-        Returns most recent game logs (descending by date in API). We'll re-sort oldest->newest for streak math.
-        """
         data = self._get(
             f"/api/v1/people/{player_id}/stats",
             {"stats": "gameLog", "group": group, "season": season_year},
@@ -189,21 +186,18 @@ class StatsApiProvider:
         if not stats:
             return []
         splits = (stats[0].get("splits") or [])[:limit]
-        # Normalize minimal fields we need
         logs: List[Dict[str, Any]] = []
         for s in splits:
             stat = s.get("stat") or {}
             logs.append({
-                "date": s.get("date"),  # e.g., "2025-08-10"
+                "date": s.get("date"),
                 "hits": _safe_int(stat.get("hits")) or 0,
                 "atBats": _safe_int(stat.get("atBats")) or 0,
-                "avg": _safe_float(stat.get("avg")),  # per-game AVG, often None; not used in core calc
             })
-        # API returns most recent first; reverse to oldest->newest for run detection
-        logs.reverse()
+        logs.reverse()  # oldest -> newest
         return logs
 
-    # -------- helpers to bound work --------
+    # -------- helpers to bound work (used by old endpoints) --------
     def _sampled_roster_rows(
         self,
         *,
@@ -242,7 +236,7 @@ class StatsApiProvider:
                     "ops": _safe_float(stat.get("ops")),
                     "hr": _safe_int(stat.get("homeRuns")),
                     "rbi": _safe_int(stat.get("rbi")),
-                    "pa": _safe_int((stat.get("plateAppearances"))),
+                    "pa": _safe_int(stat.get("plateAppearances")),
                     "gamesPlayed": _safe_int(stat.get("gamesPlayed")),
                 })
 
@@ -273,10 +267,6 @@ class StatsApiProvider:
     # -------- slump & surge analytics (hitters) --------
     @staticmethod
     def _current_hitless_streak(logs: List[Dict[str, Any]]) -> int:
-        """
-        Count consecutive games with 0 hits from the most recent game backward.
-        'logs' must be oldest->newest.
-        """
         streak = 0
         for g in reversed(logs):
             if (g.get("hits") or 0) == 0 and (g.get("atBats") or 0) > 0:
@@ -287,17 +277,12 @@ class StatsApiProvider:
 
     @staticmethod
     def _hitless_run_lengths(logs: List[Dict[str, Any]]) -> List[int]:
-        """
-        Identify lengths of all hitless runs across the season logs (oldest->newest).
-        Excludes games with 0 AB (DNP/pinch-run only).
-        """
         runs: List[int] = []
         cur = 0
         for g in logs:
             ab = g.get("atBats") or 0
             hits = g.get("hits") or 0
             if ab == 0:
-                # treat as neutral separator — end any current run
                 if cur > 0:
                     runs.append(cur)
                     cur = 0
@@ -314,7 +299,6 @@ class StatsApiProvider:
 
     @staticmethod
     def _base_slump_weight(n: int) -> int:
-        # 1 -> 1, 2 -> 3, 3 -> 5, >=4 -> 7
         if n <= 0: return 0
         if n == 1: return 1
         if n == 2: return 3
@@ -323,33 +307,21 @@ class StatsApiProvider:
 
     @staticmethod
     def _quality_multiplier(season_avg: Optional[float]) -> float:
-        # Map .270 -> 1.00, .300 -> 1.15, .330 -> 1.30 (linear between)
         if not season_avg:
             return 1.0
         a = season_avg
         if a <= 0.270: return 1.0
         if a >= 0.330: return 1.30
-        # linear interpolation
-        return 1.0 + (a - 0.270) * (0.30 / 0.060)  # 1.0 -> 1.30 over .270-.330
+        return 1.0 + (a - 0.270) * (0.30 / 0.060)
 
     def _cold_hitter_score(self, season_avg: Optional[float], logs: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """
-        Compute slump score using:
-          - current hitless streak length
-          - average hitless-run length (season)
-          - rarity index = current / max(0.75, avg_run)
-          - base weight curve (1->1, 2->3, 3->5, 4+->7)
-          - quality multiplier based on season AVG
-        """
         ch = self._current_hitless_streak(logs)
         runs = self._hitless_run_lengths(logs)
-        avg_run = mean(runs) if runs else 0.7  # default small if none recorded
+        avg_run = mean(runs) if runs else 0.7
         rarity = ch / max(0.75, avg_run)
-        rarity = max(0.5, min(2.0, rarity))  # clamp
-
+        rarity = max(0.5, min(2.0, rarity))
         base = self._base_slump_weight(ch)
         qual = self._quality_multiplier(season_avg)
-
         score = base * rarity * qual
         return {
             "current_hitless_streak": ch,
@@ -359,9 +331,6 @@ class StatsApiProvider:
         }
 
     def _hot_hitter_score(self, season_avg: Optional[float], logs: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """
-        Hot = recent 5-game AVG outperforming season AVG with some contact.
-        """
         recent = logs[-5:] if len(logs) >= 5 else logs[:]
         ab = sum((g.get("atBats") or 0) for g in recent)
         hits = sum((g.get("hits") or 0) for g in recent)
@@ -371,19 +340,14 @@ class StatsApiProvider:
             "recent_avg_5": round(recent_avg, 3),
             "season_avg": round((season_avg or 0.0), 3),
             "avg_uplift": round(uplift, 3),
-            "hot_score": round(max(0.0, uplift) * 100, 1),  # simple scaled score
+            "hot_score": round(max(0.0, uplift) * 100, 1),
         }
 
-    # -------- public endpoints (hitters/pitchers) --------
+    # -------- public endpoints (existing) --------
     def hot_streak_hitters(self, *, date: date_cls, min_avg: float, games: int, require_hit_each: bool, debug: bool) -> Dict[str, Any]:
-        """
-        Uses game logs for last-5 outperformance vs season.
-        Only include hitters with season AVG >= 0.250.
-        """
         year = date.year
         hit_rows, _ = self._sampled_roster_rows(date=date, max_teams=16, per_team=8)
         out_items: List[Dict[str, Any]] = []
-
         for h in hit_rows:
             season_avg = h.get("avg") or 0.0
             if season_avg < 0.250:
@@ -394,33 +358,20 @@ class StatsApiProvider:
             except Exception as e:
                 self._log("hot logs error:", pid, e)
                 logs = []
-
             hot = self._hot_hitter_score(season_avg, logs)
             if hot["avg_uplift"] <= 0.0:
                 continue
-
-            out_items.append({
-                **h,
-                **hot,
-            })
-
-        # Rank by hot score (bigger uplift first)
+            out_items.append({**h, **hot})
         out_items.sort(key=lambda x: (x.get("hot_score") or 0.0, x.get("recent_avg_5") or 0.0), reverse=True)
-
         result: Dict[str, Any] = {"items": out_items}
         if debug:
             result["debug"] = {"note": "Hot = recent 5G AVG above season AVG", "count": len(out_items)}
         return result
 
     def cold_streak_hitters(self, *, date: date_cls, min_avg: float, games: int, require_zero_hit_each: bool, debug: bool) -> Dict[str, Any]:
-        """
-        TRUE cold = good hitters (season AVG >= .270) currently hitless N games,
-        weighted by how uncommon long hitless runs are for them this season.
-        """
         year = date.year
         hit_rows, _ = self._sampled_roster_rows(date=date, max_teams=16, per_team=8)
         out_items: List[Dict[str, Any]] = []
-
         for h in hit_rows:
             season_avg = h.get("avg") or 0.0
             pa = h.get("pa") or 0
@@ -432,27 +383,11 @@ class StatsApiProvider:
             except Exception as e:
                 self._log("cold logs error:", pid, e)
                 logs = []
-
             cold = self._cold_hitter_score(season_avg, logs)
             if cold["current_hitless_streak"] <= 0:
                 continue
-
-            out_items.append({
-                **h,
-                **cold,
-                # Optional: last 5-game hit chart for readability
-                "last5_hits": [(g.get("hits") or 0) for g in logs[-5:]],
-            })
-
-        # Rank by slump_score desc, then season AVG desc
-        out_items.sort(
-            key=lambda x: (
-                x.get("slump_score") or 0.0,
-                x.get("avg") or 0.0
-            ),
-            reverse=True,
-        )
-
+            out_items.append({**h, **cold, "last5_hits": [(g.get("hits") or 0) for g in logs[-5:]]})
+        out_items.sort(key=lambda x: (x.get("slump_score") or 0.0, x.get("avg") or 0.0), reverse=True)
         result: Dict[str, Any] = {"items": out_items}
         if debug:
             result["debug"] = {"note": "Cold = hitless streak weighted by rarity among good hitters", "count": len(out_items)}
@@ -460,7 +395,6 @@ class StatsApiProvider:
 
     def pitcher_streaks(self, *, date: date_cls, hot_max_era: float, hot_min_ks_each: int, hot_last_starts: int,
                         cold_min_era: float, cold_min_runs_each: int, cold_last_starts: int, debug: bool) -> Dict[str, Any]:
-        # (unchanged — season heuristics; pitcher game-log variant can be added later)
         _, pit_rows = self._sampled_roster_rows(date=date, max_teams=16, per_team=8)
         hot = [p for p in pit_rows if (p.get("era") or 99.9) <= float(hot_max_era)]
         cold = [p for p in pit_rows if (p.get("era") or 0.0) >= float(cold_min_era)]
@@ -469,31 +403,63 @@ class StatsApiProvider:
             out["debug"] = {"note": "Heuristic = hot ERA ≤ hot_max_era; cold ERA ≥ cold_min_era"}
         return out
 
-    def cold_pitchers(self, *, date: date_cls, min_era: float, min_runs_each: int, last_starts: int, debug: bool) -> Dict[str, Any]:
-        _, pit_rows = self._sampled_roster_rows(date=date, max_teams=16, per_team=8)
-        cold = [p for p in pit_rows if (p.get("era") or 0.0) >= float(min_era)]
-        out: Dict[str, Any] = {"items": cold}
-        if debug:
-            out["debug"] = {"note": "Heuristic = season ERA ≥ min_era"}
-        return out
-
-    def slate_scan(self, *, date: date_cls, max_teams: int = 16, per_team: int = 8, debug: bool = False) -> Dict[str, Any]:
+    # -------- NEW: full-league compact scan (for GPT) --------
+    def league_scan(self, *, date: date_cls, top_n: int = 15, debug: bool = False) -> Dict[str, Any]:
         """
-        BOUNDED full-slate scan:
-          - matchups with ET & probables
-          - hot/cold hitters using game logs and season baselines
+        Scan ALL scheduled MLB teams and ALL active hitters server-side,
+        compute hot/cold via game logs and season baselines,
+        and return COMPACT top-N lists with counts and matchups.
         """
-        per_team = max(1, min(15, per_team))
-        max_teams = max(2, min(30, max_teams))
-
-        # Build roster samples first
-        hitters_rows, pitchers_rows = self._sampled_roster_rows(date=date, max_teams=max_teams, per_team=per_team)
-
-        # Build hot/cold hitters via logs
         year = date.year
+        teams = self._teams_playing_on(date)
+        hitters_rows: List[Dict[str, Any]] = []
+        pitchers_rows: List[Dict[str, Any]] = []
+
+        # Pull full active rosters (hitters + pitchers) for every scheduled team
+        for t in teams:
+            roster = self._team_roster(t["id"])
+            for r in roster:
+                p = r.get("person") or {}
+                pid = p.get("id")
+                if not pid:
+                    continue
+                pos = (r.get("position") or {}).get("abbreviation", "")
+                if pos == "P":
+                    try:
+                        stat = self._player_season_stats(pid, year, "pitching")
+                    except Exception as e:
+                        self._log("pitch season stat err:", pid, e); stat = {}
+                    pitchers_rows.append({
+                        "player_id": pid,
+                        "player_name": p.get("fullName"),
+                        "team_id": t["id"],
+                        "team_name": t["name"],
+                        "era": _safe_float(stat.get("era")),
+                        "so": _safe_int(stat.get("strikeOuts")),
+                        "whip": _safe_float(stat.get("whip")),
+                        "gamesStarted": _safe_int(stat.get("gamesStarted")),
+                    })
+                else:
+                    try:
+                        stat = self._player_season_stats(pid, year, "hitting")
+                    except Exception as e:
+                        self._log("hit season stat err:", pid, e); stat = {}
+                    hitters_rows.append({
+                        "player_id": pid,
+                        "player_name": p.get("fullName"),
+                        "team_id": t["id"],
+                        "team_name": t["name"],
+                        "avg": _safe_float(stat.get("avg")),
+                        "ops": _safe_float(stat.get("ops")),
+                        "hr": _safe_int(stat.get("homeRuns")),
+                        "rbi": _safe_int(stat.get("rbi")),
+                        "pa": _safe_int(stat.get("plateAppearances")),
+                        "gamesPlayed": _safe_int(stat.get("gamesPlayed")),
+                    })
+
+        # Build hot/cold hitters (game logs)
         hot_hitters: List[Dict[str, Any]] = []
         cold_hitters: List[Dict[str, Any]] = []
-
         for h in hitters_rows:
             pid = h["player_id"]
             season_avg = h.get("avg") or 0.0
@@ -501,7 +467,7 @@ class StatsApiProvider:
             try:
                 logs = self._player_game_logs(pid, year, "hitting", limit=30)
             except Exception as e:
-                self._log("slate logs error:", pid, e)
+                self._log("league logs err:", pid, e)
                 logs = []
 
             # HOT: recent 5 above season, baseline >= .250
@@ -514,23 +480,38 @@ class StatsApiProvider:
             if season_avg >= 0.270 and pa >= 50:
                 cold = self._cold_hitter_score(season_avg, logs)
                 if cold["current_hitless_streak"] > 0:
-                    cold_hitters.append({**h, **cold, "last5_hits": [(g.get("hits") or 0) for g in logs[-5:]]})
+                    cold_hitters.append({**h, **cold})
 
-        # Rank lists
         hot_hitters.sort(key=lambda x: (x.get("hot_score") or 0.0, x.get("recent_avg_5") or 0.0), reverse=True)
         cold_hitters.sort(key=lambda x: (x.get("slump_score") or 0.0, x.get("avg") or 0.0), reverse=True)
 
-        # Pitchers (season heuristics for now)
+        # Pitchers (season heuristics; compact top-N too)
         hot_pitchers = [p for p in pitchers_rows if (p.get("era") or 99.9) <= 3.50]
         cold_pitchers = [p for p in pitchers_rows if (p.get("era") or 0.0) >= 4.60]
+        hot_pitchers.sort(key=lambda x: (-(x.get("era") or 99.9), x.get("so") or 0.0))
+        cold_pitchers.sort(key=lambda x: (x.get("era") or 0.0, -(x.get("so") or 0.0)))
 
         matchups = self._build_matchups(date)
 
+        # COMPACT response: counts + top-N lists + matchups (not all rows)
         out: Dict[str, Any] = {
-            "hot_hitters": hot_hitters,
-            "cold_hitters": cold_hitters,
-            "hot_pitchers": hot_pitchers,
-            "cold_pitchers": cold_pitchers,
+            "date": date.isoformat(),
+            "counts": {
+                "teams": len(teams),
+                "hitters_total": len(hitters_rows),
+                "pitchers_total": len(pitchers_rows),
+                "hot_hitters": len(hot_hitters),
+                "cold_hitters": len(cold_hitters),
+                "hot_pitchers": len(hot_pitchers),
+                "cold_pitchers": len(cold_pitchers),
+                "matchups": len(matchups),
+            },
+            "top": {
+                "hot_hitters": hot_hitters[:top_n],
+                "cold_hitters": cold_hitters[:top_n],
+                "hot_pitchers": hot_pitchers[:top_n],
+                "cold_pitchers": cold_pitchers[:top_n],
+            },
             "matchups": matchups,
         }
         if debug:
@@ -539,14 +520,7 @@ class StatsApiProvider:
                 "base": self.base,
                 "last_schedule_status": self._last_schedule_status,
                 "error": self._last_error,
-                "limits": {"max_teams": max_teams, "per_team": per_team},
-                "counts": {
-                    "hitters_rows": len(hitters_rows),
-                    "pitchers_rows": len(pitchers_rows),
-                    "matchups": len(matchups),
-                    "hot_hitters": len(hot_hitters),
-                    "cold_hitters": len(cold_hitters),
-                }
+                "top_n": top_n,
             }
         return out
 
