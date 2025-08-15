@@ -749,6 +749,13 @@ try:
 except Exception:
     pass
 
+# >>> NEW: include /cold_candidates router <<<
+try:
+    from routes.cold_candidates import router as cold_candidates_router
+    app.include_router(cold_candidates_router)
+except Exception:
+    pass
+
 # ------------------
 # Run local
 # ------------------
