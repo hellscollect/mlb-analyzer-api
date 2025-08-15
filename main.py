@@ -9,9 +9,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import pytz
+import requests
 
 APP_NAME = "MLB Analyzer API"
-APP_VERSION = "1.1.5"
+APP_VERSION = "1.1.6"
 
 # --- Force UTF-8 on every JSON response (prevents mojibake in some clients) ---
 class UTF8JSONResponse(JSONResponse):
@@ -269,13 +270,6 @@ def root():
         "app": APP_NAME,
         "version": APP_VERSION,
         "date": datetime.now(tz).date().isoformat(),
-        "now_local": datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S %Z"),
-        "provider": {
-            "loaded": provider is not None,
-            "module": provider_module,
-            "class": provider_class,
-            "last_error": _last_provider_error,
-        },
         "docs": f"{EXTERNAL_URL}/docs",
         "health": f"{EXTERNAL_URL}/health?tz=America/New_York",
     }
@@ -353,7 +347,7 @@ def provider_raw_post(req: ProviderRawReq):
     return out
 
 # ------------------
-# Compatibility wrappers (prefer league_*; fallback to direct hot_/cold_*)
+# Compatibility wrappers (adapters for league_* + date_str + top_n)
 # ------------------
 def _hot_hitters_fallback(
     the_date: date_cls,
@@ -363,41 +357,32 @@ def _hot_hitters_fallback(
     debug: bool,
     top_n: int = 25,
 ):
-    # 1) Prefer league_* (proven working in self_test)
-    league = _callable(provider, "league_hot_hitters")
-    if league:
-        try:
-            res = _call_with_sig(
-                league,
-                date_str=the_date.isoformat(),
-                date=the_date,
-                top_n=top_n,
-                n=top_n,
-                limit=top_n,
-                debug=debug,
-            )
-            return _take_n(_deep_fix(res), top_n)
-        except Exception:
-            # Fall through to direct
-            pass
-
-    # 2) Fallback to direct hot_streak_hitters if provider has it
     direct = _callable(provider, "hot_streak_hitters")
     if direct:
-        try:
-            res = _call_with_sig(
-                direct,
-                date=the_date,
-                min_avg=min_avg,
-                games=games,
-                require_hit_each=require_hit_each,
-                debug=debug,
-            )
-            return _take_n(_deep_fix(res), top_n)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"hot_streak_hitters failed after league_* attempt: {type(e).__name__}: {e}")
+        res = _call_with_sig(
+            direct,
+            date=the_date,
+            min_avg=min_avg,
+            games=games,
+            require_hit_each=require_hit_each,
+            debug=debug,
+        )
+        return _take_n(_deep_fix(res), top_n)
 
-    raise HTTPException(status_code=501, detail="Provider does not implement league_hot_hitters() or hot_streak_hitters().")
+    league = _callable(provider, "league_hot_hitters")
+    if league:
+        res = _call_with_sig(
+            league,
+            date_str=the_date.isoformat(),
+            date=the_date,
+            top_n=top_n,
+            n=top_n,
+            limit=top_n,
+            debug=debug,
+        )
+        return _take_n(_deep_fix(res), top_n)
+
+    raise HTTPException(status_code=501, detail="Provider does not implement hot_streak_hitters() or league_hot_hitters().")
 
 def _cold_hitters_fallback(
     the_date: date_cls,
@@ -407,41 +392,32 @@ def _cold_hitters_fallback(
     debug: bool,
     top_n: int = 25,
 ):
-    # 1) Prefer league_* (proven working in self_test)
-    league = _callable(provider, "league_cold_hitters")
-    if league:
-        try:
-            res = _call_with_sig(
-                league,
-                date_str=the_date.isoformat(),
-                date=the_date,
-                top_n=top_n,
-                n=top_n,
-                limit=top_n,
-                debug=debug,
-            )
-            return _take_n(_deep_fix(res), top_n)
-        except Exception:
-            # Fall through to direct
-            pass
-
-    # 2) Fallback to direct cold_streak_hitters if provider has it
     direct = _callable(provider, "cold_streak_hitters")
     if direct:
-        try:
-            res = _call_with_sig(
-                direct,
-                date=the_date,
-                min_avg=min_avg,
-                games=games,
-                require_zero_hit_each=require_zero_hit_each,
-                debug=debug,
-            )
-            return _take_n(_deep_fix(res), top_n)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"cold_streak_hitters failed after league_* attempt: {type(e).__name__}: {e}")
+        res = _call_with_sig(
+            direct,
+            date=the_date,
+            min_avg=min_avg,
+            games=games,
+            require_zero_hit_each=require_zero_hit_each,
+            debug=debug,
+        )
+        return _take_n(_deep_fix(res), top_n)
 
-    raise HTTPException(status_code=501, detail="Provider does not implement league_cold_hitters() or cold_streak_hitters().")
+    league = _callable(provider, "league_cold_hitters")
+    if league:
+        res = _call_with_sig(
+            league,
+            date_str=the_date.isoformat(),
+            date=the_date,
+            top_n=top_n,
+            n=top_n,
+            limit=top_n,
+            debug=debug,
+        )
+        return _take_n(_deep_fix(res), top_n)
+
+    raise HTTPException(status_code=501, detail="Provider does not implement cold_streak_hitters() or league_cold_hitters().")
 
 def _pitcher_streaks_fallback(the_date: date_cls, hot_max_era: float, hot_min_ks_each: int, hot_last_starts: int,
                               cold_min_era: float, cold_min_runs_each: int, cold_last_starts: int, debug: bool):
@@ -614,7 +590,7 @@ def league_scan(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"schedule_for_date failed: {type(e).__name__}: {e}")
 
-    # Hot / Cold hitters via adapters (prefer league_*, fallback to direct)
+    # Hot / Cold hitters via adapters
     hot = _hot_hitters_fallback(the_date, min_avg=0.0, games=5, require_hit_each=False, debug=bool(debug), top_n=limit)
     cold = _cold_hitters_fallback(the_date, min_avg=0.0, games=5, require_zero_hit_each=False, debug=bool(debug), top_n=limit)
 
@@ -642,9 +618,174 @@ def league_scan(
     return result
 
 # ------------------
+# Cold hitters by GAME (strict, from MLB Stats API directly)
+# ------------------
+def _mlb_get(url: str) -> Dict[str, Any]:
+    try:
+        r = requests.get(url, timeout=20)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"MLB Stats API error: {type(e).__name__}: {e}")
+
+def _mlb_schedule(the_date: date_cls) -> Dict[str, Any]:
+    return _mlb_get(f"https://statsapi.mlb.com/api/v1/schedule?sportId=1&date={the_date.isoformat()}")
+
+def _find_game_pk(sched: Dict[str, Any], away_name: str, home_name: str) -> Optional[int]:
+    dates = sched.get("dates") or []
+    for d in dates:
+        for g in d.get("games") or []:
+            a = (((g.get("teams") or {}).get("away") or {}).get("team") or {}).get("name", "")
+            h = (((g.get("teams") or {}).get("home") or {}).get("team") or {}).get("name", "")
+            if a and h and a.lower() == away_name.lower() and h.lower() == home_name.lower():
+                return g.get("gamePk")
+    return None
+
+def _boxscore_players(game_pk: int) -> List[Dict[str, Any]]:
+    j = _mlb_get(f"https://statsapi.mlb.com/api/v1/game/{game_pk}/boxscore")
+    out: List[Dict[str, Any]] = []
+    for side in ("home", "away"):
+        team = (j.get(side) or {}).get("team") or {}
+        team_name = team.get("name") or side
+        players = (j.get(side) or {}).get("players") or {}
+        for pkey, pdata in players.items():
+            person = pdata.get("person") or {}
+            pos = (pdata.get("position") or {}).get("abbreviation") or ""
+            pid = person.get("id")
+            name = person.get("fullName") or person.get("lastFirstName") or str(pid)
+            # treat non-pitchers as hitters (keeps 2-way guys if they bat)
+            if pid and pos.upper() not in ("P", "SP", "RP"):
+                out.append({"person_id": pid, "player_name": name, "team_name": team_name})
+    return out
+
+def _season_avg(person_id: int, season: int) -> float:
+    j = _mlb_get(
+        f"https://statsapi.mlb.com/api/v1/people/{person_id}/stats"
+        f"?stats=season&group=hitting&season={season}"
+    )
+    try:
+        splits = (((j.get("stats") or [])[0]).get("splits") or [])
+        if not splits:
+            return 0.0
+        avg_str = (splits[0].get("stat") or {}).get("avg") or "0"
+        return float(avg_str)
+    except Exception:
+        return 0.0
+
+def _gamelog(person_id: int, season: int, take_games: int = 20) -> List[Dict[str, Any]]:
+    j = _mlb_get(
+        f"https://statsapi.mlb.com/api/v1/people/{person_id}/stats"
+        f"?stats=gameLog&group=hitting&season={season}"
+    )
+    try:
+        splits = (((j.get("stats") or [])[0]).get("splits") or [])
+        return splits[:max(1, take_games)]
+    except Exception:
+        return []
+
+def _recent_avg_from_log(splits: List[Dict[str, Any]], last_n: int) -> Tuple[float, int, int]:
+    hits = ab = taken = 0
+    for sp in splits:
+        stat = sp.get("stat") or {}
+        ab_g = int(stat.get("atBats") or 0)
+        h_g = int(stat.get("hits") or 0)
+        if ab_g <= 0:
+            continue  # skip DNP/PH w/0 AB
+        hits += h_g
+        ab += ab_g
+        taken += 1
+        if taken >= last_n:
+            break
+    return ((hits / ab) if ab > 0 else 0.0, hits, ab)
+
+def _hitless_streak_from_log(splits: List[Dict[str, Any]]) -> int:
+    streak = 0
+    for sp in splits:
+        stat = sp.get("stat") or {}
+        ab_g = int(stat.get("atBats") or 0)
+        h_g = int(stat.get("hits") or 0)
+        if ab_g <= 0:
+            continue  # neutral day
+        if h_g == 0:
+            streak += 1
+        else:
+            break
+    return streak
+
+@app.get("/cold_hitters_game", operation_id="cold_hitters_game")
+def cold_hitters_game(
+    date: Optional[str] = Query(None, description="today|yesterday|tomorrow|YYYY-MM-DD"),
+    away: str = Query(..., description="Away team name exactly as in MLB schedule, e.g. 'Arizona Diamondbacks'"),
+    home: str = Query(..., description="Home team name exactly as in MLB schedule, e.g. 'Colorado Rockies'"),
+    min_season_avg: float = Query(0.250, ge=0.0, le=1.0, description="Only keep players with season AVG >= this"),
+    last_n: int = Query(5, ge=2, le=15, description="Window for recent AVG"),
+    max_recent_avg: float = Query(0.200, ge=0.0, le=1.0, description="Recent AVG must be <= this OR hitless-streak rule"),
+    min_hitless_games: int = Query(1, ge=1, le=20, description="Consecutive 0-hit games required (OR condition)"),
+    limit: int = Query(12, ge=1, le=50),
+    debug: int = Query(0, ge=0, le=1),
+):
+    the_date = parse_date(date)
+    season = the_date.year
+
+    # find game
+    sched = _mlb_schedule(the_date)
+    game_pk = _find_game_pk(sched, away, home)
+    if not game_pk:
+        raise HTTPException(status_code=404, detail="Game not found for away/home/date. Use exact full team names.")
+
+    # candidate hitters in that game
+    candidates = _boxscore_players(game_pk)
+    results: List[Dict[str, Any]] = []
+
+    for c in candidates:
+        pid = c["person_id"]
+        season_avg = _season_avg(pid, season)
+
+        # must be a "good hitter" first
+        if season_avg < min_season_avg:
+            continue
+
+        log = _gamelog(pid, season, take_games=max(20, last_n * 2))
+        recent_avg, r_hits, r_ab = _recent_avg_from_log(log, last_n)
+        hitless = _hitless_streak_from_log(log)
+
+        qualifies = (hitless >= min_hitless_games) or (r_ab > 0 and recent_avg <= max_recent_avg)
+        if not qualifies:
+            continue
+
+        results.append({
+            "player_name": c["player_name"],
+            "team_name": c["team_name"],
+            "season_avg": round(season_avg, 3),
+            f"recent_avg_{last_n}": round(recent_avg, 3),
+            "recent_sample": {"hits": r_hits, "at_bats": r_ab},
+            "current_hitless_streak": hitless,
+        })
+
+    # sort: longer hitless streak first, then lower recent avg, then higher season avg
+    results.sort(key=lambda x: (-x["current_hitless_streak"], x[f"recent_avg_{last_n}"], -x["season_avg"]))
+    out = results[:limit]
+
+    if debug == 1:
+        return {
+            "date": the_date.isoformat(),
+            "game": {"away": away, "home": home, "game_pk": game_pk},
+            "filters": {
+                "min_season_avg": min_season_avg,
+                "last_n": last_n,
+                "max_recent_avg": max_recent_avg,
+                "min_hitless_games": min_hitless_games,
+                "limit": limit,
+            },
+            "counts": {"candidates": len(candidates), "qualified": len(results), "returned": len(out)},
+            "results": out,
+        }
+    return out
+
+# ------------------
 # Include routers from routes/
 # ------------------
-# Optional routers; include if present
+# Optional routers; include if present without breaking deploys
 try:
     from routes.league_scan import router as league_scan_router
     app.include_router(league_scan_router)
