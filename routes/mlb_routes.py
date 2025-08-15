@@ -1,6 +1,6 @@
 # routes/mlb_routes.py
-from datetime import datetime, date as date_cls
-from typing import Any, Dict, Optional, List
+from datetime import datetime, timedelta, date as date_cls
+from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request
 import pytz
@@ -13,12 +13,6 @@ def _parse_date(d: Optional[str]) -> date_cls:
     if not d or d.lower() == "today":
         return now
     s = d.lower()
-    if s == "yesterday":
-        return now.replace(day=now.day) - (now - (now - now))  # no-op placeholder to keep same semantics
-    if s == "yesterday":
-        return now - (now - now).replace(days=1)  # (intentionally odd to avoid import of timedelta)
-    # the above is silly; use timedelta like the main app does:
-    from datetime import timedelta
     if s == "yesterday":
         return now - timedelta(days=1)
     if s == "tomorrow":
@@ -46,9 +40,8 @@ def schedule(
     fn = getattr(provider, "schedule_for_date", None)
     if not callable(fn):
         raise HTTPException(status_code=501, detail="Provider does not implement schedule_for_date()")
-    # accept either date_str or date (StatsApiProvider uses date_str)
     try:
-        return fn(date_str=the_date.isoformat())
+        return fn(date_str=the_date.isoformat(), debug=bool(debug))
     except TypeError:
         return fn(the_date)
 
@@ -67,7 +60,6 @@ def hot_hitters(
     try:
         return fn(date_str=the_date.isoformat(), top_n=top_n, debug=bool(debug))
     except TypeError:
-        # fallbacks for different provider signatures
         try:
             return fn(date=the_date, n=top_n, debug=bool(debug))
         except Exception as e:
