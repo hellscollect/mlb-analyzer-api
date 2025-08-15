@@ -1,25 +1,16 @@
 # providers/statsapi_provider.py
-import requests
+from __future__ import annotations
+
 import unicodedata
 from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime, timedelta, date as date_cls
 from zoneinfo import ZoneInfo
 
-BASE = "https://statsapi.mlb.com/api/v1"
-
+from .statsapi_client import StatsApiClient
 
 def _log(msg: str) -> None:
     # Keep logs consistent with your Render logs
     print(f"[StatsApiProvider] {msg}", flush=True)
-
-
-def _get(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    url = f"{BASE}{path}"
-    _log(f"GET {url} params= {params}")
-    r = requests.get(url, params=params or {}, timeout=30)
-    _log(f"HTTP {r.status_code} for {url}")
-    r.raise_for_status()
-    return r.json()
 
 
 def _season_from_date(date_str: str) -> int:
@@ -185,17 +176,17 @@ class StatsApiProvider:
       • Builds the slate and probables from /schedule
       • Scans hitters on active rosters for teams in the slate
       • Computes HOT and COLD lists with the exact fields your router expects
-      • NEW: boxscore_hitless_streak (AB>0-only) via /game/{gamePk}/boxscore
+      • Boxscore-based hitless streak verification via /game/{gamePk}/boxscore
     """
+
+    def __init__(self, client: Optional[StatsApiClient] = None):
+        # A small TTL cache + retry client so we don't hammer the public API.
+        self.client = client or StatsApiClient()
 
     # ---------------- Schedule ----------------
 
     def schedule_for_date(self, date_str: str) -> List[Dict[str, Any]]:
-        data = _get("/schedule", {
-            "date": date_str,
-            "sportId": 1,
-            "hydrate": "probablePitcher"
-        })
+        data = self.client.schedule(date_str, hydrate="probablePitcher")
 
         out: List[Dict[str, Any]] = []
         dates = data.get("dates") or []
@@ -230,10 +221,7 @@ class StatsApiProvider:
     # ---------------- Hot / Cold ----------------
 
     def _teams_in_slate(self, date_str: str) -> List[Dict[str, Any]]:
-        data = _get("/schedule", {
-            "date": date_str,
-            "sportId": 1
-        })
+        data = self.client.schedule(date_str)
         teams: Dict[int, str] = {}
         dates = data.get("dates") or []
         if not dates:
@@ -248,22 +236,14 @@ class StatsApiProvider:
         return [{"id": k, "name": v} for k, v in teams.items()]
 
     def _active_roster(self, team_id: int) -> List[Dict[str, Any]]:
-        js = _get(f"/teams/{team_id}/roster", {"rosterType": "active"})
+        js = self.client.team_roster(team_id, "active")
         return js.get("roster") or []
 
     def _player_season_stats(self, player_id: int, season: int) -> Dict[str, Any]:
-        return _get(f"/people/{player_id}/stats", {
-            "stats": "season",
-            "group": "hitting",
-            "season": season
-        })
+        return self.client.player_stats(player_id, season, "season")
 
     def _player_gamelog(self, player_id: int, season: int) -> Dict[str, Any]:
-        return _get(f"/people/{player_id}/stats", {
-            "stats": "gameLog",
-            "group": "hitting",
-            "season": season
-        })
+        return self.client.player_stats(player_id, season, "gameLog")
 
     def _scan_hitters_for_teams(self, date_str: str) -> List[Dict[str, Any]]:
         """
@@ -378,7 +358,7 @@ class StatsApiProvider:
         out.sort(key=lambda x: (x["slump_score"], x["current_hitless_streak"]), reverse=True)
         return out[:max(0, int(top_n))]
 
-    # ---------------- Boxscore verification (NEW) ----------------
+    # ---------------- Boxscore verification ----------------
     def boxscore_hitless_streak(
         self,
         player_name: str,
@@ -417,7 +397,7 @@ class StatsApiProvider:
         while cursor >= season_start and looked <= max_lookback:
             day = cursor.strftime("%Y-%m-%d")
             try:
-                sched = _get("/schedule", {"date": day, "sportId": 1})
+                sched = self.client.schedule(day)
             except Exception:
                 sched = {}
 
@@ -439,7 +419,7 @@ class StatsApiProvider:
 
                 # Pull boxscore
                 try:
-                    box = _get(f"/game/{game_pk}/boxscore")
+                    box = self.client.boxscore(int(game_pk))
                 except Exception:
                     continue
 
