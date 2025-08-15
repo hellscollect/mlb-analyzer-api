@@ -44,9 +44,6 @@ def _safe_float(v: Any) -> float:
 
 
 def _avg_from_stat(stat: Dict[str, Any]) -> float:
-    """
-    Prefer 'avg' if present; otherwise compute H/AB.
-    """
     if not stat:
         return 0.0
     if "avg" in stat and stat["avg"] not in (None, "", ".---"):
@@ -56,9 +53,7 @@ def _avg_from_stat(stat: Dict[str, Any]) -> float:
             return _safe_float(stat["avg"])
     h = _safe_float(stat.get("hits"))
     ab = _safe_float(stat.get("atBats"))
-    if ab > 0:
-        return h / ab
-    return 0.0
+    return (h / ab) if ab > 0 else 0.0
 
 
 def _extract_season_avg(stats_json: Dict[str, Any]) -> float:
@@ -80,12 +75,8 @@ def _extract_game_splits(stats_json: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 def _recent_avg_from_gamelog(splits: List[Dict[str, Any]], n: int = 5) -> float:
-    """
-    Compute last-n games batting average (H/AB), skipping games with AB=0.
-    Splits are most-recent first.
-    """
-    games: List[Tuple[int, int]] = []  # (H, AB)
-    for sp in splits:
+    games: List[Tuple[int, int]] = []
+    for sp in splits:  # most recent first
         stat = sp.get("stat", {})
         h = int(_safe_float(stat.get("hits")))
         ab = int(_safe_float(stat.get("atBats")))
@@ -100,18 +91,9 @@ def _recent_avg_from_gamelog(splits: List[Dict[str, Any]], n: int = 5) -> float:
     return (total_h / total_ab) if total_ab > 0 else 0.0
 
 
-def _ab0_hitless_streak_from_splits(
-    splits: List[Dict[str, Any]],
-    end_date: Optional[date_cls] = None,
-) -> int:
-    """
-    AB>0-only *consecutive hitless games* walking most-recent -> older.
-    Stops at first game with a hit. 0-AB games do not count and do not break.
-    If end_date is provided, only consider splits with date <= end_date.
-    """
+def _ab0_hitless_streak_from_splits(splits: List[Dict[str, Any]], end_date: Optional[date_cls] = None) -> int:
     streak = 0
-    for sp in splits:
-        # split date (formats vary a bit across endpoints)
+    for sp in splits:  # most recent first
         dstr = (sp.get("date") or sp.get("gameDate") or sp.get("gameDateTime") or "")
         if "T" in dstr:
             dstr = dstr.split("T")[0]
@@ -120,14 +102,12 @@ def _ab0_hitless_streak_from_splits(
         except Exception:
             gdate = None
         if end_date and gdate and gdate > end_date:
-            # skip future games relative to end_date
             continue
 
         st = sp.get("stat", {})
         ab = int(_safe_float(st.get("atBats")))
         h = int(_safe_float(st.get("hits")))
         if ab == 0:
-            # ignore this game entirely
             continue
         if h == 0:
             streak += 1
@@ -137,9 +117,6 @@ def _ab0_hitless_streak_from_splits(
 
 
 def _avg_hitless_run_ab_only(splits: List[Dict[str, Any]]) -> float:
-    """
-    Average length of AB>0-only hitless runs across the season.
-    """
     runs: List[int] = []
     cur = 0
     for sp in splits:
@@ -156,9 +133,7 @@ def _avg_hitless_run_ab_only(splits: List[Dict[str, Any]]) -> float:
             cur = 0
     if cur > 0:
         runs.append(cur)
-    if not runs:
-        return 0.0
-    return sum(runs) / len(runs)
+    return (sum(runs) / len(runs)) if runs else 0.0
 
 
 # ----------------------------
@@ -187,11 +162,10 @@ def _same_player(a: str, b: str) -> bool:
 # ======================================================================
 class StatsApiProvider:
     """
-    Provider that:
-      • Builds the slate and probables from /schedule
-      • Scans hitters on active rosters for teams in the slate
-      • Computes HOT and COLD lists
-      • Enforces AB>0-only streak logic via each player's gameLog (fast)
+    Builds the slate, scans active rosters for hitters in the slate, and computes:
+      • HOT hitters (recent uplift)
+      • COLD hitters (AB>0-only streaks)
+    Also fixes team labeling using /people/{id}.currentTeam.
     """
 
     def __init__(self, client: Optional[StatsApiClient] = None):
@@ -232,7 +206,7 @@ class StatsApiProvider:
             })
         return out
 
-    # ---------------- League scans (AB>0-only using gameLog) ----------------
+    # ---------------- League scans (AB>0-only) ----------------
 
     def _teams_in_slate(self, date_str: str) -> List[Dict[str, Any]]:
         data = self.client.schedule(date_str)
@@ -259,11 +233,19 @@ class StatsApiProvider:
     def _player_gamelog(self, player_id: int, season: int) -> Dict[str, Any]:
         return self.client.player_stats(player_id, season, "gameLog")
 
+    def _current_team_name(self, player_id: int) -> str:
+        try:
+            js = self.client.people(player_id)
+            people = js.get("people") or []
+            ct = (people[0].get("currentTeam") or {}).get("name") if people else None
+            return ct or ""
+        except Exception:
+            return ""
+
     def _scan_hitters_for_teams(self, date_str: str) -> List[Dict[str, Any]]:
         """
-        Returns per-hitter rows for the slate with AB>0-only hitless streak computed from gameLog.
         Keys:
-          player_id, player_name, team_name, season_avg, recent_avg_5,
+          player_id, player_name, team_name (from /people), season_avg, recent_avg_5,
           hitless_streak (AB>0-only), avg_hitless_run
         """
         try:
@@ -276,10 +258,7 @@ class StatsApiProvider:
         hitters: List[Dict[str, Any]] = []
 
         for t in teams:
-            team_id = t["id"]
-            team_name = t["name"]
-
-            roster = self._active_roster(team_id)
+            roster = self._active_roster(t["id"])
             for r in roster:
                 try:
                     person = r.get("person") or {}
@@ -289,14 +268,18 @@ class StatsApiProvider:
                     if pos == "P" or not pid:
                         continue
 
-                    # season avg
+                    # Team: authoritative from /people (handles trades)
+                    team_name = self._current_team_name(pid) or t["name"]
+
+                    # Season avg
                     season_stats = self._player_season_stats(pid, season)
                     s_avg = _extract_season_avg(season_stats)
 
-                    # game log
+                    # Game log (most recent first)
                     gamelog = self._player_gamelog(pid, season)
                     splits = _extract_game_splits(gamelog)
 
+                    # AB>0-only metrics
                     r5 = _recent_avg_from_gamelog(splits, 5)
                     verified_streak = _ab0_hitless_streak_from_splits(splits, end_date=end_date)
                     avg0 = _avg_hitless_run_ab_only(splits)
@@ -307,7 +290,7 @@ class StatsApiProvider:
                         "team_name": team_name,
                         "season_avg": round(s_avg, 3),
                         "recent_avg_5": round(r5, 3),
-                        "hitless_streak": int(verified_streak),   # AB>0-only
+                        "hitless_streak": int(verified_streak),
                         "avg_hitless_run": round(avg0, 3),
                     })
                 except Exception as ex:
@@ -317,10 +300,6 @@ class StatsApiProvider:
         return hitters
 
     def league_hot_hitters(self, date_str: str, top_n: int) -> List[Dict[str, Any]]:
-        """
-        Return: list of dicts with keys:
-          player_name, team_name, recent_avg_5, season_avg, avg_uplift
-        """
         rows = self._scan_hitters_for_teams(date_str)
         out: List[Dict[str, Any]] = []
         for r in rows:
@@ -336,16 +315,10 @@ class StatsApiProvider:
         return out[:max(0, int(top_n))]
 
     def league_cold_hitters(self, date_str: str, top_n: int) -> List[Dict[str, Any]]:
-        """
-        Return: list of dicts with keys:
-          player_name, team_name, season_avg, current_hitless_streak, avg_hitless_run, rarity_index, slump_score
-        All streak values are AB>0-only and computed from the player’s gameLog.
-        """
         rows = self._scan_hitters_for_teams(date_str)
         out: List[Dict[str, Any]] = []
-
         for r in rows:
-            cur0 = int(r["hitless_streak"])
+            cur0 = int(r["hitless_streak"])  # AB>0-only
             avg0 = float(r["avg_hitless_run"])
             season_avg = float(r["season_avg"])
             recent = float(r["recent_avg_5"])
@@ -367,50 +340,40 @@ class StatsApiProvider:
         out.sort(key=lambda x: (x["slump_score"], x["current_hitless_streak"]), reverse=True)
         return out[:max(0, int(top_n))]
 
-    # ---------------- Verification endpoint helper (fast) ----------------
+    # ---------------- Verification (fast) ----------------
     def boxscore_hitless_streak(
         self,
         player_name: str,
         team_name: Optional[str] = None,
         end_date: Optional[date_cls] = None,
-        max_lookback: int = 300,   # kept for signature compatibility; not used
+        max_lookback: int = 300,
         debug: bool = False,
     ) -> int:
-        """
-        AB>0-only *consecutive hitless games* for `player_name` based on the player’s gameLog.
-        We locate the player from today’s slate rosters (team hint helps if a player was traded).
-        """
         tz = ZoneInfo("America/New_York")
         if end_date is None:
             end_date = datetime.now(tz).date()
         date_str = end_date.strftime("%Y-%m-%d")
         season = end_date.year
 
-        # Find the player by scanning active rosters for the slate
         target = _norm_name(player_name)
         teams = self._teams_in_slate(date_str)
-        # If team_name is provided, bias the search order
+
+        # If team provided, bias search order
         if team_name:
-            tn = _norm_name(team_name)
-            teams.sort(key=lambda t: 0 if _norm_name(t["name"]) == tn else 1)
+            want = _norm_name(team_name)
+            teams.sort(key=lambda t: 0 if _norm_name(t["name"]) == want else 1)
 
         for t in teams:
             roster = self._active_roster(t["id"])
             for r in roster:
                 person = r.get("person") or {}
                 pname = person.get("fullName") or person.get("lastFirstName") or ""
-                if not pname:
+                if not pname or not _same_player(pname, target):
                     continue
-                if _same_player(pname, target):
-                    pid = person.get("id")
-                    if not pid:
-                        continue
-                    stats = self._player_stats_for_gamelog(pid, season)
-                    splits = _extract_game_splits(stats)
-                    return _ab0_hitless_streak_from_splits(splits, end_date=end_date)
+                pid = person.get("id")
+                if not pid:
+                    continue
+                splits = _extract_game_splits(self._player_gamelog(pid, season))
+                return _ab0_hitless_streak_from_splits(splits, end_date=end_date)
 
-        # Not found in slate rosters ➜ conservative 0
         return 0
-
-    def _player_stats_for_gamelog(self, player_id: int, season: int) -> Dict[str, Any]:
-        return self.client.player_stats(player_id, season, "gameLog")
