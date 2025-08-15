@@ -1,6 +1,6 @@
 # routes/mlb_routes.py
 from datetime import datetime, timedelta, date as date_cls
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 
 from fastapi import APIRouter, HTTPException, Query, Request
 import pytz
@@ -33,57 +33,96 @@ def _require_provider(request: Request):
 def schedule(
     request: Request,
     date: Optional[str] = Query(None, description="today|yesterday|tomorrow|YYYY-MM-DD"),
-    debug: int = Query(0, ge=0, le=1),
+    debug: int = Query(0, ge=0, le=1),  # kept only as a route param; NOT passed to provider
 ):
     provider = _require_provider(request)
     the_date = _parse_date(date)
+
     fn = getattr(provider, "schedule_for_date", None)
     if not callable(fn):
         raise HTTPException(status_code=501, detail="Provider does not implement schedule_for_date()")
+
+    # 1) Preferred: date_str=YYYY-MM-DD
     try:
-        return fn(date_str=the_date.isoformat(), debug=bool(debug))
+        return fn(date_str=the_date.isoformat())
     except TypeError:
-        return fn(the_date)
+        pass
+
+    # 2) Some providers accept date as a date object
+    try:
+        return fn(date=the_date)
+    except TypeError:
+        pass
+
+    # 3) Positional, but pass a string to avoid client JSON serialization issues
+    try:
+        return fn(the_date.isoformat())
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Provider error schedule_for_date: {type(e).__name__}: {e}")
 
 @router.get("/hot_hitters", summary="League-wide hot hitters (recent AVG uplift)")
 def hot_hitters(
     request: Request,
     date: Optional[str] = Query(None, description="today|yesterday|tomorrow|YYYY-MM-DD"),
     top_n: int = Query(15, ge=1, le=200),
-    debug: int = Query(0, ge=0, le=1),
+    debug: int = Query(0, ge=0, le=1),  # route param only; NOT passed to provider
 ):
     provider = _require_provider(request)
     the_date = _parse_date(date)
+
     fn = getattr(provider, "league_hot_hitters", None)
     if not callable(fn):
         raise HTTPException(status_code=501, detail="Provider does not implement league_hot_hitters()")
+
+    # 1) date_str + top_n (your StatsApiProvider uses this)
     try:
-        return fn(date_str=the_date.isoformat(), top_n=top_n, debug=bool(debug))
+        return fn(date_str=the_date.isoformat(), top_n=top_n)
     except TypeError:
-        try:
-            return fn(date=the_date, n=top_n, debug=bool(debug))
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Provider error: {type(e).__name__}: {e}")
+        pass
+
+    # 2) Some implementations prefer date + n
+    try:
+        return fn(date=the_date, n=top_n)
+    except TypeError:
+        pass
+
+    # 3) Last chance: positional date_str then top_n
+    try:
+        return fn(the_date.isoformat(), top_n)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Provider error league_hot_hitters: {type(e).__name__}: {e}")
 
 @router.get("/cold_hitters", summary="League-wide cold hitters (hitless/rarity index)")
 def cold_hitters(
     request: Request,
     date: Optional[str] = Query(None, description="today|yesterday|tomorrow|YYYY-MM-DD"),
     top_n: int = Query(15, ge=1, le=200),
-    debug: int = Query(0, ge=0, le=1),
+    debug: int = Query(0, ge=0, le=1),  # route param only; NOT passed to provider
 ):
     provider = _require_provider(request)
     the_date = _parse_date(date)
+
     fn = getattr(provider, "league_cold_hitters", None)
     if not callable(fn):
         raise HTTPException(status_code=501, detail="Provider does not implement league_cold_hitters()")
+
+    # 1) date_str + top_n (your StatsApiProvider uses this)
     try:
-        return fn(date_str=the_date.isoformat(), top_n=top_n, debug=bool(debug))
+        return fn(date_str=the_date.isoformat(), top_n=top_n)
     except TypeError:
-        try:
-            return fn(date=the_date, n=top_n, debug=bool(debug))
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Provider error: {type(e).__name__}: {e}")
+        pass
+
+    # 2) Some implementations prefer date + n
+    try:
+        return fn(date=the_date, n=top_n)
+    except TypeError:
+        pass
+
+    # 3) Last chance: positional date_str then top_n
+    try:
+        return fn(the_date.isoformat(), top_n)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Provider error league_cold_hitters: {type(e).__name__}: {e}")
 
 @router.get("/verify_hitless_streak", summary="Verify current AB>0-only hitless streak by boxscores")
 def verify_hitless_streak(
@@ -114,4 +153,4 @@ def verify_hitless_streak(
             "hitless_streak_ab_gt_0": int(streak),
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Provider error: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail=f"Provider error boxscore_hitless_streak: {type(e).__name__}: {e}")
