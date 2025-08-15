@@ -2,7 +2,7 @@ import os
 import importlib
 import inspect
 from datetime import datetime, timedelta, date as date_cls
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -49,7 +49,7 @@ _last_provider_error: Optional[str] = None
 def load_provider() -> Tuple[Optional[Any], Optional[str], Optional[str]]:
     """
     Loads the provider referenced by $MLB_PROVIDER.
-    Default to statsapi provider since it exists in your repo.
+    Defaults to statsapi provider if not set.
     """
     global _last_provider_error
     target = os.getenv("MLB_PROVIDER", "providers.statsapi_provider:StatsApiProvider")
@@ -123,8 +123,6 @@ def _call_with_sig(fn, **kwargs):
                     else:
                         raise
             return fn(*args)
-    except HTTPException:
-        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Provider error calling {fn.__name__}: {type(e).__name__}: {e}")
 
@@ -197,6 +195,19 @@ def _take_n(obj: Any, n: int) -> Any:
         return out
     return obj
 
+def _as_list_from_provider(obj: Union[List[Dict[str, Any]], Dict[str, Any]], keys: List[str]) -> List[Dict[str, Any]]:
+    """
+    Normalize provider response to a list, trying multiple common keys.
+    """
+    if isinstance(obj, list):
+        return obj
+    if isinstance(obj, dict):
+        for k in keys:
+            v = obj.get(k)
+            if isinstance(v, list):
+                return v
+    return []
+
 # ------------------
 # Models (kept here so OpenAPI is complete)
 # ------------------
@@ -262,7 +273,7 @@ class DateOnlyReq(BaseModel):
     debug: int = 0
 
 # ------------------
-# Health + simple root
+# Root & Health
 # ------------------
 @app.get("/", operation_id="root")
 def root():
@@ -348,7 +359,7 @@ def provider_raw_post(req: ProviderRawReq):
     return out
 
 # ------------------
-# Compatibility wrappers (prefer league_* first; then direct)
+# Compatibility wrappers (adapters for league_* + date_str + top_n)
 # ------------------
 def _hot_hitters_fallback(
     the_date: date_cls,
@@ -358,43 +369,32 @@ def _hot_hitters_fallback(
     debug: bool,
     top_n: int = 25,
 ):
-    errors: List[str] = []
-
-    # 1) Prefer league_* (works in utf8 wrapper)
-    league = _callable(provider, "league_hot_hitters")
-    if league:
-        try:
-            res = _call_with_sig(
-                league,
-                date_str=the_date.isoformat(),
-                date=the_date,
-                top_n=top_n, n=top_n, limit=top_n,
-                debug=debug,
-            )
-            return _take_n(_deep_fix(res), top_n)
-        except HTTPException as e:
-            errors.append(f"league_hot_hitters failed: {e.detail}")
-
-    # 2) Fall back to direct hot_streak_hitters if present
     direct = _callable(provider, "hot_streak_hitters")
     if direct:
-        try:
-            res = _call_with_sig(
-                direct,
-                date=the_date,
-                min_avg=min_avg,
-                games=games,
-                require_hit_each=require_hit_each,
-                top_n=top_n, limit=top_n,
-                debug=debug,
-            )
-            return _take_n(_deep_fix(res), top_n)
-        except HTTPException as e:
-            errors.append(f"hot_streak_hitters failed: {e.detail}")
+        res = _call_with_sig(
+            direct,
+            date=the_date,
+            min_avg=min_avg,
+            games=games,
+            require_hit_each=require_hit_each,
+            debug=debug,
+        )
+        return _take_n(_deep_fix(res), top_n)
 
-    if errors:
-        raise HTTPException(status_code=500, detail="; ".join(errors))
-    raise HTTPException(status_code=501, detail="Provider does not implement league_hot_hitters() or hot_streak_hitters().")
+    league = _callable(provider, "league_hot_hitters")
+    if league:
+        res = _call_with_sig(
+            league,
+            date_str=the_date.isoformat(),
+            date=the_date,
+            top_n=top_n,
+            n=top_n,
+            limit=top_n,
+            debug=debug,
+        )
+        return _take_n(_deep_fix(res), top_n)
+
+    raise HTTPException(status_code=501, detail="Provider does not implement hot_streak_hitters() or league_hot_hitters().")
 
 def _cold_hitters_fallback(
     the_date: date_cls,
@@ -404,43 +404,32 @@ def _cold_hitters_fallback(
     debug: bool,
     top_n: int = 25,
 ):
-    errors: List[str] = []
-
-    # 1) Prefer league_* (works in utf8 wrapper)
-    league = _callable(provider, "league_cold_hitters")
-    if league:
-        try:
-            res = _call_with_sig(
-                league,
-                date_str=the_date.isoformat(),
-                date=the_date,
-                top_n=top_n, n=top_n, limit=top_n,
-                debug=debug,
-            )
-            return _take_n(_deep_fix(res), top_n)
-        except HTTPException as e:
-            errors.append(f"league_cold_hitters failed: {e.detail}")
-
-    # 2) Fall back to direct cold_streak_hitters if present
     direct = _callable(provider, "cold_streak_hitters")
     if direct:
-        try:
-            res = _call_with_sig(
-                direct,
-                date=the_date,
-                min_avg=min_avg,
-                games=games,
-                require_zero_hit_each=require_zero_hit_each,
-                top_n=top_n, limit=top_n,
-                debug=debug,
-            )
-            return _take_n(_deep_fix(res), top_n)
-        except HTTPException as e:
-            errors.append(f"cold_streak_hitters failed: {e.detail}")
+        res = _call_with_sig(
+            direct,
+            date=the_date,
+            min_avg=min_avg,
+            games=games,
+            require_zero_hit_each=require_zero_hit_each,
+            debug=debug,
+        )
+        return _take_n(_deep_fix(res), top_n)
 
-    if errors:
-        raise HTTPException(status_code=500, detail="; ".join(errors))
-    raise HTTPException(status_code=501, detail="Provider does not implement league_cold_hitters() or cold_streak_hitters().")
+    league = _callable(provider, "league_cold_hitters")
+    if league:
+        res = _call_with_sig(
+            league,
+            date_str=the_date.isoformat(),
+            date=the_date,
+            top_n=top_n,
+            n=top_n,
+            limit=top_n,
+            debug=debug,
+        )
+        return _take_n(_deep_fix(res), top_n)
+
+    raise HTTPException(status_code=501, detail="Provider does not implement cold_streak_hitters() or league_cold_hitters().")
 
 def _pitcher_streaks_fallback(the_date: date_cls, hot_max_era: float, hot_min_ks_each: int, hot_last_starts: int,
                               cold_min_era: float, cold_min_runs_each: int, cold_last_starts: int, debug: bool):
@@ -600,7 +589,7 @@ def league_scan(
     logs: List[str] = []
     result: Dict[str, Any] = {"date": the_date.isoformat()}
 
-    # Matchups / schedule (provider expects date_str)
+    # Matchups / schedule
     try:
         matchups = _schedule_for_date(the_date, bool(debug))
         logs.append("provider_call:schedule_for_date:ok")
@@ -613,7 +602,7 @@ def league_scan(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"schedule_for_date failed: {type(e).__name__}: {e}")
 
-    # Hot / Cold hitters via adapters (now league_* first)
+    # Hot / Cold hitters via adapters
     hot = _hot_hitters_fallback(the_date, min_avg=0.0, games=5, require_hit_each=False, debug=bool(debug), top_n=limit)
     cold = _cold_hitters_fallback(the_date, min_avg=0.0, games=5, require_zero_hit_each=False, debug=bool(debug), top_n=limit)
 
@@ -641,26 +630,122 @@ def league_scan(
     return result
 
 # ------------------
-# Include routers from routes/ (optional)
+# NEW: "True cold" hitters endpoint (good season hitters currently in hitless/low-recent form)
 # ------------------
-# Self-test router
-try:
-    from routes.self_test import router as self_test_router
-    app.include_router(self_test_router)
-except Exception:
-    pass
+@app.get("/cold_hitters_streaky", operation_id="cold_hitters_streaky")
+def cold_hitters_streaky(
+    date: Optional[str] = Query(None, description="today|yesterday|tomorrow|YYYY-MM-DD"),
+    min_season_avg: float = Query(0.260, description="Minimum season AVG to be considered 'good'"),
+    last_n: int = Query(5, ge=1, le=15, description="Recent window size (used if provider supplies recent_avg fields)"),
+    max_recent_avg: Optional[float] = Query(None, description="If provided and provider supplies recent averages, require recent_avg <= this"),
+    min_hitless_games: int = Query(1, ge=0, le=20, description="Require at least this many consecutive hitless games"),
+    limit: int = Query(12, ge=1, le=200),
+    team: Optional[str] = Query(None, description="Optional team filter if provider supports it"),
+    debug: int = Query(0, ge=0, le=1),
+):
+    the_date = parse_date(date)
 
-# League scan (if you also keep a separate module)
+    league_fn = _callable(provider, "league_cold_hitters")
+    if not league_fn:
+        raise HTTPException(status_code=501, detail="Provider does not implement league_cold_hitters()")
+
+    # Pull a generous set, then filter down.
+    raw = _call_with_sig(
+        league_fn,
+        date_str=the_date.isoformat(),
+        date=the_date,
+        top_n=max(limit * 4, 100),
+        n=max(limit * 4, 100),
+        limit=max(limit * 4, 100),
+        team=team,
+        debug=bool(debug),
+    )
+    items = _as_list_from_provider(raw, ["cold_hitters", "result", "players"]) or (raw if isinstance(raw, list) else [])
+    items = _deep_fix(items)
+
+    # Helper to read a "recent average" if present
+    def _recent_avg(d: Dict[str, Any]) -> Optional[float]:
+        keys_try = [f"recent_avg_{last_n}", "recent_avg", "recent_avg_5"]
+        for k in keys_try:
+            v = d.get(k)
+            if isinstance(v, (int, float)):
+                return float(v)
+        return None
+
+    candidates = len(items)
+    qualified: List[Dict[str, Any]] = []
+
+    for row in items:
+        sa = row.get("season_avg")
+        if not isinstance(sa, (int, float)):
+            continue
+        if sa < float(min_season_avg):
+            continue
+
+        chs = row.get("current_hitless_streak", 0)  # prefer explicit hitless streak if provider supplies it
+        if not isinstance(chs, int):
+            try:
+                chs = int(chs)
+            except Exception:
+                chs = 0
+
+        # Require a minimum hitless streak (0 means allow none)
+        if chs < int(min_hitless_games):
+            # If no hitless streak, optionally allow via recent AVG if supplied and below max_recent_avg
+            if max_recent_avg is None:
+                continue
+            ra = _recent_avg(row)
+            if ra is None or ra > float(max_recent_avg):
+                continue
+
+        # Optional recent AVG clamp if provided
+        if max_recent_avg is not None:
+            ra2 = _recent_avg(row)
+            if ra2 is not None and ra2 > float(max_recent_avg):
+                continue
+
+        qualified.append(row)
+
+    # Sort: priority to longest current hitless streak, then higher season avg
+    qualified.sort(key=lambda r: (r.get("current_hitless_streak", 0), r.get("season_avg", 0.0)), reverse=True)
+    out = {
+        "date": the_date.isoformat(),
+        "filters": {
+            "min_season_avg": float(min_season_avg),
+            "last_n": int(last_n),
+            "max_recent_avg": None if max_recent_avg is None else float(max_recent_avg),
+            "min_hitless_games": int(min_hitless_games),
+            "limit": int(limit),
+            "team": team,
+        },
+        "counts": {
+            "candidates": candidates,
+            "qualified": len(qualified),
+            "returned": min(len(qualified), int(limit)),
+        },
+        "results": qualified[:limit],
+    }
+    if debug == 1:
+        out["debug"] = {
+            "provider_module": provider_module,
+            "provider_class": provider_class,
+            "notes": "Filtered league_cold_hitters by season_avg/Hitless/RecentAVG",
+            "raw_preview": items[:5],
+        }
+    return out
+
+# ------------------
+# Include routers from routes/
+# ------------------
 try:
     from routes.league_scan import router as league_scan_router
     app.include_router(league_scan_router)
 except Exception:
     pass
 
-# Cold hitters by game (if present in your repo)
 try:
-    from routes.cold_hitters_game import router as cold_game_router
-    app.include_router(cold_game_router)
+    from routes.self_test import router as self_test_router
+    app.include_router(self_test_router)
 except Exception:
     pass
 
