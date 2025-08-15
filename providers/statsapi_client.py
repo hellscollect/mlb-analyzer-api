@@ -21,7 +21,6 @@ class _TTLCache:
     def _evict_if_needed(self) -> None:
         if len(self._store) <= self.maxsize:
             return
-        # Evict oldest N entries
         to_evict = len(self._store) - self.maxsize
         keys = sorted(self._store.keys(), key=lambda k: self._store[k][0])
         for k in keys[:to_evict]:
@@ -42,33 +41,14 @@ class _TTLCache:
         self._evict_if_needed()
 
 
-def _jsonable(v: Any) -> Any:
-    """Make values JSONable for cache keys; dates -> isoformat, others -> str fallback."""
-    if v is None or isinstance(v, (str, int, float, bool)):
-        return v
-    # handle stdlib/date/datetime-like things
-    iso = getattr(v, "isoformat", None)
-    if callable(iso):
-        try:
-            return v.isoformat()
-        except Exception:
-            pass
-    return str(v)
-
-
 def _mk_key(path: str, params: Optional[Dict[str, Any]]) -> str:
-    # canonicalize params for stable cache key — ensure all values are JSON-serializable
     p = params or {}
-    p2 = {k: _jsonable(v) for k, v in p.items()}
-    return json.dumps([path, sorted(p2.items(), key=lambda kv: kv[0])], separators=(",", ":"), sort_keys=False)
+    return json.dumps([path, sorted(p.items(), key=lambda kv: kv[0])], separators=(",", ":"), sort_keys=False)
 
 
 class StatsApiClient:
     """
-    A small, resilient HTTP client for MLB StatsAPI with TTL caching + retries.
-    - Sync (requests) for drop-in use.
-    - Backoff on transient errors.
-    - Per-request timeout.
+    Small HTTP client for MLB StatsAPI with TTL caching + retries.
     """
 
     def __init__(
@@ -96,7 +76,6 @@ class StatsApiClient:
                 self._log(f"CACHE HIT {url} params={params}")
                 return cached
 
-        # retry with decorrelated jitter backoff
         attempt = 0
         wait = 0.5
         while True:
@@ -114,15 +93,14 @@ class StatsApiClient:
                 if attempt >= self.max_retries:
                     self._log(f"ERROR giving up after {attempt} attempts: {type(e).__name__}")
                     raise
-                # jittered backoff
                 sleep_for = wait + random.random() * 0.5 * wait
                 self._log(f"Transient error ({type(e).__name__}). Retry {attempt}/{self.max_retries} in {sleep_for:.2f}s")
                 time.sleep(sleep_for)
                 wait = min(8.0, wait * 1.7)
 
-    # Convenience wrappers (kept simple so provider code reads clearly)
+    # Convenience wrappers
     def schedule(self, date_str: str, hydrate: Optional[str] = None) -> Dict[str, Any]:
-        params = {"date": str(date_str), "sportId": 1}
+        params = {"date": date_str, "sportId": 1}
         if hydrate:
             params["hydrate"] = hydrate
         return self.get("/schedule", params)
@@ -133,8 +111,12 @@ class StatsApiClient:
     def player_stats(self, player_id: int, season: int, stat_type: str) -> Dict[str, Any]:
         return self.get(
             f"/people/{player_id}/stats",
-            {"stats": stat_type, "group": "hitting", "season": int(season)}
+            {"stats": stat_type, "group": "hitting", "season": season}
         )
 
     def boxscore(self, game_pk: int) -> Dict[str, Any]:
-        return self.get(f"/game/{int(game_pk)}/boxscore")
+        return self.get(f"/game/{game_pk}/boxscore")
+
+    def people(self, player_id: int) -> Dict[str, Any]:
+        # currentTeam lives here; keep cached briefly
+        return self.get(f"/people/{player_id}")
