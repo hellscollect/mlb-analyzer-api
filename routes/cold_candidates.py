@@ -1,4 +1,3 @@
-# routes/cold_candidates.py
 from fastapi import APIRouter, Query, HTTPException, Request
 from typing import Optional, Dict, Any, List
 from datetime import datetime, timedelta, date as date_cls
