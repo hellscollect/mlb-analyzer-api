@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import time
 import json
-import math
 import random
 from typing import Any, Dict, Optional, Tuple
 
@@ -43,10 +42,25 @@ class _TTLCache:
         self._evict_if_needed()
 
 
+def _jsonable(v: Any) -> Any:
+    """Make values JSONable for cache keys; dates -> isoformat, others -> str fallback."""
+    if v is None or isinstance(v, (str, int, float, bool)):
+        return v
+    # handle stdlib/date/datetime-like things
+    iso = getattr(v, "isoformat", None)
+    if callable(iso):
+        try:
+            return v.isoformat()
+        except Exception:
+            pass
+    return str(v)
+
+
 def _mk_key(path: str, params: Optional[Dict[str, Any]]) -> str:
-    # canonicalize params for stable cache key
+    # canonicalize params for stable cache key — ensure all values are JSON-serializable
     p = params or {}
-    return json.dumps([path, sorted(p.items(), key=lambda kv: kv[0])], separators=(",", ":"), sort_keys=False)
+    p2 = {k: _jsonable(v) for k, v in p.items()}
+    return json.dumps([path, sorted(p2.items(), key=lambda kv: kv[0])], separators=(",", ":"), sort_keys=False)
 
 
 class StatsApiClient:
@@ -108,7 +122,7 @@ class StatsApiClient:
 
     # Convenience wrappers (kept simple so provider code reads clearly)
     def schedule(self, date_str: str, hydrate: Optional[str] = None) -> Dict[str, Any]:
-        params = {"date": date_str, "sportId": 1}
+        params = {"date": str(date_str), "sportId": 1}
         if hydrate:
             params["hydrate"] = hydrate
         return self.get("/schedule", params)
@@ -119,8 +133,8 @@ class StatsApiClient:
     def player_stats(self, player_id: int, season: int, stat_type: str) -> Dict[str, Any]:
         return self.get(
             f"/people/{player_id}/stats",
-            {"stats": stat_type, "group": "hitting", "season": season}
+            {"stats": stat_type, "group": "hitting", "season": int(season)}
         )
 
     def boxscore(self, game_pk: int) -> Dict[str, Any]:
-        return self.get(f"/game/{game_pk}/boxscore")
+        return self.get(f"/game/{int(game_pk)}/boxscore")
