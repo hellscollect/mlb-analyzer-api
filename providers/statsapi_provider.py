@@ -1,7 +1,8 @@
 # providers/statsapi_provider.py
 import requests
+import unicodedata
 from typing import Any, Dict, List, Optional, Tuple
-from datetime import datetime
+from datetime import datetime, timedelta, date as date_cls
 from zoneinfo import ZoneInfo
 
 BASE = "https://statsapi.mlb.com/api/v1"
@@ -154,12 +155,37 @@ def _avg_hitless_run(splits: List[Dict[str, Any]]) -> float:
     return sum(runs) / len(runs)
 
 
+# ----------------------------
+# Name normalization helpers
+# ----------------------------
+def _norm_name(s: str) -> str:
+    if not isinstance(s, str):
+        return ""
+    s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
+    return (
+        s.lower()
+        .replace(".", "")
+        .replace("-", " ")
+        .replace("'", "")
+        .replace("  ", " ")
+        .strip()
+    )
+
+
+def _same_player(a: str, b: str) -> bool:
+    return _norm_name(a) == _norm_name(b)
+
+
+# ======================================================================
+# Provider
+# ======================================================================
 class StatsApiProvider:
     """
     Provider that:
       • Builds the slate and probables from /schedule
       • Scans hitters on active rosters for teams in the slate
       • Computes HOT and COLD lists with the exact fields your router expects
+      • NEW: boxscore_hitless_streak (AB>0-only) via /game/{gamePk}/boxscore
     """
 
     # ---------------- Schedule ----------------
@@ -351,3 +377,140 @@ class StatsApiProvider:
         # Sort by slump_score desc, then current_hitless_streak desc
         out.sort(key=lambda x: (x["slump_score"], x["current_hitless_streak"]), reverse=True)
         return out[:max(0, int(top_n))]
+
+    # ---------------- Boxscore verification (NEW) ----------------
+    def boxscore_hitless_streak(
+        self,
+        player_name: str,
+        team_name: Optional[str] = None,
+        end_date: Optional[date_cls] = None,
+        max_lookback: int = 300,
+        debug: bool = False,
+    ) -> int:
+        """
+        Compute current-season, AB>0-only *consecutive hitless games* for `player_name`,
+        scanning backward from `end_date` until a game with a hit occurs (or season start).
+
+        Rules:
+          • Count a game as hitless ONLY if AB > 0 and H == 0.
+          • 0-for-0 (BB/HBP/SF-only) does NOT count and does NOT break the streak.
+          • Any hit (H > 0) immediately BREAKS the streak.
+          • Current season only (based on end_date.year).
+        Returns:
+          int -> consecutive hitless games (AB>0 only)
+        """
+        # Establish time bounds
+        tz = ZoneInfo("America/New_York")
+        if end_date is None:
+            end_date = datetime.now(tz).date()
+        season_year = end_date.year
+        season_start = date_cls(season_year, 3, 1)  # safe early bound
+
+        target = _norm_name(player_name)
+        team_norm = _norm_name(team_name) if team_name else None
+
+        # Walk back day-by-day
+        cursor = end_date
+        looked = 0
+        streak = 0
+
+        while cursor >= season_start and looked <= max_lookback:
+            day = cursor.strftime("%Y-%m-%d")
+            try:
+                sched = _get("/schedule", {"date": day, "sportId": 1})
+            except Exception:
+                sched = {}
+
+            dates = sched.get("dates") or []
+            games = dates[0].get("games", []) if dates else []
+
+            for g in games:
+                game_pk = g.get("gamePk") or g.get("game_pk") or g.get("game_id")
+                if not game_pk:
+                    continue
+
+                # If a team filter is provided, skip games that clearly don't involve it (best-effort)
+                if team_norm:
+                    home_name = (((g.get("teams") or {}).get("home") or {}).get("team") or {}).get("name") or ""
+                    away_name = (((g.get("teams") or {}).get("away") or {}).get("team") or {}).get("name") or ""
+                    if _norm_name(home_name) != team_norm and _norm_name(away_name) != team_norm:
+                        # Not a hard exclusion—player may have been traded—but this speeds most paths.
+                        pass
+
+                # Pull boxscore
+                try:
+                    box = _get(f"/game/{game_pk}/boxscore")
+                except Exception:
+                    continue
+
+                batter_rows: List[Dict[str, Any]] = []
+
+                # Standard shape: box['teams']['home'/'away']['players'][<id>]['stats']['batting']
+                teams_blob = box.get("teams") or {}
+                for side in ("home", "away"):
+                    side_blob = teams_blob.get(side)
+                    if isinstance(side_blob, dict):
+                        players = side_blob.get("players")
+                        if isinstance(players, dict):
+                            for pdata in players.values():
+                                person = pdata.get("person") or {}
+                                full_name = person.get("fullName") or pdata.get("name") or ""
+                                stats = pdata.get("stats", {})
+                                batting = stats.get("batting") or {}
+                                ab = batting.get("atBats")
+                                h = batting.get("hits")
+                                if full_name:
+                                    batter_rows.append({"name": full_name, "ab": ab, "h": h})
+
+                # Fallback shapes occasionally seen
+                if not batter_rows:
+                    for key in ("batters", "hitters"):
+                        maybe = box.get(key)
+                        if isinstance(maybe, list):
+                            for row in maybe:
+                                if isinstance(row, dict):
+                                    full_name = row.get("name") or row.get("fullName") or ""
+                                    batting = row.get("batting") or row
+                                    ab = batting.get("ab") or batting.get("atBats")
+                                    h = batting.get("h") or batting.get("hits")
+                                    if full_name:
+                                        batter_rows.append({"name": full_name, "ab": ab, "h": h})
+
+                matched_any = False
+                hit_found = False
+                counted_hitless = False
+
+                for br in batter_rows:
+                    if _same_player(br.get("name", ""), target):
+                        matched_any = True
+                        ab = br.get("ab") or 0
+                        h = br.get("h") or 0
+                        try:
+                            ab = int(ab)
+                        except Exception:
+                            ab = 0
+                        try:
+                            h = int(h)
+                        except Exception:
+                            h = 0
+
+                        if ab == 0:
+                            # ignore this game
+                            continue
+                        if h > 0:
+                            hit_found = True
+                            break
+                        else:
+                            counted_hitless = True  # AB>0 and H==0
+
+                if matched_any:
+                    if hit_found:
+                        return streak
+                    if counted_hitless:
+                        streak += 1
+                    # if matched but AB==0 only -> ignore and continue scanning older dates
+
+            cursor = cursor - timedelta(days=1)
+            looked += 1
+
+        return streak
