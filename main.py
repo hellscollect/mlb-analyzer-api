@@ -756,6 +756,13 @@ try:
 except Exception:
     pass
 
+# >>> NEW: include /mlb router <<<
+try:
+    from routes.mlb_routes import router as mlb_router
+    app.include_router(mlb_router)
+except Exception:
+    pass
+
 # ------------------
 # Run local
 # ------------------
