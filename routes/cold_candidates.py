@@ -2,24 +2,20 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, date as date_cls
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request
 import pytz
 
-router = APIRouter(tags=["cold-candidates"])
+router = APIRouter(tags=["cold"], prefix="")
 
-# ---------- helpers ----------
 def _parse_date(d: Optional[str]) -> date_cls:
     tz = pytz.timezone("America/New_York")
-    now = datetime.now(tz).date()
+    today = datetime.now(tz).date()
     if not d or d.lower() == "today":
-        return now
-    s = d.lower()
-    if s == "yesterday":
-        return now - timedelta(days=1)
-    if s == "tomorrow":
-        return now + timedelta(days=1)
+        return today
+    if d.lower() == "yesterday":
+        return today - timedelta(days=1)
     try:
         return datetime.strptime(d, "%Y-%m-%d").date()
     except Exception:
@@ -32,42 +28,16 @@ def _require_provider(request: Request):
         raise HTTPException(status_code=503, detail=f"Provider not loaded: {last_err or 'unknown error'}")
     return provider
 
-def _as_list_from_provider(obj: Any, keys: List[str]) -> List[Dict[str, Any]]:
-    if isinstance(obj, list):
-        return obj
-    if isinstance(obj, dict):
-        for k in keys:
-            v = obj.get(k)
-            if isinstance(v, list):
-                return v
-    return []
-
-def _get_float(d: Dict[str, Any], k: str, default: float = 0.0) -> float:
-    v = d.get(k, default)
-    try:
-        return float(v)
-    except Exception:
-        return default
-
-def _get_int(d: Dict[str, Any], k: str, default: int = 0) -> int:
-    v = d.get(k, default)
-    try:
-        return int(v)
-    except Exception:
-        return default
-
-# ---------- endpoint ----------
 @router.get(
     "/cold_candidates",
-    summary="Cold Candidates",
+    summary="Cold Candidates (AB>0-only, boxscore-verified streaks)",
     description=(
-        "BUSINESS RULES:\n"
-        "  • Count hitless games only if AB > 0 (0-for-X counts; 0-for-0 is ignored and does not break).\n"
+        "RULES:\n"
+        "  • Count hitless games only if AB > 0 (0-for-0 is ignored and does not break).\n"
         "  • Current season only; require season AVG >= min_season_avg (default .265).\n"
-        "  • Include players with hitless streak >= min_hitless_games (default 1) OR recent AVG <= max_recent_avg if provided.\n"
-        "  • Ranking: verified_hitless_streak desc → season AVG desc → OBP desc → AB in last 3 games desc.\n"
-        "  • verify=1 recomputes AB>0 hitless streak via provider.boxscore_hitless_streak (slower but exact).\n"
-        "  • verified_only=1 keeps only rows where AB>0 recompute succeeded."
+        "  • Include players with verified hitless streak >= min_hitless_games (default 1).\n"
+        "  • Ranking: verified_hitless_streak desc → season AVG desc → (optional) recent AVG desc.\n"
+        "This endpoint ALWAYS recomputes hitless streaks via provider.boxscore_hitless_streak."
     ),
 )
 def cold_candidates(
@@ -79,113 +49,69 @@ def cold_candidates(
     min_hitless_games: int = Query(1, ge=1, description="minimum AB>0 hitless games to include"),
     limit: int = Query(30, ge=1, le=100),
     team: Optional[str] = Query(None, description="optional team filter"),
-    verify: int = Query(1, ge=0, le=1, description="try to recompute AB>0 hitless streak"),
-    verified_only: int = Query(0, ge=0, le=1, description="when 1, include only players whose AB>0 streak was verified"),
     debug: int = Query(0, ge=0, le=1),
 ):
     provider = _require_provider(request)
     the_date = _parse_date(date)
 
-    # 1) Seed from provider's league_cold_hitters (bigger pool, then filter)
+    # Seed from provider’s league_cold_hitters (already AB>0-enforced in provider)
     league_fn = getattr(provider, "league_cold_hitters", None)
     if not callable(league_fn):
         raise HTTPException(status_code=501, detail="Provider does not implement league_cold_hitters()")
 
-    # Ask for a generous pool (4x limit, min 100) then filter down
-    seed_n = max(limit * 4, 100)
     try:
-        raw = league_fn(
-            date_str=the_date.isoformat(),
-            top_n=seed_n,
-            n=seed_n,
-            limit=seed_n,
-            team=team,
-            debug=bool(debug),
-        )
+        raw = league_fn(date_str=the_date.isoformat(), top_n=max(limit * 4, 120))
     except TypeError:
-        # signature fallback
-        raw = league_fn(date=the_date, top_n=seed_n)
+        raw = league_fn(date=the_date, n=max(limit * 4, 120))
 
-    items = _as_list_from_provider(raw, ["cold_hitters", "result", "players"]) or (raw if isinstance(raw, list) else [])
-    candidates = len(items)
-
-    # 2) Filter by season AVG + (hitless streak >= min_hitless_games OR recent AVG <= max_recent_avg if provided)
-    filtered: List[Dict[str, Any]] = []
+    items = raw if isinstance(raw, list) else []
+    candidates: List[Dict[str, Any]] = []
     for row in items:
-        sa = _get_float(row, "season_avg", 0.0)
-        if sa < float(min_season_avg):
+        sa = row.get("season_avg")
+        if not isinstance(sa, (int, float)) or float(sa) < float(min_season_avg):
             continue
 
-        chs = _get_int(row, "current_hitless_streak", 0)
+        # Optional recent AVG clamp
+        if max_recent_avg is not None:
+            ra = row.get("recent_avg_5") or row.get("recent_avg") or None
+            if isinstance(ra, (int, float)) and float(ra) > float(max_recent_avg):
+                continue
 
-        # Allow via hitless streak threshold
-        allow = chs >= int(min_hitless_games)
+        candidates.append(row)
 
-        # Or allow via recent AVG if present + capped
-        if not allow and max_recent_avg is not None:
-            # Try common recent keys
-            ra: Optional[float] = None
-            for k in (f"recent_avg_{last_n}", "recent_avg", "recent_avg_5"):
-                if isinstance(row.get(k), (int, float)):
-                    ra = float(row[k])
-                    break
-            if ra is not None and ra <= float(max_recent_avg):
-                allow = True
-
-        if not allow:
+    # ALWAYS re-verify AB>0-only streak via boxscores
+    verified: List[Dict[str, Any]] = []
+    for row in candidates:
+        pname = row.get("player_name") or row.get("name")
+        tname = row.get("team_name")
+        if not pname:
+            continue
+        try:
+            streak = provider.boxscore_hitless_streak(
+                player_name=pname,
+                team_name=tname,
+                end_date=the_date,
+                max_lookback=300,
+                debug=bool(debug),
+            )
+        except Exception:
             continue
 
-        filtered.append(dict(row))  # shallow copy
+        if streak >= int(min_hitless_games):
+            out = dict(row)
+            out["verified_hitless_streak"] = int(streak)
+            verified.append(out)
 
-    # 3) Optional: exact recompute of AB>0 hitless streak using boxscores (slow but correct)
-    verified_count = 0
-    if verify == 1:
-        verify_fn = getattr(provider, "boxscore_hitless_streak", None)
-        if callable(verify_fn):
-            for r in filtered:
-                pname = r.get("player_name") or r.get("name")
-                tname = r.get("team_name") or team
-                try:
-                    v = verify_fn(
-                        player_name=str(pname),
-                        team_name=str(tname) if tname else None,
-                        end_date=the_date,
-                        max_lookback=400,
-                        debug=bool(debug),
-                    )
-                    r["verified_hitless_streak"] = int(v)
-                    verified_count += 1
-                except Exception:
-                    # leave as-is if verify fails
-                    r["verified_hitless_streak"] = _get_int(r, "current_hitless_streak", 0)
-        else:
-            # No verify available on provider; mirror current streak
-            for r in filtered:
-                r["verified_hitless_streak"] = _get_int(r, "current_hitless_streak", 0)
-    else:
-        for r in filtered:
-            r["verified_hitless_streak"] = _get_int(r, "current_hitless_streak", 0)
+    # Sort by verified streak desc, then season avg desc, then (if present) recent avg desc
+    def _recent_key(d: Dict[str, Any]) -> float:
+        v = d.get("recent_avg_5") or d.get("recent_avg") or 0.0
+        try:
+            return float(v)
+        except Exception:
+            return 0.0
 
-    # 4) Optionally keep only those that have a strictly positive verified streak
-    if verified_only == 1:
-        filtered = [r for r in filtered if _get_int(r, "verified_hitless_streak", 0) >= int(min_hitless_games)]
-
-    # 5) Ranking:
-    #    verified_hitless_streak desc → season AVG desc → OBP desc → AB last 3 games desc
-    def _get_obp(d: Dict[str, Any]) -> float:
-        return _get_float(d, "season_obp", _get_float(d, "obp", 0.0))
-
-    def _get_recent_ab3(d: Dict[str, Any]) -> int:
-        # if the provider exposes recent ABs; otherwise 0
-        return _get_int(d, "recent_ab_3", 0)
-
-    filtered.sort(
-        key=lambda r: (
-            _get_int(r, "verified_hitless_streak", 0),
-            _get_float(r, "season_avg", 0.0),
-            _get_obp(r),
-            _get_recent_ab3(r),
-        ),
+    verified.sort(
+        key=lambda r: (r.get("verified_hitless_streak", 0), r.get("season_avg", 0.0), _recent_key(r)),
         reverse=True,
     )
 
@@ -198,19 +124,18 @@ def cold_candidates(
             "min_hitless_games": int(min_hitless_games),
             "limit": int(limit),
             "team": team,
-            "verify": int(verify),
-            "verified_only": int(verified_only),
         },
         "counts": {
-            "candidates": candidates,
-            "qualified": len(filtered),
-            "verified_attempted": verified_count if verify == 1 else 0,
-            "returned": min(len(filtered), int(limit)),
+            "seeded": len(items),
+            "qualified": len(candidates),
+            "verified": len(verified),
+            "returned": min(len(verified), int(limit)),
         },
-        "results": filtered[:limit],
+        "results": verified[:limit],
     }
     if debug == 1:
         out["debug"] = {
-            "notes": "Seeded from league_cold_hitters; optional boxscore verify applied per player.",
+            "note": "All hitless streaks recomputed via boxscores (AB>0-only).",
+            "sample": verified[:5],
         }
     return out
