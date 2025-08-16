@@ -6,12 +6,12 @@ from typing import Any, Dict, List, Optional
 class StatsApiProvider:
     """
     Business logic lives here.
-    - schedule_for_date
+    - schedule_for_date (now accepts missing date and defaults to today)
     - cold_candidates (STRICT: only AB>0 & H==0, regular season)
     - league_hot_hitters / league_cold_hitters (placeholders)
     - pitcher_streaks (empty lists)
     - cold_pitchers (empty list)
-    - _fetch_hitter_rows / _fetch_pitcher_rows (stubs for /provider_raw probes)
+    - _fetch_hitter_rows / _fetch_pitcher_rows (accept optional date so probes don’t 500)
     """
     BASE_URL = "https://statsapi.mlb.com/api/v1"
     base = "mlb-statsapi"
@@ -29,8 +29,14 @@ class StatsApiProvider:
     # ------------------------
     # Public methods used by your API
     # ------------------------
-    def schedule_for_date(self, date: str) -> Dict[str, Any]:
-        return self._fetch("schedule", params={"sportId": 1, "date": date})
+    def schedule_for_date(self, date: Optional[str] = None, date_str: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Accepts either `date` or `date_str`. If neither provided, uses today (local).
+        """
+        d = date or date_str
+        if not d:
+            d = datetime.now().date().isoformat()
+        return self._fetch("schedule", params={"sportId": 1, "date": d})
 
     def league_hot_hitters(self, date: Optional[str] = None, top_n: int = 10) -> List[Dict[str, Any]]:
         return []
@@ -243,8 +249,8 @@ class StatsApiProvider:
     # ------------------------
     # Private fetch stubs for /provider_raw probes in main.py
     # ------------------------
-    def _fetch_hitter_rows(self, date, limit=None, team: Optional[str] = None) -> List[Dict[str, Any]]:
+    def _fetch_hitter_rows(self, date: Optional[str] = None, limit: Optional[int] = None, team: Optional[str] = None) -> List[Dict[str, Any]]:
         return []
 
-    def _fetch_pitcher_rows(self, date, limit=None, team: Optional[str] = None) -> List[Dict[str, Any]]:
+    def _fetch_pitcher_rows(self, date: Optional[str] = None, limit: Optional[int] = None, team: Optional[str] = None) -> List[Dict[str, Any]]:
         return []
