@@ -5,11 +5,11 @@ from typing import Any, Dict, List, Optional
 
 class StatsApiProvider:
     """
-    Provider compatible with your existing long main.py.
+    Provider compatible with your existing long main.py and Utf8WrapperProvider.
     Implements:
       - schedule_for_date
-      - cold_candidates (strict AB>0, H==0, regular season only)
-      - league_hot_hitters / league_cold_hitters (placeholders to satisfy endpoints)
+      - cold_candidates  (STRICT: count only AB>0 & H==0, regular season)
+      - league_hot_hitters / league_cold_hitters (placeholders)
       - pitcher_streaks (empty lists by design)
       - cold_pitchers (empty list)
       - _fetch_hitter_rows / _fetch_pitcher_rows (stubs so /provider_raw probes pass)
@@ -67,7 +67,7 @@ class StatsApiProvider:
         return []
 
     # ------------------------
-    # New: strict cold candidate scan
+    # STRICT cold candidate scan
     # ------------------------
     def cold_candidates(
         self,
