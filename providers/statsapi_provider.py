@@ -5,18 +5,17 @@ from typing import Any, Dict, List, Optional
 
 class StatsApiProvider:
     """
-    Provider compatible with your existing long main.py and Utf8WrapperProvider.
-    Implements:
-      - schedule_for_date
-      - cold_candidates  (STRICT: count only AB>0 & H==0, regular season)
-      - league_hot_hitters / league_cold_hitters (placeholders)
-      - pitcher_streaks (empty lists by design)
-      - cold_pitchers (empty list)
-      - _fetch_hitter_rows / _fetch_pitcher_rows (stubs so /provider_raw probes pass)
+    Business logic lives here.
+    - schedule_for_date
+    - cold_candidates (STRICT: only AB>0 & H==0, regular season)
+    - league_hot_hitters / league_cold_hitters (placeholders)
+    - pitcher_streaks (empty lists)
+    - cold_pitchers (empty list)
+    - _fetch_hitter_rows / _fetch_pitcher_rows (stubs for /provider_raw probes)
     """
     BASE_URL = "https://statsapi.mlb.com/api/v1"
     base = "mlb-statsapi"
-    key = None  # present so /provider_raw debug does not error
+    key = None
 
     # ------------------------
     # HTTP helper
@@ -34,11 +33,9 @@ class StatsApiProvider:
         return self._fetch("schedule", params={"sportId": 1, "date": date})
 
     def league_hot_hitters(self, date: Optional[str] = None, top_n: int = 10) -> List[Dict[str, Any]]:
-        # Placeholder to satisfy existing endpoints
         return []
 
     def league_cold_hitters(self, date: Optional[str] = None, top_n: int = 10) -> List[Dict[str, Any]]:
-        # Placeholder to satisfy existing endpoints
         return []
 
     def pitcher_streaks(
@@ -52,7 +49,6 @@ class StatsApiProvider:
         cold_last_starts: int = 2,
         debug: bool = False,
     ) -> Dict[str, Any]:
-        # Empty-by-design to match your current behavior
         return {"hot_pitchers": [], "cold_pitchers": [], "debug": {"note": "not implemented"}}
 
     def cold_pitchers(
@@ -63,7 +59,6 @@ class StatsApiProvider:
         last_starts: int = 2,
         debug: bool = False,
     ) -> List[Dict[str, Any]]:
-        # Empty list so /cold_pitchers stays functional
         return []
 
     # ------------------------
@@ -81,12 +76,11 @@ class StatsApiProvider:
     ) -> List[Dict[str, Any]]:
         """
         League-wide scan for cold hitters with strict slump rules:
-        - Only regular-season games (game type 'R')
+        - Only regular-season games (type 'R')
         - Count consecutive games with AB > 0 and H == 0
         - Ignore games with AB == 0
-        - Only include hitters with season AVG >= min_season_avg
-        - Consider up to `last_n` qualifying (AB>0, regular) games in the window
-        - Return up to `limit` rows, sorted by (hitlessStreak desc, seasonAVG desc)
+        - Min season AVG filter
+        - Consider up to `last_n` qualifying games (AB>0 & 'R'), newest→oldest
         """
         as_of = self._resolve_date(date)
         season = as_of.year
@@ -98,7 +92,7 @@ class StatsApiProvider:
             for r in self._team_roster_active(tid):
                 pos = (r.get("position") or {}).get("abbreviation", "")
                 if pos == "P":
-                    continue  # skip pitchers
+                    continue
                 person = r.get("person") or {}
                 pid = person.get("id")
                 pname = person.get("fullName")
@@ -224,17 +218,10 @@ class StatsApiProvider:
                 }
             )
 
-        # newest → oldest
         rows.sort(key=lambda r: r["gameDate"], reverse=True)
         return rows
 
     def _compute_hitless_streak_from_gamelog(self, logs: List[Dict[str, Any]], last_n: int) -> int:
-        """
-        Count consecutive H==0 over qualifying games:
-          - gameType == 'R'
-          - AB > 0
-        Stop at first H>0. Consider up to last_n qualifying games.
-        """
         streak = 0
         considered = 0
         for g in logs:
@@ -245,7 +232,7 @@ class StatsApiProvider:
             ab = int(g.get("AB") or 0)
             h = int(g.get("H") or 0)
             if ab == 0:
-                continue  # ignored; does not increment considered
+                continue
             considered += 1
             if h == 0:
                 streak += 1
