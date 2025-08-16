@@ -14,21 +14,14 @@ def cold_candidates(
     debug: int = Query(0),
 ):
     """
-    Calls inner provider even when wrapped by Utf8WrapperProvider.
-    Returns plain Python data so your app-wide UTF-8 response class applies.
+    Thin route: call provider.cold_candidates().
+    Utf8WrapperProvider guarantees UTF-8 responses and returns a 501 JSON
+    if the inner provider lacks the method.
     """
-    prov = getattr(request.app.state, "provider", None)
-    if prov is None:
+    provider = getattr(request.app.state, "provider", None)
+    if provider is None:
         return {"error": "Provider not loaded"}
-
-    # If we’re using Utf8WrapperProvider, it stores the real provider at .provider
-    # Unwrap if needed so we can call methods not exposed by the wrapper.
-    inner = getattr(prov, "provider", prov)
-
-    if not hasattr(inner, "cold_candidates"):
-        return {"error": "Provider has no cold_candidates(); deploy updated providers/statsapi_provider.py"}
-
-    return inner.cold_candidates(
+    return provider.cold_candidates(
         date=date,
         min_season_avg=min_season_avg,
         last_n=last_n,
