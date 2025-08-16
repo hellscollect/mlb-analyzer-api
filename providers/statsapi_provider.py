@@ -1,130 +1,170 @@
 import requests
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from functools import lru_cache
+from typing import Any, Dict, List, Optional
 
 class StatsApiProvider:
+    """
+    Provider compatible with your existing long main.py.
+    Implements:
+      - schedule_for_date
+      - cold_candidates (strict AB>0, H==0, regular season only)
+      - league_hot_hitters / league_cold_hitters (placeholders to satisfy endpoints)
+      - pitcher_streaks (empty lists by design)
+      - cold_pitchers (empty list)
+      - _fetch_hitter_rows / _fetch_pitcher_rows (stubs so /provider_raw probes pass)
+    """
     BASE_URL = "https://statsapi.mlb.com/api/v1"
+    base = "mlb-statsapi"
+    key = None  # present so /provider_raw debug does not error
 
-    # --------- HTTP ----------
-    def _fetch(self, endpoint, params=None):
+    # ------------------------
+    # HTTP helper
+    # ------------------------
+    def _fetch(self, endpoint: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         url = f"{self.BASE_URL}/{endpoint}"
-        r = requests.get(url, params=params, timeout=20)
+        r = requests.get(url, params=params, timeout=25)
         r.raise_for_status()
         return r.json()
 
-    # --------- Public API used by routes ----------
-    def schedule_for_date(self, date_str):
-        return self._fetch("schedule", params={"sportId": 1, "date": date_str})
+    # ------------------------
+    # Public methods used by your API
+    # ------------------------
+    def schedule_for_date(self, date: str) -> Dict[str, Any]:
+        return self._fetch("schedule", params={"sportId": 1, "date": date})
 
-    def league_hot_hitters(self, date=None, top_n=10):
-        # Not implemented yet
+    def league_hot_hitters(self, date: Optional[str] = None, top_n: int = 10) -> List[Dict[str, Any]]:
+        # Placeholder to satisfy existing endpoints
         return []
 
+    def league_cold_hitters(self, date: Optional[str] = None, top_n: int = 10) -> List[Dict[str, Any]]:
+        # Placeholder to satisfy existing endpoints
+        return []
+
+    def pitcher_streaks(
+        self,
+        date: Optional[str] = None,
+        hot_max_era: float = 4.0,
+        hot_min_ks_each: int = 6,
+        hot_last_starts: int = 3,
+        cold_min_era: float = 4.6,
+        cold_min_runs_each: int = 3,
+        cold_last_starts: int = 2,
+        debug: bool = False,
+    ) -> Dict[str, Any]:
+        # Empty-by-design to match your current behavior
+        return {"hot_pitchers": [], "cold_pitchers": [], "debug": {"note": "not implemented"}}
+
+    def cold_pitchers(
+        self,
+        date: Optional[str] = None,
+        min_era: float = 4.6,
+        min_runs_each: int = 3,
+        last_starts: int = 2,
+        debug: bool = False,
+    ) -> List[Dict[str, Any]]:
+        # Empty list so /cold_pitchers stays functional
+        return []
+
+    # ------------------------
+    # New: strict cold candidate scan
+    # ------------------------
     def cold_candidates(
         self,
-        date="today",
-        min_season_avg=0.26,
-        last_n=7,
-        min_hitless_games=3,
-        limit=30,
-        verify=1,
-        debug=0,
-    ):
+        date: str = "today",
+        min_season_avg: float = 0.26,
+        last_n: int = 7,
+        min_hitless_games: int = 3,
+        limit: int = 30,
+        verify: int = 1,   # reserved; future boxscore re-check
+        debug: int = 0,
+    ) -> List[Dict[str, Any]]:
         """
-        League-wide cold pool with STRICT slump definition:
-        - Only count consecutive games with AB>0, H==0
-        - Ignore non-regular-season games (gameType != 'R')
+        League-wide scan for cold hitters with strict slump rules:
+        - Only regular-season games (game type 'R')
+        - Count consecutive games with AB > 0 and H == 0
+        - Ignore games with AB == 0
         - Only include hitters with season AVG >= min_season_avg
-        - Up to `limit` results sorted by longest streak desc
+        - Consider up to `last_n` qualifying (AB>0, regular) games in the window
+        - Return up to `limit` rows, sorted by (hitlessStreak desc, seasonAVG desc)
         """
         as_of = self._resolve_date(date)
         season = as_of.year
 
-        # Build league player list (active roster hitters)
-        teams = self._teams_mlb()
-        players = []
-        for t in teams:
-            tid = t.get("id")
-            roster = self._team_roster_active(tid)
-            for r in roster:
-                p = r.get("person", {})
-                pos = r.get("position", {}).get("abbreviation", "")
-                # Filter to likely hitters (exclude Ps); MLB uses "P" for pitchers
+        results: List[Dict[str, Any]] = []
+        for team in self._teams_mlb():
+            tid = team.get("id")
+            tname = team.get("name")
+            for r in self._team_roster_active(tid):
+                pos = (r.get("position") or {}).get("abbreviation", "")
                 if pos == "P":
+                    continue  # skip pitchers
+                person = r.get("person") or {}
+                pid = person.get("id")
+                pname = person.get("fullName")
+
+                s_avg = self._player_season_avg(pid, season)
+                if s_avg is None or s_avg < float(min_season_avg):
                     continue
-                players.append(
-                    {
-                        "playerId": p.get("id"),
-                        "playerFullName": p.get("fullName"),
-                        "primaryPosition": pos,
+
+                logs = self._player_game_logs(pid, season, as_of)
+                streak = self._compute_hitless_streak_from_gamelog(logs, last_n)
+
+                if streak >= int(min_hitless_games):
+                    row: Dict[str, Any] = {
+                        "playerId": pid,
+                        "name": pname,
                         "teamId": tid,
-                        "teamName": t.get("name"),
+                        "teamName": tname,
+                        "season": season,
+                        "asOfDate": as_of.isoformat(),
+                        "seasonAVG": round(float(s_avg), 3),
+                        "hitlessStreak": int(streak),
+                        "lastNConsidered": int(last_n),
                     }
-                )
+                    if debug:
+                        row["debugSample"] = logs[:max(1, min(int(last_n), 5))]
+                    results.append(row)
 
-        results = []
-        for p in players:
-            pid = p["playerId"]
-            # Quick season AVG screen
-            season_avg = self._player_season_avg(pid, season)
-            if season_avg is None or season_avg < float(min_season_avg):
-                continue
-
-            # Game logs (last ~30 to be safe; streak calc itself will use last_n)
-            logs = self._player_game_logs(pid, season, as_of)
-            streak = self._compute_hitless_streak_from_gamelog(logs, last_n)
-
-            if streak >= int(min_hitless_games):
-                row = {
-                    "playerId": pid,
-                    "name": p["playerFullName"],
-                    "teamId": p["teamId"],
-                    "teamName": p["teamName"],
-                    "season": season,
-                    "asOfDate": as_of.strftime("%Y-%m-%d"),
-                    "seasonAVG": round(season_avg, 3),
-                    "hitlessStreak": streak,
-                    "lastNConsidered": int(last_n),
-                }
-                if debug:
-                    row["debugSample"] = logs[:last_n]
-                results.append(row)
-
+                if len(results) >= int(limit):
+                    break
             if len(results) >= int(limit):
                 break
 
-        # Sort by streak desc, then by season AVG desc (tie-breaker)
         results.sort(key=lambda r: (r["hitlessStreak"], r["seasonAVG"]), reverse=True)
         return results
 
-    # --------- Helpers ----------
-    def _resolve_date(self, date_str):
-        if not date_str or date_str == "today":
-            return datetime.now(timezone.utc).astimezone().date()
-        # Accept YYYY-MM-DD
+    # ------------------------
+    # Helpers
+    # ------------------------
+    def _resolve_date(self, date_str: Optional[str]):
+        today = datetime.now(timezone.utc).astimezone().date()
+        if not date_str or date_str.lower() == "today":
+            return today
+        if date_str.lower() == "yesterday":
+            return today - timedelta(days=1)
+        if date_str.lower() == "tomorrow":
+            return today + timedelta(days=1)
         return datetime.strptime(date_str, "%Y-%m-%d").date()
 
     @lru_cache(maxsize=1)
-    def _teams_mlb(self):
+    def _teams_mlb(self) -> List[Dict[str, Any]]:
         data = self._fetch("teams", params={"sportId": 1, "activeStatus": "yes"})
-        return data.get("teams", [])
+        return data.get("teams", []) or []
 
     @lru_cache(maxsize=256)
-    def _team_roster_active(self, team_id):
+    def _team_roster_active(self, team_id: int) -> List[Dict[str, Any]]:
         data = self._fetch(f"teams/{team_id}/roster", params={"rosterType": "active"})
-        return data.get("roster", [])
+        return data.get("roster", []) or []
 
     @lru_cache(maxsize=4096)
-    def _player_season_avg(self, player_id, season):
-        # Hydrate season stats
-        q = {
-            "hydrate": f"stats(group=hitting,type=season,season={season})"
-        }
+    def _player_season_avg(self, player_id: int, season: int) -> Optional[float]:
+        q = {"hydrate": f"stats(group=hitting,type=season,season={season})"}
         data = self._fetch(f"people/{player_id}", params=q)
-        people = data.get("people", [])
-        if not people:
+        ppl = data.get("people", []) or []
+        if not ppl:
             return None
-        stats = (people[0].get("stats") or [])
+        stats = (ppl[0].get("stats") or [])
         if not stats:
             return None
         splits = (stats[0].get("splits") or [])
@@ -138,37 +178,30 @@ class StatsApiProvider:
             return None
 
     @lru_cache(maxsize=4096)
-    def _player_game_logs(self, player_id, season, as_of_date):
+    def _player_game_logs(self, player_id: int, season: int, as_of_date) -> List[Dict[str, Any]]:
         """
-        Uses stats hydrate: gameLog for the season; filters to games on/before as_of_date.
-        Returns newest→oldest list of simplified rows for streak calc.
+        Fetch full-season game logs and trim to games on/before as_of_date.
+        Return newest→oldest simplified rows for streak computation.
         """
-        q = {
-            "hydrate": f"stats(group=hitting,type=gameLog,season={season})"
-        }
+        q = {"hydrate": f"stats(group=hitting,type=gameLog,season={season})"}
         data = self._fetch(f"people/{player_id}", params=q)
-        people = data.get("people", [])
-        if not people:
+        ppl = data.get("people", []) or []
+        if not ppl:
             return []
-
-        stats = (people[0].get("stats") or [])
-        if not stats:
-            return []
-
-        # Find the gameLog entry
+        stats = (ppl[0].get("stats") or [])
         game_log_entry = None
         for s in stats:
-            if s.get("type", {}).get("displayName", "").lower() == "gamelog" or s.get("type", {}).get("type") == "gameLog":
+            t = s.get("type", {})
+            if t.get("type") == "gameLog" or t.get("displayName", "").lower() == "gamelog":
                 game_log_entry = s
                 break
         if not game_log_entry:
             return []
 
-        splits = (game_log_entry.get("splits") or [])
-        rows = []
-        for sp in splits:
-            game = sp.get("game", {})  # has gameDate and type
-            gdate_raw = game.get("gameDate")  # ISO string
+        rows: List[Dict[str, Any]] = []
+        for sp in (game_log_entry.get("splits") or []):
+            game = sp.get("game", {}) or {}
+            gdate_raw = game.get("gameDate")
             if not gdate_raw:
                 continue
             try:
@@ -177,18 +210,17 @@ class StatsApiProvider:
                 continue
             if gdate > as_of_date:
                 continue
-
-            stat = sp.get("stat", {})
+            gtype = (game.get("type") or "").upper()
+            stat = sp.get("stat", {}) or {}
             ab = int(stat.get("atBats") or 0)
             h = int(stat.get("hits") or 0)
-            gtype = (game.get("type") or "").upper()
             rows.append(
                 {
                     "gameDate": gdate_raw,
                     "gameType": gtype,
                     "AB": ab,
                     "H": h,
-                    "opponent": sp.get("team", {}).get("name"),
+                    "opponent": (sp.get("team") or {}).get("name"),
                 }
             )
 
@@ -196,10 +228,12 @@ class StatsApiProvider:
         rows.sort(key=lambda r: r["gameDate"], reverse=True)
         return rows
 
-    def _compute_hitless_streak_from_gamelog(self, logs, last_n):
+    def _compute_hitless_streak_from_gamelog(self, logs: List[Dict[str, Any]], last_n: int) -> int:
         """
-        Logs are newest→oldest. Count consecutive H==0 for games with AB>0 and type 'R'.
-        Stop on first game with a hit. Consider only last_n regular-season games in the scan window.
+        Count consecutive H==0 over qualifying games:
+          - gameType == 'R'
+          - AB > 0
+        Stop at first H>0. Consider up to last_n qualifying games.
         """
         streak = 0
         considered = 0
@@ -211,11 +245,19 @@ class StatsApiProvider:
             ab = int(g.get("AB") or 0)
             h = int(g.get("H") or 0)
             if ab == 0:
-                # ignored; does not advance 'considered'
-                continue
+                continue  # ignored; does not increment considered
             considered += 1
             if h == 0:
                 streak += 1
             else:
                 break
         return streak
+
+    # ------------------------
+    # Private fetch stubs for /provider_raw probes in main.py
+    # ------------------------
+    def _fetch_hitter_rows(self, date, limit=None, team: Optional[str] = None) -> List[Dict[str, Any]]:
+        return []
+
+    def _fetch_pitcher_rows(self, date, limit=None, team: Optional[str] = None) -> List[Dict[str, Any]]:
+        return []
