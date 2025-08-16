@@ -19,7 +19,7 @@ class StatsApiProvider:
     # ---------------------
     @staticmethod
     def _to_datestr(date_obj_or_str: Union[str, datetime, date_cls, None]) -> str:
-        if isinstance(date_obj_or_str, str):
+        if isinstance(date_obj_or_str, str) and date_obj_or_str.strip():
             return date_obj_or_str
         if isinstance(date_obj_or_str, datetime):
             return date_obj_or_str.strftime("%Y-%m-%d")
@@ -89,14 +89,14 @@ class StatsApiProvider:
         return streak
 
     # ---------------------
-    # Robust player search
+    # Robust player search (for name-targeted flows)
     # ---------------------
     def _search_people(self, name: str) -> List[Dict[str, Any]]:
         """
         Try multiple public endpoints to resolve a player by name.
         Returns a list of people-like dicts: {id, fullName, currentTeam:{name?...}}
         """
-        # 1) Primary: /people?search=... (with sportId to avoid 400s)
+        # 1) Primary: /people?search=... (add sportId to avoid 400s)
         try:
             data = self._fetch("people", params={"search": name, "sportId": 1})
             ppl = data.get("people") or []
@@ -123,7 +123,7 @@ class StatsApiProvider:
         except Exception:
             pass
 
-        # 4) Fallback to MLB's search service
+        # 4) Fallback to MLB's suggest service
         try:
             r = requests.get(
                 "https://search-api.mlb.com/svc/search/v2/suggest",
@@ -167,6 +167,83 @@ class StatsApiProvider:
         except Exception:
             return ""
 
+    def _active_roster(self, team_id: int, season: int) -> List[Dict[str, Any]]:
+        try:
+            data = self._fetch(f"teams/{team_id}/roster", params={"season": season, "rosterType": "active"})
+            return data.get("roster") or []
+        except Exception:
+            return []
+
+    # ---------------------
+    # League-wide cold hitters
+    # ---------------------
+    def league_cold_hitters(
+        self,
+        date: Optional[Union[str, datetime, date_cls]] = None,
+        top_n: int = 10,
+        min_season_avg: float = 0.26,
+        min_hitless_games: int = 1,
+    ) -> List[Dict[str, Any]]:
+        """Scan only teams on today's slate and return top-N cold hitters by streak."""
+        dstr = self._to_datestr(date)
+        try:
+            season = datetime.fromisoformat(dstr).year
+        except Exception:
+            season = datetime.now().year
+
+        # Schedule → teams playing
+        sched = self.schedule_for_date(dstr)
+        games = []
+        for d in (sched.get("dates") or []):
+            games.extend(d.get("games") or [])
+        team_ids: Dict[int, str] = {}
+        for g in games:
+            try:
+                home = g.get("teams", {}).get("home", {}).get("team", {})
+                away = g.get("teams", {}).get("away", {}).get("team", {})
+                if home.get("id"):
+                    team_ids[int(home["id"])] = home.get("name") or ""
+                if away.get("id"):
+                    team_ids[int(away["id"])] = away.get("name") or ""
+            except Exception:
+                continue
+
+        results: List[Dict[str, Any]] = []
+
+        # For each team → active roster → hitters only
+        for tid, tname in team_ids.items():
+            roster = self._active_roster(tid, season)
+            for r in roster:
+                try:
+                    pos = (r.get("position") or {}).get("abbreviation") or ""
+                    if pos.upper() == "P":
+                        continue  # skip pitchers
+                    person = r.get("person") or {}
+                    pid = int(person.get("id"))
+                    full = (person.get("fullName") or "").strip()
+                    if not pid or not full:
+                        continue
+
+                    avg = self._season_avg(pid, season)
+                    if avg < float(min_season_avg):
+                        continue
+
+                    logs = self._game_logs(pid, season)
+                    streak = self._compute_hitless_streak_from_gamelog(logs)
+                    if streak >= int(min_hitless_games) and streak > 0:
+                        results.append({
+                            "name": full,
+                            "team": tname or self._team_name_for(pid) or "",
+                            "season_avg": round(avg, 3),
+                            "hitless_streak": streak,
+                        })
+                except Exception:
+                    # best-effort; skip on any single-player failure
+                    continue
+
+        results.sort(key=lambda x: x["hitless_streak"], reverse=True)
+        return results[: max(1, int(top_n))]
+
     # ---------------------
     # Targeted cold-candidates by names
     # ---------------------
@@ -175,7 +252,7 @@ class StatsApiProvider:
         names: List[str],
         date: Optional[Union[str, datetime, date_cls]] = None,
         min_season_avg: float = 0.26,
-        last_n: int = 7,              # window context (not a hard cap)
+        last_n: int = 7,              # window context (informational only here)
         min_hitless_games: int = 1,
         limit: int = 30,
         verify: int = 1,
@@ -189,7 +266,6 @@ class StatsApiProvider:
          - Ignore games with AB==0
          - Filter by season AVG >= min_season_avg
         """
-        # Season/year from date (fallback to current year)
         try:
             dstr = self._to_datestr(date)
             season = datetime.fromisoformat(dstr).year
@@ -286,10 +362,7 @@ class StatsApiProvider:
         return {"date": self._to_datestr(date), "items": [], "note": "Pass names=Comma,Separated,Players"}
 
     # ---------------------
-    # Placeholders
+    # Hot hitters placeholder (still fine)
     # ---------------------
     def league_hot_hitters(self, date=None, top_n: int = 10):
-        return []
-
-    def league_cold_hitters(self, date=None, top_n: int = 10):
         return []
