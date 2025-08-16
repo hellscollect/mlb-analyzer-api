@@ -96,22 +96,14 @@ class StatsApiProvider:
         Try multiple public endpoints to resolve a player by name.
         Returns a list of people-like dicts: {id, fullName, currentTeam:{name?...}}
         """
-        errors: List[str] = []
-
         # 1) Primary: /people?search=... (with sportId to avoid 400s)
         try:
             data = self._fetch("people", params={"search": name, "sportId": 1})
             ppl = data.get("people") or []
             if ppl:
                 return ppl
-        except requests.HTTPError as e:
-            try:
-                code = e.response.status_code
-            except Exception:
-                code = "HTTPError"
-            errors.append(f"people?search:{code}")
-        except Exception as e:
-            errors.append(f"people?search:{type(e).__name__}")
+        except Exception:
+            pass
 
         # 2) Variant: /people/search?names=...
         try:
@@ -119,14 +111,8 @@ class StatsApiProvider:
             ppl = data.get("people") or data.get("results") or []
             if ppl:
                 return ppl
-        except requests.HTTPError as e:
-            try:
-                code = e.response.status_code
-            except Exception:
-                code = "HTTPError"
-            errors.append(f"people/search(names):{code}")
-        except Exception as e:
-            errors.append(f"people/search(names):{type(e).__name__}")
+        except Exception:
+            pass
 
         # 3) Variant: /people/search?name=...
         try:
@@ -134,16 +120,10 @@ class StatsApiProvider:
             ppl = data.get("people") or data.get("results") or []
             if ppl:
                 return ppl
-        except requests.HTTPError as e:
-            try:
-                code = e.response.status_code
-            except Exception:
-                code = "HTTPError"
-            errors.append(f"people/search(name):{code}")
-        except Exception as e:
-            errors.append(f"people/search(name):{type(e).__name__}")
+        except Exception:
+            pass
 
-        # 4) Fallback to MLB's search service to obtain a person id, then adapt
+        # 4) Fallback to MLB's search service
         try:
             r = requests.get(
                 "https://search-api.mlb.com/svc/search/v2/suggest",
@@ -152,7 +132,6 @@ class StatsApiProvider:
             )
             r.raise_for_status()
             s = r.json() or {}
-            # Typical keys: "docs" or "suggestions"
             candidates = []
             for item in (s.get("docs") or s.get("suggestions") or []):
                 pid = (
@@ -162,9 +141,7 @@ class StatsApiProvider:
                     or item.get("personId")
                 )
                 full = item.get("fullName") or item.get("full_name") or item.get("name")
-                team_name = (
-                    item.get("team_full_name") or item.get("team_name") or item.get("team")
-                )
+                team_name = item.get("team_full_name") or item.get("team_name") or item.get("team")
                 if pid and full:
                     try:
                         pid = int(pid)
@@ -173,18 +150,22 @@ class StatsApiProvider:
                     candidates.append({"id": pid, "fullName": full, "currentTeam": {"name": team_name}})
             if candidates:
                 return candidates
-        except requests.HTTPError as e:
-            try:
-                code = e.response.status_code
-            except Exception:
-                code = "HTTPError"
-            errors.append(f"search-api:{code}")
-        except Exception as e:
-            errors.append(f"search-api:{type(e).__name__}")
+        except Exception:
+            pass
 
-        # Nothing worked
-        # (We return empty list; caller can report `not_found` via debug)
         return []
+
+    def _team_name_for(self, person_id: int) -> str:
+        """Hydrate person to get currentTeam.name; return '' if unavailable."""
+        try:
+            data = self._fetch(f"people/{person_id}", params={"hydrate": "currentTeam"})
+            ppl = data.get("people") or []
+            if not ppl:
+                return ""
+            team = (ppl[0].get("currentTeam") or {})
+            return (team.get("name") or "").strip()
+        except Exception:
+            return ""
 
     # ---------------------
     # Targeted cold-candidates by names
@@ -238,6 +219,10 @@ class StatsApiProvider:
                     if debug:
                         notes.append({"name": fullname, "note": "missing_id_from_search"})
                     continue
+
+                # Ensure team name via hydrate when missing
+                if not team_name:
+                    team_name = self._team_name_for(int(pid)) or ""
 
                 avg = self._season_avg(int(pid), season)
                 if avg < min_season_avg:
