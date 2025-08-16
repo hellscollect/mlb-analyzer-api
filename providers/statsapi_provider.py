@@ -5,13 +5,18 @@ from typing import List, Optional, Dict, Any, Union
 class StatsApiProvider:
     BASE_URL = "https://statsapi.mlb.com/api/v1"
 
+    # ---------------------
+    # Core fetch
+    # ---------------------
     def _fetch(self, endpoint: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         url = f"{self.BASE_URL}/{endpoint.lstrip('/')}"
         r = requests.get(url, params=params or {}, timeout=20)
         r.raise_for_status()
         return r.json()
 
-    # ---------- Helpers ----------
+    # ---------------------
+    # Helpers
+    # ---------------------
     @staticmethod
     def _to_datestr(date_obj_or_str: Union[str, datetime, None]) -> str:
         if isinstance(date_obj_or_str, str):
@@ -30,12 +35,14 @@ class StatsApiProvider:
         except Exception:
             return datetime.min.replace(tzinfo=timezone.utc)
 
-    def schedule_for_date(self, date: Union[str, datetime]) -> Dict[str, Any]:
-        # Keep existing signature; wrapper may pass str or date
+    # Keep signature flexible — wrapper/main may pass str or date
+    def schedule_for_date(self, date: Union[str, datetime, None] = None) -> Dict[str, Any]:
         date_str = self._to_datestr(date)
         return self._fetch("schedule", params={"sportId": 1, "date": date_str})
 
-    # --- Stats lookups ---
+    # ---------------------
+    # Stats lookups
+    # ---------------------
     def _season_avg(self, person_id: int, season: int) -> float:
         data = self._fetch(
             f"people/{person_id}/stats",
@@ -83,13 +90,15 @@ class StatsApiProvider:
         data = self._fetch("people", params={"search": name})
         return data.get("people", []) or []
 
-    # ---------- Targeted cold-candidates by names (fast path for verification) ----------
+    # ---------------------
+    # Targeted cold-candidates by names
+    # ---------------------
     def cold_candidates_by_names(
         self,
         names: List[str],
         date: Optional[Union[str, datetime]] = None,
         min_season_avg: float = 0.26,
-        last_n: int = 7,
+        last_n: int = 7,              # window context (not a hard cap)
         min_hitless_games: int = 1,
         limit: int = 30,
         verify: int = 1,
@@ -135,10 +144,7 @@ class StatsApiProvider:
                     continue
 
                 logs = self._game_logs(pid, season)
-                # Count consecutive hitless AB>0 from the front; last_n bounds the context we care about
-                # (we still allow longer consecutive runs if present)
                 streak = 0
-                considered = 0
                 for g in sorted(logs, key=self._parse_game_date, reverse=True):
                     gtype = (g.get("game", {}).get("type") or g.get("gameType") or "").upper()
                     if gtype != "R":
@@ -148,12 +154,10 @@ class StatsApiProvider:
                     h = int(stat.get("hits") or 0)
                     if ab == 0:
                         continue
-                    considered += 1
                     if h == 0:
                         streak += 1
                     else:
                         break
-                    # do not hard-cap streak by last_n; last_n just defines window minimums
 
                 if streak >= min_hitless_games and streak > 0:
                     out.append({
@@ -172,7 +176,50 @@ class StatsApiProvider:
         out = sorted(out, key=lambda x: x["hitless_streak"], reverse=True)[: max(1, int(limit))]
         return {"date": self._to_datestr(date), "season": season, "items": out, "debug": notes} if debug else out
 
-    # ---------- Placeholders (unchanged) ----------
+    # ---------------------
+    # Compatibility wrapper expected by your route
+    # ---------------------
+    def cold_candidates(
+        self,
+        date: Optional[Union[str, datetime]] = None,
+        names: Optional[Union[str, List[str]]] = None,
+        min_season_avg: float = 0.26,
+        last_n: int = 7,
+        min_hitless_games: int = 1,
+        limit: int = 30,
+        verify: int = 1,
+        debug: int = 0,
+    ) -> Union[List[Dict[str, Any]], Dict[str, Any]]:
+        """
+        Public method used by /cold_candidates route.
+        If names are provided (comma-separated string or list), delegates to cold_candidates_by_names.
+        If not, returns an empty set (league-wide scan intentionally not implemented yet).
+        """
+        if isinstance(names, str) and names.strip():
+            name_list = [n.strip() for n in names.split(",") if n.strip()]
+        elif isinstance(names, list):
+            name_list = [str(n).strip() for n in names if str(n).strip()]
+        else:
+            name_list = []
+
+        if name_list:
+            return self.cold_candidates_by_names(
+                name_list,
+                date=date,
+                min_season_avg=min_season_avg,
+                last_n=last_n,
+                min_hitless_games=min_hitless_games,
+                limit=limit,
+                verify=verify,
+                debug=debug,
+            )
+
+        # No names provided: neutral response to avoid confusion
+        return {"date": self._to_datestr(date), "items": [], "note": "Pass names=Comma,Separated,Players"}
+
+    # ---------------------
+    # Placeholders (unchanged)
+    # ---------------------
     def league_hot_hitters(self, date=None, top_n: int = 10):
         return []
 
