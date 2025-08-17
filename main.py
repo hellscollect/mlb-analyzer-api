@@ -163,7 +163,7 @@ def _smart_call_fetch(method_name: str, the_date: date_cls, limit: Optional[int]
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error calling {method_name}: {type(e).__name__}: {e}")
 
-# --- Mojibake fixer (latin1->utf8 for typical "Ã", "Â" artifacts) ---
+# --- Mojibake fixer ---
 def _fix_text(s: Any) -> Any:
     if not isinstance(s, str):
         return s
@@ -196,9 +196,6 @@ def _take_n(obj: Any, n: int) -> Any:
     return obj
 
 def _as_list_from_provider(obj: Union[List[Dict[str, Any]], Dict[str, Any]], keys: List[str]) -> List[Dict[str, Any]]:
-    """
-    Normalize provider response to a list, trying multiple common keys.
-    """
     if isinstance(obj, list):
         return obj
     if isinstance(obj, dict):
@@ -209,7 +206,7 @@ def _as_list_from_provider(obj: Union[List[Dict[str, Any]], Dict[str, Any]], key
     return []
 
 # ------------------
-# Models (kept here so OpenAPI is complete)
+# Models
 # ------------------
 class HealthResp(BaseModel):
     ok: bool
@@ -238,8 +235,8 @@ class HotHittersReq(BaseModel):
     min_avg: float = 0.280
     games: int = 3
     require_hit_each: bool = True
-    top_n: Optional[int] = None  # prefer this
-    limit: Optional[int] = None  # accept this too
+    top_n: Optional[int] = None
+    limit: Optional[int] = None
     debug: int = 0
 
 class ColdHittersReq(BaseModel):
@@ -359,7 +356,7 @@ def provider_raw_post(req: ProviderRawReq):
     return out
 
 # ------------------
-# Compatibility wrappers (adapters for league_* + date_str + top_n)
+# Compatibility wrappers (adapters)
 # ------------------
 def _hot_hitters_fallback(
     the_date: date_cls,
@@ -481,8 +478,8 @@ def hot_streak_hitters(
     min_avg: float = Query(0.280),
     games: int = Query(3, ge=1),
     require_hit_each: int = Query(1, ge=0, le=1),
-    limit: Optional[int] = Query(None, ge=1, le=200),   # keep old client param
-    top_n: Optional[int] = Query(None, ge=1, le=200),   # also accept top_n
+    limit: Optional[int] = Query(None, ge=1, le=200),
+    top_n: Optional[int] = Query(None, ge=1, le=200),
     debug: int = Query(0, ge=0, le=1),
 ):
     the_date = parse_date(date)
@@ -577,7 +574,7 @@ def cold_pitchers_post(req: ColdPitchersReq):
     return _deep_fix(data)
 
 # ------------------
-# League scan (GET convenience wrapper using provider’s league_* methods)
+# League scan (GET convenience wrapper)
 # ------------------
 @app.get("/league_scan", operation_id="league_scan")
 def league_scan(
@@ -635,35 +632,30 @@ def league_scan(
 try:
     from routes.league_scan import router as league_scan_router
     app.include_router(league_scan_router)
-except Exception:
-    pass
+    print("[routes] loaded /league_scan")
+except Exception as e:
+    print(f"[routes] failed to load league_scan: {type(e).__name__}: {e}")
 
 try:
     from routes.self_test import router as self_test_router
     app.include_router(self_test_router)
-except Exception:
-    pass
+    print("[routes] loaded /self_test")
+except Exception as e:
+    print(f"[routes] failed to load self_test: {type(e).__name__}: {e}")
 
-# >>> NEW: include /cold_candidates router <<<
 try:
     from routes.cold_candidates import router as cold_candidates_router
     app.include_router(cold_candidates_router)
-except Exception:
-    pass
+    print("[routes] loaded /cold_candidates")
+except Exception as e:
+    print(f"[routes] failed to load cold_candidates: {type(e).__name__}: {e}")
 
-# >>> NEW: include /mlb router <<<
 try:
     from routes.mlb_routes import router as mlb_router
     app.include_router(mlb_router)
-except Exception:
-    pass
-
-# >>> NEW: include schedule proxy router <<<
-try:
-    from routes.schedule_proxy import router as schedule_proxy_router
-    app.include_router(schedule_proxy_router)
-except Exception:
-    pass
+    print("[routes] loaded /mlb")
+except Exception as e:
+    print(f"[routes] failed to load mlb_routes: {type(e).__name__}: {e}")
 
 # ------------------
 # Run local
