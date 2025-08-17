@@ -658,6 +658,13 @@ try:
 except Exception:
     pass
 
+# >>> NEW: include schedule proxy router <<<
+try:
+    from routes.schedule_proxy import router as schedule_proxy_router
+    app.include_router(schedule_proxy_router)
+except Exception:
+    pass
+
 # ------------------
 # Run local
 # ------------------
