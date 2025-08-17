@@ -8,7 +8,8 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request
 
-from main import parse_date  # reuse your helper
+# IMPORTANT: import from services to avoid circular import with main.py
+from services.dates import parse_date
 
 # Try to import soft-verify; if unavailable, provide a safe fallback so the router still loads.
 try:
