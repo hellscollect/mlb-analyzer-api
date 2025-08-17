@@ -10,14 +10,15 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import pytz
 
+# use shared parse_date to avoid circular imports
+from services.dates import parse_date
+
 APP_NAME = "MLB Analyzer API"
 APP_VERSION = "1.1.7"
 
-# --- Force UTF-8 on every JSON response (prevents mojibake in some clients) ---
 class UTF8JSONResponse(JSONResponse):
     media_type = "application/json; charset=utf-8"
 
-# --- Server URL for OpenAPI (required by GPT Actions) ---
 EXTERNAL_URL = (
     os.getenv("RENDER_EXTERNAL_URL")
     or "https://mlb-analyzer-api.onrender.com"
@@ -32,7 +33,6 @@ app = FastAPI(
     default_response_class=UTF8JSONResponse,
 )
 
-# --- CORS ---
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -41,16 +41,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ------------------
-# Provider loading
-# ------------------
 _last_provider_error: Optional[str] = None
 
 def load_provider() -> Tuple[Optional[Any], Optional[str], Optional[str]]:
-    """
-    Loads the provider referenced by $MLB_PROVIDER.
-    Defaults to statsapi provider if not set.
-    """
     global _last_provider_error
     target = os.getenv("MLB_PROVIDER", "providers.statsapi_provider:StatsApiProvider")
     module_path, _, class_name = target.partition(":")
@@ -66,30 +59,10 @@ def load_provider() -> Tuple[Optional[Any], Optional[str], Optional[str]]:
         return None, None, None
 
 provider, provider_module, provider_class = load_provider()
-
-# Expose provider to routers
 app.state.provider = provider
 app.state.provider_module = provider_module
 app.state.provider_class = provider_class
 app.state.last_provider_error = _last_provider_error
-
-# ------------------
-# Utilities
-# ------------------
-def parse_date(d: Optional[str]) -> date_cls:
-    tz = pytz.timezone("America/New_York")
-    now = datetime.now(tz).date()
-    if not d or d.lower() == "today":
-        return now
-    s = d.lower()
-    if s == "yesterday":
-        return now - timedelta(days=1)
-    if s == "tomorrow":
-        return now + timedelta(days=1)
-    try:
-        return datetime.strptime(d, "%Y-%m-%d").date()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid date; use today|yesterday|tomorrow|YYYY-MM-DD")
 
 def _callable(obj: Any, name: str):
     if obj is None:
@@ -98,11 +71,6 @@ def _callable(obj: Any, name: str):
     return fn if callable(fn) else None
 
 def _call_with_sig(fn, **kwargs):
-    """
-    Call function with only the kwargs its signature accepts.
-    If that fails (e.g., positional-only args), retry with positional args
-    in the provider's parameter order using any provided values.
-    """
     if fn is None:
         raise HTTPException(status_code=501, detail="Provider method missing")
     try:
@@ -111,7 +79,6 @@ def _call_with_sig(fn, **kwargs):
         try:
             return fn(**allowed_kwargs)
         except TypeError:
-            # Retry positionally in declared parameter order
             params = list(sig.parameters.values())
             args = []
             for p in params:
@@ -163,7 +130,6 @@ def _smart_call_fetch(method_name: str, the_date: date_cls, limit: Optional[int]
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error calling {method_name}: {type(e).__name__}: {e}")
 
-# --- Mojibake fixer ---
 def _fix_text(s: Any) -> Any:
     if not isinstance(s, str):
         return s
@@ -205,9 +171,6 @@ def _as_list_from_provider(obj: Union[List[Dict[str, Any]], Dict[str, Any]], key
                 return v
     return []
 
-# ------------------
-# Models
-# ------------------
 class HealthResp(BaseModel):
     ok: bool
     provider_loaded: bool
@@ -269,9 +232,6 @@ class DateOnlyReq(BaseModel):
     date: Optional[str] = None
     debug: int = 0
 
-# ------------------
-# Root & Health
-# ------------------
 @app.get("/", operation_id="root")
 def root():
     tz = pytz.timezone("America/New_York")
@@ -299,9 +259,6 @@ def health(tz: str = Query("America/New_York", description="IANA timezone for ti
         now_local=now_str,
     )
 
-# ------------------
-# Raw provider rows (debug/temporary)
-# ------------------
 @app.get("/provider_raw", operation_id="provider_raw")
 def provider_raw(
     date: Optional[str] = Query(None),
@@ -355,9 +312,6 @@ def provider_raw_post(req: ProviderRawReq):
         out["debug"] = {"requested": req.model_dump()}
     return out
 
-# ------------------
-# Compatibility wrappers (adapters)
-# ------------------
 def _hot_hitters_fallback(
     the_date: date_cls,
     min_avg: float,
@@ -469,9 +423,6 @@ def _schedule_for_date(the_date: date_cls, debug: bool):
         return _deep_fix(resp.get("matchups") or [])
     return _deep_fix(resp)
 
-# ------------------
-# Hitters / Pitchers streak endpoints (GET + POST)
-# ------------------
 @app.get("/hot_streak_hitters", operation_id="hot_streak_hitters")
 def hot_streak_hitters(
     date: Optional[str] = Query(None),
@@ -573,9 +524,6 @@ def cold_pitchers_post(req: ColdPitchersReq):
         last_starts=req.last_starts, debug=bool(req.debug))
     return _deep_fix(data)
 
-# ------------------
-# League scan (GET convenience wrapper)
-# ------------------
 @app.get("/league_scan", operation_id="league_scan")
 def league_scan(
     date: Optional[str] = Query(None, description="today|yesterday|tomorrow|YYYY-MM-DD"),
@@ -586,7 +534,6 @@ def league_scan(
     logs: List[str] = []
     result: Dict[str, Any] = {"date": the_date.isoformat()}
 
-    # Matchups / schedule
     try:
         matchups = _schedule_for_date(the_date, bool(debug))
         logs.append("provider_call:schedule_for_date:ok")
@@ -599,7 +546,6 @@ def league_scan(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"schedule_for_date failed: {type(e).__name__}: {e}")
 
-    # Hot / Cold hitters via adapters
     hot = _hot_hitters_fallback(the_date, min_avg=0.0, games=5, require_hit_each=False, debug=bool(debug), top_n=limit)
     cold = _cold_hitters_fallback(the_date, min_avg=0.0, games=5, require_zero_hit_each=False, debug=bool(debug), top_n=limit)
 
@@ -657,9 +603,6 @@ try:
 except Exception as e:
     print(f"[routes] failed to load mlb_routes: {type(e).__name__}: {e}")
 
-# ------------------
-# Run local
-# ------------------
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=True)
