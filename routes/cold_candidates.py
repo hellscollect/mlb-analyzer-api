@@ -1,261 +1,264 @@
 # routes/cold_candidates.py
-from __future__ import annotations
-
 from fastapi import APIRouter, Query
-from typing import Dict, List, Optional, Tuple
-from datetime import datetime, timezone
+from fastapi import HTTPException
+from typing import List, Dict, Any, Optional, Tuple
+from datetime import datetime
+import unicodedata
 import httpx
 
-from services.schedule_filters import (
-    get_not_started_team_ids,  # uses provider.schedule_for_date(...)
-)
+router = APIRouter(prefix="", tags=["cold_candidates"])
 
-router = APIRouter()
+STATS_BASE = "https://statsapi.mlb.com/api/v1"
 
-STATSAPI_BASE = "https://statsapi.mlb.com/api/v1"
+def _strip_accents(s: str) -> str:
+    return "".join(
+        c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) != "Mn"
+    )
 
+def _norm(s: str) -> str:
+    return _strip_accents(s or "").lower().strip()
 
-def _normalize_date(date_str: str) -> str:
-    if not date_str or date_str.lower() == "today":
-        # Use today in America/New_York-like sense; UTC date is fine for schedule filter
-        return datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    return date_str
+def _today_str_yyyy_mm_dd() -> str:
+    # local NY time semantics live elsewhere; here we accept date from query
+    return datetime.utcnow().date().isoformat()
 
+def _is_not_started(status: Dict[str, Any]) -> bool:
+    # Treat Preview / Pre-Game / Warmup as "not started"
+    # From MLB schedule payload: abstractGameCode: "P" for not-started, "L" live, "F"/"O" finished
+    agc = (status or {}).get("abstractGameCode", "")
+    detailed = (status or {}).get("detailedState", "")
+    return agc == "P" or detailed in ("Preview", "Pre-Game", "Warmup")
 
-async def _statsapi_get(client: httpx.AsyncClient, path: str, params: Dict = None) -> Dict:
-    r = await client.get(f"{STATSAPI_BASE}{path}", params=params or {}, headers={"Accept": "application/json"})
+async def _get_not_started_team_ids(client: httpx.AsyncClient, date_str: str) -> Tuple[List[int], Dict[str, Any]]:
+    q = {"sportId": 1, "date": date_str}
+    r = await client.get(f"{STATS_BASE}/schedule", params=q, timeout=15)
     r.raise_for_status()
-    return r.json()
+    data = r.json()
+    team_ids: List[int] = []
+    debug = {"games": []}
+    for d in data.get("dates", []):
+        for g in d.get("games", []):
+            status = g.get("status", {})
+            if _is_not_started(status):
+                away = g.get("teams", {}).get("away", {}).get("team", {})
+                home = g.get("teams", {}).get("home", {}).get("team", {})
+                aid = away.get("id")
+                hid = home.get("id")
+                if isinstance(aid, int):
+                    team_ids.append(aid)
+                if isinstance(hid, int):
+                    team_ids.append(hid)
+            debug["games"].append({
+                "gamePk": g.get("gamePk"),
+                "status": status.get("detailedState"),
+                "abstractGameCode": status.get("abstractGameCode"),
+            })
+    team_ids = sorted(set(team_ids))
+    return team_ids, debug
 
+async def _people_search(client: httpx.AsyncClient, name: str) -> List[Dict[str, Any]]:
+    """
+    Robust search: try full name; if empty, try last-name-only and filter.
+    """
+    name = (name or "").strip()
+    if not name:
+        return []
+    # 1) direct
+    r = await client.get(f"{STATS_BASE}/people", params={"search": name}, timeout=15)
+    if r.status_code == 400:
+        # retry with ascii
+        r = await client.get(f"{STATS_BASE}/people", params={"search": _strip_accents(name)}, timeout=15)
+    r.raise_for_status()
+    data = r.json() if r.content else {}
+    people = data.get("people", []) or []
 
-async def _search_person(client: httpx.AsyncClient, name: str) -> Optional[Dict]:
-    # people?search=NAME
-    # Returns {"people": [{id, fullName, currentTeam: {id, name}, ...}]} or empty
-    try:
-        data = await _statsapi_get(client, "/people", {"search": name})
-        people = data.get("people") or []
-        return people[0] if people else None
-    except httpx.HTTPError:
-        return None
+    if people:
+        return people
 
-
-async def _get_person(client: httpx.AsyncClient, person_id: int) -> Optional[Dict]:
-    try:
-        data = await _statsapi_get(client, f"/people/{person_id}")
-        people = data.get("people") or []
-        return people[0] if people else None
-    except httpx.HTTPError:
-        return None
-
+    # 2) last-name fallback
+    parts = [p for p in name.split() if p]
+    if len(parts) >= 2:
+        last = parts[-1]
+        r2 = await client.get(f"{STATS_BASE}/people", params={"search": last}, timeout=15)
+        if r2.status_code == 400:
+            r2 = await client.get(f"{STATS_BASE}/people", params={"search": _strip_accents(last)}, timeout=15)
+        r2.raise_for_status()
+        d2 = r2.json() if r2.content else {}
+        cand = d2.get("people", []) or []
+        if cand:
+            # prefer exact-ish last-name matches and same first initial
+            first_initial = _norm(parts[0])[:1]
+            last_norm = _norm(last)
+            filtered = []
+            for p in cand:
+                full = _norm(p.get("fullName", ""))
+                tokens = [t for t in full.split() if t]
+                if not tokens:
+                    continue
+                last_tok = tokens[-1]
+                fi = tokens[0][:1] if tokens else ""
+                if last_tok == last_norm and (not first_initial or fi == first_initial):
+                    filtered.append(p)
+            if filtered:
+                return filtered
+            return cand  # fall back to any last-name match
+    return []
 
 async def _season_avg(client: httpx.AsyncClient, person_id: int, season: int) -> Optional[float]:
-    # /people/{id}/stats?stats=season&group=hitting&season=YYYY
-    try:
-        data = await _statsapi_get(
-            client,
-            f"/people/{person_id}/stats",
-            {"stats": "season", "group": "hitting", "season": str(season)},
-        )
-        splits = ((data.get("stats") or [{}])[0].get("splits")) or []
-        if not splits:
-            return None
-        stat = splits[0].get("stat") or {}
-        # battingAverage can be like ".298" or "0.298" or missing
-        avg_str = stat.get("battingAverage") or stat.get("avg")
-        if not avg_str:
-            return None
-        try:
-            # Handle formats ".298" or "0.298"
-            return float(avg_str)
-        except ValueError:
-            if avg_str.startswith("."):
-                return float("0" + avg_str)
-            return None
-    except httpx.HTTPError:
-        return None
+    q = {"stats": "season", "group": "hitting", "season": season}
+    r = await client.get(f"{STATS_BASE}/people/{person_id}/stats", params=q, timeout=15)
+    r.raise_for_status()
+    data = r.json()
+    for s in (data.get("stats") or []):
+        for sp in (s.get("splits") or []):
+            stat = sp.get("stat", {})
+            avg = stat.get("avg")
+            if avg is not None:
+                try:
+                    return float(avg)
+                except Exception:
+                    pass
+    return None
 
-
-async def _hitless_streak(
-    client: httpx.AsyncClient,
-    person_id: int,
-    season: int,
-    last_n: int,
-    thru_date: str,
-) -> int:
+async def _hitless_streak(client: httpx.AsyncClient, person_id: int, season: int, last_n: int) -> int:
     """
-    Count consecutive games (working backward from thru_date) with AB>0 and H==0.
-    Uses gameLog; stops at first game with a hit or when we leave season/limit.
+    Count **consecutive** games (most recent backwards) with AB>0 and H==0.
     """
-    try:
-        data = await _statsapi_get(
-            client,
-            f"/people/{person_id}/stats",
-            {"stats": "gameLog", "group": "hitting", "season": str(season)},
-        )
-    except httpx.HTTPError:
-        return 0
-
-    splits = ((data.get("stats") or [{}])[0].get("splits")) or []
-    if not splits:
-        return 0
-
-    # Only consider games on or before thru_date
-    thru = datetime.strptime(thru_date, "%Y-%m-%d")
-    # Splits are usually chronological; safest: sort by date
-    def _to_date(s):
-        d = (s.get("date") or "").split("T")[0]
-        try:
-            return datetime.strptime(d, "%Y-%m-%d")
-        except Exception:
-            return datetime.min
-
-    relevant = [s for s in splits if _to_date(s) <= thru]
-    relevant.sort(key=_to_date, reverse=True)
+    q = {"stats": "gameLog", "group": "hitting", "season": season}
+    r = await client.get(f"{STATS_BASE}/people/{person_id}/stats", params=q, timeout=15)
+    r.raise_for_status()
+    data = r.json()
+    splits = []
+    for s in (data.get("stats") or []):
+        splits.extend(s.get("splits") or [])
+    # Ensure most-recent first: game logs usually are newest first, but be safe:
+    # Each split may have "date" YYYY-MM-DD
+    splits.sort(key=lambda x: x.get("date", ""), reverse=True)
 
     streak = 0
-    for s in relevant[: max(1, last_n)]:
-        stat = s.get("stat") or {}
-        ab = int(stat.get("atBats") or stat.get("atBatsAllowed") or 0)
-        h = int(stat.get("hits") or 0)
+    checked = 0
+    for sp in splits:
+        if checked >= max(last_n, 1):
+            break
+        stat = sp.get("stat", {})
+        try:
+            ab = int(stat.get("atBats") or 0)
+            hits = int(stat.get("hits") or 0)
+        except Exception:
+            ab = 0
+            hits = 0
         if ab <= 0:
-            # Skip games without an AB; they don't break the streak but also don't count toward it.
+            # skip games without an AB for streak purposes
             continue
-        if h == 0:
+        checked += 1
+        if hits == 0:
             streak += 1
         else:
             break
     return streak
 
-
-def _team_id_and_name(person: Dict) -> Tuple[Optional[int], str]:
-    team = (person or {}).get("currentTeam") or {}
-    tid = team.get("id")
-    tname = team.get("name") or ""
-    return (tid if isinstance(tid, int) else None, tname)
-
-
-@router.get("/cold_candidates")
+@router.get("/cold_candidates", name="cold_candidates")
 async def cold_candidates(
-    date: str = Query("today"),
-    names: Optional[str] = Query(None, description="Comma-separated player names"),
+    date: Optional[str] = Query(None, description="today|yesterday|tomorrow|YYYY-MM-DD"),
+    names: Optional[str] = Query(None, description="Comma-separated full names"),
+    min_season_avg: float = Query(0.260, ge=0.0, le=1.0),
+    min_hitless_games: int = Query(1, ge=0),
     last_n: int = Query(7, ge=1, le=30),
-    min_season_avg: float = Query(0.26, ge=0.0, le=1.0),
-    min_hitless_games: int = Query(1, ge=0, le=30),
     limit: int = Query(50, ge=1, le=200),
-    verify: int = Query(0, description="No-op; kept for compat"),
-    debug: int = Query(0),
+    verify: int = Query(0, ge=0, le=1),
+    debug: int = Query(0, ge=0, le=1),
 ):
     """
-    Identify 'cold' hitter candidates for the CURRENT DAY ONLY.
-    Filters OUT players whose team's game has already started or finished today.
-    If ?names=... is provided, only those names are evaluated.
+    Logic:
+      1) Get NOT-STARTED team IDs for the given date.
+      2) Resolve each provided name -> player(s) (robust search).
+      3) Keep only players whose currentTeam.id is in NOT-STARTED set.
+      4) Compute season AVG and hitless STREAK(last_n).
+      5) Filter by min_season_avg & min_hitless_games.
     """
-    date_str = _normalize_date(date)
-    season = int(date_str.split("-")[0])
+    # Resolve 'date'
+    when = (date or "today").lower().strip()
+    if when in ("today", ""):
+        date_str = _today_str_yyyy_mm_dd()
+    else:
+        date_str = when
 
-    # --- Schedule gating (NOT-STARTED only) ---------------------------------
-    # We call StatsAPI schedule through our own small client (doesn't depend on provider internals).
-    not_started_team_ids: set[int] = set()
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            sched = await _statsapi_get(client, "/schedule", {"sportId": 1, "date": date_str})
-            # mimic services.schedule_filters logic locally to keep route self-contained
-            for day in (sched.get("dates") or []):
-                for game in day.get("games", []):
-                    status = (game.get("status") or {})
-                    code = status.get("statusCode")
-                    detailed = (status.get("detailedState") or "").lower()
-                    abstract = (status.get("abstractGameState") or "").lower()
+    items: List[Dict[str, Any]] = []
+    dbg: List[Dict[str, Any]] = []
 
-                    def not_started():
-                        if code in {"S", "P"}:
-                            return True
-                        if code in {"I", "PW", "PR", "F", "O"}:
-                            return False
-                        for token in ("scheduled", "preview", "pre-game", "pregame", "pre game"):
-                            if token in detailed or token in abstract:
-                                return True
-                        for token in ("warmup", "in progress", "final", "game over", "live"):
-                            if token in detailed or token in abstract:
-                                return False
-                        return False
+    if not names:
+        return {"date": date_str, "season": int(date_str.split("-")[0]), "items": [], "debug": [{"note": "no names provided"}]}
 
-                    if not_started():
-                        try:
-                            hid = game["teams"]["home"]["team"]["id"]
-                            aid = game["teams"]["away"]["team"]["id"]
-                            if isinstance(hid, int):
-                                not_started_team_ids.add(hid)
-                            if isinstance(aid, int):
-                                not_started_team_ids.add(aid)
-                        except Exception:
-                            pass
-    except Exception:
-        # If schedule fetch fails, default to empty => everyone is filtered out unless names specified with manual override
-        not_started_team_ids = set()
+    # Collect not-started teams
+    async with httpx.AsyncClient() as client:
+        try:
+            not_started_team_ids, sched_dbg = await _get_not_started_team_ids(client, date_str)
+        except httpx.HTTPError as e:
+            raise HTTPException(status_code=502, detail=f"schedule fetch failed: {type(e).__name__}: {e}") from e
 
-    items: List[Dict] = []
-    dbg: List[Dict] = []
-
-    # Parse names list
-    name_list: List[str] = []
-    if names:
-        # Allow commas and pipe as separators
-        raw = [n.strip() for n in names.replace("|", ",").split(",")]
-        name_list = [n for n in raw if n]
-
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        # If no names given, we return empty list (you are driving candidates by explicit names today)
-        candidates = name_list if name_list else []
-
-        for nm in candidates:
-            person = await _search_person(client, nm)
-            if not person:
-                dbg.append({"name": nm, "error": "not found in people search"})
+        season = int(date_str.split("-")[0])
+        # Process each name
+        raw_names = [n.strip() for n in names.split(",") if n.strip()]
+        for name in raw_names:
+            try:
+                people = await _people_search(client, name)
+            except httpx.HTTPError as e:
+                dbg.append({"name": name, "error": f"HTTPError: {e}"})
                 continue
 
-            team_id, team_name = _team_id_and_name(person)
-            if not team_id or team_id not in not_started_team_ids:
-                dbg.append({
-                    "name": nm,
-                    "skip": "no not-started game today (not found on any active roster of a not-started team)"
-                })
+            if not people:
+                dbg.append({"name": name, "error": "not found in people search"})
                 continue
 
-            person_id = person.get("id")
-            if not isinstance(person_id, int):
-                dbg.append({"name": nm, "error": "missing person id"})
+            # choose the best candidate: prefer exact (accents-insensitive) full match if available
+            target = None
+            name_norm = _norm(name)
+            for p in people:
+                if _norm(p.get("fullName", "")) == name_norm:
+                    target = p
+                    break
+            if target is None:
+                target = people[0]
+
+            pid = target.get("id")
+            cteam = (target.get("currentTeam") or {}).get("id")
+            cteam_name = (target.get("currentTeam") or {}).get("name") or ""
+
+            if not isinstance(pid, int):
+                dbg.append({"name": name, "error": "bad/unknown player id"})
                 continue
 
-            avg = await _season_avg(client, person_id, season)
+            if not isinstance(cteam, int):
+                dbg.append({"name": name, "skip": "no current team on record"})
+                continue
+
+            if cteam not in not_started_team_ids:
+                dbg.append({"name": name, "skip": "no not-started game today (not found on any active roster of a not-started team)"})
+                continue
+
+            # stats
+            avg = await _season_avg(client, pid, season)
             if avg is None:
-                dbg.append({"name": nm, "team": team_name, "skip": "no season avg"})
-                continue
-            if avg < float(min_season_avg):
-                dbg.append({"name": nm, "team": team_name, "skip": f"season_avg {avg:.3f} < min {min_season_avg:.3f}"})
+                dbg.append({"name": name, "team": cteam_name, "skip": "no season avg"})
                 continue
 
-            streak = await _hitless_streak(client, person_id, season, last_n=last_n, thru_date=date_str)
-            if streak < int(min_hitless_games):
-                dbg.append({"name": nm, "team": team_name, "skip": f"hitless_streak {streak} < min {min_hitless_games}"})
+            streak = await _hitless_streak(client, pid, season, last_n)
+            # Filter per thresholds
+            if avg < min_season_avg:
+                dbg.append({"name": name, "team": cteam_name, "skip": f"season_avg {avg:.3f} < min {min_season_avg:.3f}"})
+                continue
+            if streak < min_hitless_games:
+                dbg.append({"name": name, "team": cteam_name, "skip": f"hitless_streak {streak} < min {min_hitless_games}"})
                 continue
 
             items.append({
-                "name": person.get("fullName") or nm,
-                "team": team_name,
+                "name": target.get("fullName") or name,
+                "team": cteam_name,
                 "season_avg": round(avg, 3),
-                "hitless_streak": int(streak),
+                "hitless_streak": streak,
             })
 
-    # Sort: longest hitless streak first, then higher season avg
-    items.sort(key=lambda x: (-x["hitless_streak"], -x["season_avg"]))
-    if limit and len(items) > limit:
-        items = items[:limit]
-
-    out = {
-        "date": date_str,
-        "season": season,
-        "items": items,
-        "debug": (dbg if debug else []),
-    }
+    # enforce limit
+    items = items[:limit]
+    out = {"date": date_str, "season": season, "items": items, "debug": dbg if debug or verify else []}
     return out
