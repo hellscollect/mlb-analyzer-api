@@ -2,109 +2,96 @@
 
 from __future__ import annotations
 
-import math
 import requests
 from datetime import datetime, date as date_cls
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request
 
-from main import parse_date  # reuse your existing helper
-from services.verify_helpers import verify_and_filter_names_soft
+from main import parse_date  # reuse your helper
+
+# Try to import soft-verify; if unavailable, provide a safe fallback so the router still loads.
+try:
+    from services.verify_helpers import verify_and_filter_names_soft
+except Exception:
+    def verify_and_filter_names_soft(the_date, provider, input_names, cutoffs, debug_flag):
+        return input_names, {
+            "error": "verify_helpers missing; soft-verify skipped",
+            "names_checked": len(input_names),
+            "not_started_team_count": 30,
+            "cutoffs": cutoffs,
+        }
 
 router = APIRouter()
 
-# ---------- StatsAPI helpers (defensive; used only if provider doesn’t expose player-level helpers) ----------
+# ---------- StatsAPI helpers ----------
 
+_STAS_API_TIMEOUT = 12
 _STATSAPI_BASE = "https://statsapi.mlb.com"
 
 def _http_get_json(url: str, params: Dict[str, Any] | None = None) -> Dict[str, Any]:
-    headers = {
-        "User-Agent": "mlb-analyzer-api/1.0 (cold_candidates)",
-        "Accept": "application/json",
-    }
-    r = requests.get(url, params=params or {}, headers=headers, timeout=12)
+    r = requests.get(
+        url,
+        params=params or {},
+        headers={
+            "User-Agent": "mlb-analyzer-api/1.0 (cold_candidates)",
+            "Accept": "application/json",
+        },
+        timeout=_STAS_API_TIMEOUT,
+    )
     r.raise_for_status()
     return r.json()
 
 def _people_search(full_name: str) -> Optional[int]:
     """
-    Best-effort lookup of a player id by name. Returns the first match ID or None.
+    Best-effort lookup of a player id by name. Returns first match ID or None.
     """
+    # Primary
     try:
         data = _http_get_json(
-            f"{_STATsAPI_BASE}/api/v1/people",
+            f"{_STATSAPI_BASE}/api/v1/people",
             {"search": full_name, "sportId": 1},
         )
+        people = data.get("people") or []
+        if isinstance(people, list) and people:
+            pid = people[0].get("id")
+            return int(pid) if pid is not None else None
     except Exception:
-        # Fallback: try the alternate search endpoint (some deployments prefer people/search)
-        try:
-            data = _http_get_json(
-                f"{_STATsAPI_BASE}/api/v1/people/search",
-                {"query": full_name, "sportId": 1},
-            )
-        except Exception:
-            return None
-
-    people = data.get("people") or data.get("results") or []
-    if not isinstance(people, list) or not people:
-        return None
-    p = people[0]
-    pid = p.get("id") or p.get("person", {}).get("id")
+        pass
+    # Fallback endpoint
     try:
-        return int(pid) if pid is not None else None
+        data = _http_get_json(
+            f"{_STATSAPI_BASE}/api/v1/people/search",
+            {"query": full_name, "sportId": 1},
+        )
+        people = data.get("results") or data.get("people") or []
+        if isinstance(people, list) and people:
+            pid = (people[0].get("id")
+                   or people[0].get("person", {}).get("id"))
+            return int(pid) if pid is not None else None
     except Exception:
-        return None
+        pass
+    return None
 
 def _person_team(pid: int) -> str:
     """
-    Try to fetch the player's current team name. Returns "" on any failure.
-    """
-    try:
-        data = _http_get_json(f"{_STATsAPI_BASE}/api/v1/people/{pid}", {"hydrate": "team,CurrentTeam"})
-        # Try several shapes
-        team = (
-            (data.get("people") or [{}])[0]
-            .get("currentTeam", {})
-            .get("name")
-        ) or (
-            (data.get("people") or [{}])[0]
-            .get("team", {})
-            .get("name")
-        )
-        if isinstance(team, str):
-            return team
-    except Exception:
-        pass
-    return ""
-
-def _season_avg(pid: int, season: int) -> Optional[float]:
-    """
-    Return season AVG as float or None.
+    Try to fetch the player's current team name. Returns "" on failure.
     """
     try:
         data = _http_get_json(
-            f"{_STATsAPI_BASE}/api/v1/people/{pid}/stats",
-            {"stats": "season", "group": "hitting", "season": season},
+            f"{_STATSAPI_BASE}/api/v1/people/{pid}",
+            {"hydrate": "team,CurrentTeam"},
         )
-        splits = ((data.get("stats") or [{}])[0].get("splits")) or []
-        if not splits:
-            return None
-        avg_str = (splits[0].get("stat") or {}).get("avg")
-        if not isinstance(avg_str, str):
-            return None
-        # Some APIs return ".273" or "0.273"; both are fine.
-        try:
-            val = float(avg_str)
-        except Exception:
-            # Strip leading dot if present
-            avg_str2 = avg_str.strip()
-            if avg_str2.startswith("."):
-                avg_str2 = "0" + avg_str2
-            val = float(avg_str2)
-        return round(val, 3)
+        ppl = data.get("people") or []
+        if not ppl:
+            return ""
+        p0 = ppl[0] or {}
+        team = (p0.get("currentTeam", {}) or {}).get("name") \
+            or (p0.get("team", {}) or {}).get("name") \
+            or ""
+        return team if isinstance(team, str) else ""
     except Exception:
-        return None
+        return ""
 
 def _parse_iso(d: str) -> Optional[date_cls]:
     try:
@@ -117,27 +104,47 @@ def _parse_iso(d: str) -> Optional[date_cls]:
 
 def _game_log_splits(pid: int, season: int) -> List[Dict[str, Any]]:
     """
-    Fetch hitting game logs for the given season. Returns a list (may be empty).
+    Fetch hitting game logs for the season. Returns newest-first list.
     """
     try:
         data = _http_get_json(
-            f"{_STATsAPI_BASE}/api/v1/people/{pid}/stats",
+            f"{_STATSAPI_BASE}/api/v1/people/{pid}/stats",
             {"stats": "gameLog", "group": "hitting", "season": season},
         )
         splits = ((data.get("stats") or [{}])[0].get("splits")) or []
-        # Normalize to newest-first by date
-        def _key(s: Dict[str, Any]) -> tuple:
+        def _k(s: Dict[str, Any]):
             d = s.get("date") or s.get("gameDate") or ""
             dt = _parse_iso(d) or datetime.min.date()
             return (dt.toordinal(),)
-        splits_sorted = sorted(splits, key=_key, reverse=True)
-        return splits_sorted
+        return sorted(splits, key=_k, reverse=True)
     except Exception:
         return []
 
+def _season_avg(pid: int, season: int) -> Optional[float]:
+    """
+    Return season AVG as float or None.
+    """
+    try:
+        data = _http_get_json(
+            f"{_STATSAPI_BASE}/api/v1/people/{pid}/stats",
+            {"stats": "season", "group": "hitting", "season": season},
+        )
+        splits = ((data.get("stats") or [{}])[0].get("splits")) or []
+        if not splits:
+            return None
+        avg_str = (splits[0].get("stat") or {}).get("avg")
+        if not isinstance(avg_str, str):
+            return None
+        s = avg_str.strip()
+        if s.startswith("."):
+            s = "0" + s
+        return round(float(s), 3)
+    except Exception:
+        return None
+
 def _compute_hitless_streak(pid: int, up_to_date: date_cls, last_n: int) -> int:
     """
-    Count consecutive games (up to last_n) on or before up_to_date with AB>0 and H==0.
+    Count consecutive games (up to last_n) on/before up_to_date with AB>0 and H==0.
     Ignore games with AB==0. Stop at first game with a hit.
     """
     season = up_to_date.year
@@ -147,32 +154,24 @@ def _compute_hitless_streak(pid: int, up_to_date: date_cls, last_n: int) -> int:
         d = s.get("date") or s.get("gameDate")
         dt = _parse_iso(d)
         if not dt or dt > up_to_date:
-            continue  # ignore future/today-not-final
+            continue  # ignore future or same-day in-progress
         stat = s.get("stat") or {}
-        ab = stat.get("atBats") or 0
-        h = stat.get("hits") or 0
-        # Some payloads store numbers as strings; coerce.
         try:
-            ab = int(ab)
+            ab = int(stat.get("atBats") or 0)
+            h = int(stat.get("hits") or 0)
         except Exception:
-            ab = 0
-        try:
-            h = int(h)
-        except Exception:
-            h = 0
+            ab, h = 0, 0
         if ab <= 0:
-            # no official ABs; ignore this game entirely for streak purposes
             continue
         if h == 0:
             streak += 1
             if streak >= last_n:
                 return streak
         else:
-            # streak broken
             break
     return streak
 
-# ---------- Main route ----------
+# ---------- Route ----------
 
 @router.get("/cold_candidates", tags=["hitters"])
 def cold_candidates(
@@ -187,33 +186,20 @@ def cold_candidates(
     debug: int = Query(0, ge=0, le=1),
 ):
     """
-    For the supplied names, return those whose season AVG >= min_season_avg AND
-    whose current hitless-streak (considering up to last_n completed games) >= min_hitless_games.
-
-    - Soft verify mode: consults schedule to understand 'not-started' teams, but never drops names
-      just for roster mismatches. It only returns a verify_context for transparency.
+    For the supplied names, return those whose season AVG >= min_season_avg AND whose
+    current hitless-streak (considering only completed games up to 'date') >= min_hitless_games.
     """
     the_date: date_cls = parse_date(date)
     season = the_date.year
 
-    # Parse names
+    # Parse names list
     if not names:
-        return {
-            "date": the_date.isoformat(),
-            "season": season,
-            "items": [],
-            "debug": [{"note": "no names provided"}],
-        }
+        return {"date": the_date.isoformat(), "season": season, "items": [], "debug": [{"note": "no names provided"}]}
     raw_names = [n.strip() for n in names.split(",") if n.strip()]
     if not raw_names:
-        return {
-            "date": the_date.isoformat(),
-            "season": season,
-            "items": [],
-            "debug": [{"note": "no names provided"}],
-        }
+        return {"date": the_date.isoformat(), "season": season, "items": [], "debug": [{"note": "no names provided"}]}
 
-    # Soft verify (never filters; just returns context)
+    # Soft verify (does not filter names; returns context only)
     filtered_names = raw_names
     verify_ctx: Dict[str, Any] | None = None
     if verify == 1:
@@ -222,35 +208,36 @@ def cold_candidates(
                 the_date=the_date,
                 provider=request.app.state.provider,
                 input_names=raw_names,
-                cutoffs={"min_season_avg": min_season_avg, "min_hitless_games": min_hitless_games, "last_n": last_n},
+                cutoffs={
+                    "min_season_avg": min_season_avg,
+                    "min_hitless_games": min_hitless_games,
+                    "last_n": last_n,
+                },
                 debug_flag=bool(debug),
             )
         except Exception as e:
-            # Fail open: keep names as-is, attach error in verify_context
             verify_ctx = {"error": f"{type(e).__name__}: {e}", "names_checked": len(raw_names)}
 
     items: List[Dict[str, Any]] = []
-    debug_list: List[Dict[str, Any]] = []
+    debugs: List[Dict[str, Any]] = []
 
-    # Build candidates
     for nm in filtered_names:
         pid = _people_search(nm)
         if pid is None:
-            debug_list.append({"name": nm, "error": "not found in people search"})
+            debugs.append({"name": nm, "error": "not found in people search"})
             continue
 
         avg = _season_avg(pid, season)
         if avg is None:
-            debug_list.append({"name": nm, "error": "season average unavailable"})
+            debugs.append({"name": nm, "error": "season average unavailable"})
             continue
-
         if avg < min_season_avg:
-            debug_list.append({"name": nm, "team": "", "skip": f"season_avg {avg:.3f} < min {min_season_avg:.3f}"})
+            debugs.append({"name": nm, "team": "", "skip": f"season_avg {avg:.3f} < min {min_season_avg:.3f}"})
             continue
 
         streak = _compute_hitless_streak(pid, the_date, last_n)
         if streak < min_hitless_games:
-            debug_list.append({"name": nm, "team": "", "skip": f"hitless_streak {streak} < min {min_hitless_games}"})
+            debugs.append({"name": nm, "team": "", "skip": f"hitless_streak {streak} < min {min_hitless_games}"})
             continue
 
         team_name = _person_team(pid)
@@ -263,14 +250,9 @@ def cold_candidates(
         if len(items) >= limit:
             break
 
-    out: Dict[str, Any] = {
-        "date": the_date.isoformat(),
-        "season": season,
-        "items": items,
-    }
-    if debug_list or debug == 1:
-        out["debug"] = debug_list
+    out: Dict[str, Any] = {"date": the_date.isoformat(), "season": season, "items": items}
+    if debugs or debug == 1:
+        out["debug"] = debugs
     if verify_ctx is not None:
         out["verify_context"] = verify_ctx
-
     return out
