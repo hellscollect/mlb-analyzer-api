@@ -2,16 +2,17 @@
 
 from __future__ import annotations
 
+import re
 import requests
 from datetime import datetime, date as date_cls
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, HTTPException, Query, Request
 
-# IMPORTANT: import from services to avoid circular import with main.py
+# avoid circular import with main.py
 from services.dates import parse_date
 
-# Try to import soft-verify; if unavailable, provide a safe fallback so the router still loads.
+# Try optional soft-verify helper; fall back safely if missing
 try:
     from services.verify_helpers import verify_and_filter_names_soft
 except Exception:
@@ -25,10 +26,8 @@ except Exception:
 
 router = APIRouter()
 
-# ---------- StatsAPI helpers ----------
-
-_STAS_API_TIMEOUT = 12
 _STATSAPI_BASE = "https://statsapi.mlb.com"
+_TIMEOUT = 12
 
 def _http_get_json(url: str, params: Dict[str, Any] | None = None) -> Dict[str, Any]:
     r = requests.get(
@@ -38,46 +37,93 @@ def _http_get_json(url: str, params: Dict[str, Any] | None = None) -> Dict[str, 
             "User-Agent": "mlb-analyzer-api/1.0 (cold_candidates)",
             "Accept": "application/json",
         },
-        timeout=_STAS_API_TIMEOUT,
+        timeout=_TIMEOUT,
     )
     r.raise_for_status()
     return r.json()
 
+_name_cleaner = re.compile(r"[^a-z]+")
+
+def _norm_name(s: str) -> str:
+    # normalize: lower, remove non-letters, collapse spaces
+    s = s.strip().lower()
+    s = _name_cleaner.sub(" ", s).strip()
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+def _score_candidate(query_norm: str, cand: Dict[str, Any]) -> Tuple[int, bool]:
+    # scoring: exact fullName match > useName > partial
+    names = []
+    for k in ("fullName", "useName", "boxscoreName", "lastFirstName"):
+        v = cand.get(k)
+        if isinstance(v, str) and v.strip():
+            names.append(_norm_name(v))
+    exact = any(n == query_norm for n in names)
+    if exact:
+        return (100, bool(cand.get("active")))
+
+    # token overlap score
+    q_tokens = set(query_norm.split())
+    best_overlap = 0
+    for n in names:
+        cand_tokens = set(n.split())
+        best_overlap = max(best_overlap, len(q_tokens & cand_tokens))
+    return (best_overlap, bool(cand.get("active")))
+
 def _people_search(full_name: str) -> Optional[int]:
     """
-    Best-effort lookup of a player id by name. Returns first match ID or None.
+    Robust player lookup. Uses /people/search and requires best exact/near-exact match.
+    Returns the chosen player's id or None.
     """
-    # Primary
-    try:
-        data = _http_get_json(
-            f"{_STATSAPI_BASE}/api/v1/people",
-            {"search": full_name, "sportId": 1},
-        )
-        people = data.get("people") or []
-        if isinstance(people, list) and people:
-            pid = people[0].get("id")
-            return int(pid) if pid is not None else None
-    except Exception:
-        pass
-    # Fallback endpoint
+    q = full_name.strip()
+    if not q:
+        return None
+
+    # Primary (reliable) endpoint
     try:
         data = _http_get_json(
             f"{_STATSAPI_BASE}/api/v1/people/search",
-            {"query": full_name, "sportId": 1},
+            {"query": q, "sportId": 1},
         )
-        people = data.get("results") or data.get("people") or []
-        if isinstance(people, list) and people:
-            pid = (people[0].get("id")
-                   or people[0].get("person", {}).get("id"))
-            return int(pid) if pid is not None else None
+        people = (data.get("people") or data.get("results") or []) if isinstance(data, dict) else []
+        if people:
+            qn = _norm_name(q)
+            scored = sorted(
+                people,
+                key=lambda c: _score_candidate(qn, c),
+                reverse=True,
+            )
+            best = scored[0]
+            pid = best.get("id") or (best.get("person") or {}).get("id")
+            if isinstance(pid, int):
+                return pid
     except Exception:
         pass
+
+    # Fallback: older endpoint (best-effort), still filter by name
+    try:
+        data = _http_get_json(
+            f"{_STATSAPI_BASE}/api/v1/people",
+            {"search": q, "sportId": 1},
+        )
+        people = data.get("people") or []
+        if people:
+            qn = _norm_name(q)
+            scored = sorted(
+                people,
+                key=lambda c: _score_candidate(qn, c),
+                reverse=True,
+            )
+            best = scored[0]
+            pid = best.get("id")
+            if isinstance(pid, int):
+                return pid
+    except Exception:
+        pass
+
     return None
 
 def _person_team(pid: int) -> str:
-    """
-    Try to fetch the player's current team name. Returns "" on failure.
-    """
     try:
         data = _http_get_json(
             f"{_STATSAPI_BASE}/api/v1/people/{pid}",
@@ -104,9 +150,6 @@ def _parse_iso(d: str) -> Optional[date_cls]:
             return None
 
 def _game_log_splits(pid: int, season: int) -> List[Dict[str, Any]]:
-    """
-    Fetch hitting game logs for the season. Returns newest-first list.
-    """
     try:
         data = _http_get_json(
             f"{_STATSAPI_BASE}/api/v1/people/{pid}/stats",
@@ -122,9 +165,6 @@ def _game_log_splits(pid: int, season: int) -> List[Dict[str, Any]]:
         return []
 
 def _season_avg(pid: int, season: int) -> Optional[float]:
-    """
-    Return season AVG as float or None.
-    """
     try:
         data = _http_get_json(
             f"{_STATSAPI_BASE}/api/v1/people/{pid}/stats",
@@ -144,10 +184,6 @@ def _season_avg(pid: int, season: int) -> Optional[float]:
         return None
 
 def _compute_hitless_streak(pid: int, up_to_date: date_cls, last_n: int) -> int:
-    """
-    Count consecutive games (up to last_n) on/before up_to_date with AB>0 and H==0.
-    Ignore games with AB==0. Stop at first game with a hit.
-    """
     season = up_to_date.year
     splits = _game_log_splits(pid, season)
     streak = 0
@@ -172,8 +208,6 @@ def _compute_hitless_streak(pid: int, up_to_date: date_cls, last_n: int) -> int:
             break
     return streak
 
-# ---------- Route ----------
-
 @router.get("/cold_candidates", tags=["hitters"])
 def cold_candidates(
     request: Request,
@@ -187,20 +221,20 @@ def cold_candidates(
     debug: int = Query(0, ge=0, le=1),
 ):
     """
-    For the supplied names, return those whose season AVG >= min_season_avg AND whose
-    current hitless-streak (considering only completed games up to 'date') >= min_hitless_games.
+    Return players (from 'names') with season AVG >= min_season_avg AND a hitless streak
+    (completed games only, up to 'date') >= min_hitless_games. Name lookup is exact/fuzzy
+    through /people/search to avoid mis-mapping.
     """
     the_date: date_cls = parse_date(date)
     season = the_date.year
 
-    # Parse names list
     if not names:
         return {"date": the_date.isoformat(), "season": season, "items": [], "debug": [{"note": "no names provided"}]}
     raw_names = [n.strip() for n in names.split(",") if n.strip()]
     if not raw_names:
         return {"date": the_date.isoformat(), "season": season, "items": [], "debug": [{"note": "no names provided"}]}
 
-    # Soft verify (does not filter names; returns context only)
+    # soft verify (doesn't filter names, provides context)
     filtered_names = raw_names
     verify_ctx: Dict[str, Any] | None = None
     if verify == 1:
@@ -229,19 +263,31 @@ def cold_candidates(
             continue
 
         avg = _season_avg(pid, season)
+        team_name = _person_team(pid)  # also fetch team for debug clarity
+
         if avg is None:
-            debugs.append({"name": nm, "error": "season average unavailable"})
+            debugs.append({"name": nm, "pid": pid, "team": team_name or "", "error": "season average unavailable"})
             continue
+
         if avg < min_season_avg:
-            debugs.append({"name": nm, "team": "", "skip": f"season_avg {avg:.3f} < min {min_season_avg:.3f}"})
+            debugs.append({
+                "name": nm,
+                "pid": pid,
+                "team": team_name or "",
+                "skip": f"season_avg {avg:.3f} < min {min_season_avg:.3f}",
+            })
             continue
 
         streak = _compute_hitless_streak(pid, the_date, last_n)
         if streak < min_hitless_games:
-            debugs.append({"name": nm, "team": "", "skip": f"hitless_streak {streak} < min {min_hitless_games}"})
+            debugs.append({
+                "name": nm,
+                "pid": pid,
+                "team": team_name or "",
+                "skip": f"hitless_streak {streak} < min {min_hitless_games}",
+            })
             continue
 
-        team_name = _person_team(pid)
         items.append({
             "name": nm,
             "team": team_name or "",
