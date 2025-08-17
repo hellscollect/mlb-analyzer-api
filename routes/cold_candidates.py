@@ -42,82 +42,109 @@ def _http_get_json(url: str, params: Dict[str, Any] | None = None) -> Dict[str, 
     r.raise_for_status()
     return r.json()
 
+# --- name normalization & matching -------------------------------------------------
+
 _name_cleaner = re.compile(r"[^a-z]+")
 
 def _norm_name(s: str) -> str:
-    # normalize: lower, remove non-letters, collapse spaces
-    s = s.strip().lower()
+    s = (s or "").strip().lower()
     s = _name_cleaner.sub(" ", s).strip()
     s = re.sub(r"\s+", " ", s)
     return s
 
-def _score_candidate(query_norm: str, cand: Dict[str, Any]) -> Tuple[int, bool]:
-    # scoring: exact fullName match > useName > partial
-    names = []
-    for k in ("fullName", "useName", "boxscoreName", "lastFirstName"):
-        v = cand.get(k)
-        if isinstance(v, str) and v.strip():
-            names.append(_norm_name(v))
-    exact = any(n == query_norm for n in names)
-    if exact:
-        return (100, bool(cand.get("active")))
+def _split_first_last(q_norm: str) -> Tuple[str, str]:
+    parts = q_norm.split()
+    if not parts:
+        return "", ""
+    if len(parts) == 1:
+        return parts[0], ""
+    return parts[0], parts[-1]
 
-    # token overlap score
-    q_tokens = set(query_norm.split())
-    best_overlap = 0
-    for n in names:
-        cand_tokens = set(n.split())
-        best_overlap = max(best_overlap, len(q_tokens & cand_tokens))
-    return (best_overlap, bool(cand.get("active")))
+def _candidate_norm_names(c: Dict[str, Any]) -> Dict[str, str]:
+    # normalize several candidate name fields
+    return {
+        "full": _norm_name(c.get("fullName", "")),
+        "use": _norm_name(c.get("useName", "")),
+        "last_first": _norm_name((c.get("lastFirstName") or "").replace(",", " ")),
+        "first": _norm_name(c.get("firstName", "")),
+        "last": _norm_name(c.get("lastName", "")),
+    }
+
+def _is_exact_match(q_norm: str, cand_norm: Dict[str, str]) -> bool:
+    if q_norm in (cand_norm["full"], cand_norm["use"], cand_norm["last_first"]):
+        return True
+    qf, ql = _split_first_last(q_norm)
+    if qf and ql and cand_norm["first"] == qf and cand_norm["last"] == ql:
+        return True
+    return False
+
+def _soft_match_score(q_norm: str, cand_norm: Dict[str, str]) -> int:
+    # token overlap with fullName/useName; use as *tie-breaker only*
+    q_tokens = set(q_norm.split())
+    pool = set((cand_norm["full"] + " " + cand_norm["use"] + " " + cand_norm["last_first"]).split())
+    return len(q_tokens & pool)
+
+def _choose_person_id(q: str, people: List[Dict[str, Any]]) -> Optional[int]:
+    """
+    Choose a single correct person id from a list of candidates for query 'q'.
+    Rules:
+      - Accept ONLY exact matches (normalized) on full/use/lastFirst or exact first+last.
+      - If multiple exact matches, prefer one with currentTeam present, then active=True.
+      - If there are NO exact matches, return None (do NOT guess on token overlap).
+    """
+    qn = _norm_name(q)
+    exacts: List[Tuple[int, bool, bool]] = []  # (pid, has_team, is_active)
+    for c in people:
+        pid = c.get("id") or (c.get("person") or {}).get("id")
+        if not isinstance(pid, int):
+            continue
+        cn = _candidate_norm_names(c)
+        if _is_exact_match(qn, cn):
+            has_team = bool((c.get("currentTeam") or c.get("team") or {}).get("id"))
+            is_active = bool(c.get("active"))
+            exacts.append((pid, has_team, is_active))
+
+    if not exacts:
+        return None
+
+    # sort: has_team desc, is_active desc
+    exacts.sort(key=lambda t: (t[1], t[2]), reverse=True)
+    return exacts[0][0]
+
+# --- people lookup ----------------------------------------------------------------
 
 def _people_search(full_name: str) -> Optional[int]:
     """
-    Robust player lookup. Uses /people/search and requires best exact/near-exact match.
+    Robust player lookup via /people/search.
     Returns the chosen player's id or None.
     """
     q = full_name.strip()
     if not q:
         return None
 
-    # Primary (reliable) endpoint
+    # Primary: /people/search
     try:
         data = _http_get_json(
             f"{_STATSAPI_BASE}/api/v1/people/search",
             {"query": q, "sportId": 1},
         )
         people = (data.get("people") or data.get("results") or []) if isinstance(data, dict) else []
-        if people:
-            qn = _norm_name(q)
-            scored = sorted(
-                people,
-                key=lambda c: _score_candidate(qn, c),
-                reverse=True,
-            )
-            best = scored[0]
-            pid = best.get("id") or (best.get("person") or {}).get("id")
-            if isinstance(pid, int):
-                return pid
+        pid = _choose_person_id(q, people)
+        if pid is not None:
+            return pid
     except Exception:
         pass
 
-    # Fallback: older endpoint (best-effort), still filter by name
+    # Fallback: /people?search=...
     try:
         data = _http_get_json(
             f"{_STATSAPI_BASE}/api/v1/people",
             {"search": q, "sportId": 1},
         )
         people = data.get("people") or []
-        if people:
-            qn = _norm_name(q)
-            scored = sorted(
-                people,
-                key=lambda c: _score_candidate(qn, c),
-                reverse=True,
-            )
-            best = scored[0]
-            pid = best.get("id")
-            if isinstance(pid, int):
-                return pid
+        pid = _choose_person_id(q, people)
+        if pid is not None:
+            return pid
     except Exception:
         pass
 
@@ -127,18 +154,18 @@ def _person_team(pid: int) -> str:
     try:
         data = _http_get_json(
             f"{_STATSAPI_BASE}/api/v1/people/{pid}",
-            {"hydrate": "team,CurrentTeam"},
+            {"hydrate": "currentTeam"},
         )
         ppl = data.get("people") or []
         if not ppl:
             return ""
         p0 = ppl[0] or {}
-        team = (p0.get("currentTeam", {}) or {}).get("name") \
-            or (p0.get("team", {}) or {}).get("name") \
-            or ""
+        team = (p0.get("currentTeam") or {}).get("name") or ""
         return team if isinstance(team, str) else ""
     except Exception:
         return ""
+
+# --- stats helpers ----------------------------------------------------------------
 
 def _parse_iso(d: str) -> Optional[date_cls]:
     try:
@@ -208,6 +235,8 @@ def _compute_hitless_streak(pid: int, up_to_date: date_cls, last_n: int) -> int:
             break
     return streak
 
+# --- route ------------------------------------------------------------------------
+
 @router.get("/cold_candidates", tags=["hitters"])
 def cold_candidates(
     request: Request,
@@ -222,8 +251,8 @@ def cold_candidates(
 ):
     """
     Return players (from 'names') with season AVG >= min_season_avg AND a hitless streak
-    (completed games only, up to 'date') >= min_hitless_games. Name lookup is exact/fuzzy
-    through /people/search to avoid mis-mapping.
+    (completed games only, up to 'date') >= min_hitless_games. Name lookup requires an
+    exact match; if no exact match is found, that name is skipped (no guessing).
     """
     the_date: date_cls = parse_date(date)
     season = the_date.year
@@ -259,11 +288,11 @@ def cold_candidates(
     for nm in filtered_names:
         pid = _people_search(nm)
         if pid is None:
-            debugs.append({"name": nm, "error": "not found in people search"})
+            debugs.append({"name": nm, "error": "player not found (no exact match)"})
             continue
 
         avg = _season_avg(pid, season)
-        team_name = _person_team(pid)  # also fetch team for debug clarity
+        team_name = _person_team(pid)  # fetch current team name
 
         if avg is None:
             debugs.append({"name": nm, "pid": pid, "team": team_name or "", "error": "season average unavailable"})
