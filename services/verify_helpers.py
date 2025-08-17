@@ -1,87 +1,79 @@
 # services/verify_helpers.py
 
 from __future__ import annotations
-from typing import Any, Dict, Iterable, List, Set, Tuple
+from typing import Any, Dict, List, Tuple, Set
+from datetime import date as date_cls
+import inspect
 
-def _get(d: dict, *keys, default=None):
-    cur = d
-    for k in keys:
-        if not isinstance(cur, dict):
-            return default
-        cur = cur.get(k)
-    return cur if cur is not None else default
-
-def _status_code(game: dict) -> str:
-    st = game.get("status") or {}
-    # MLB schedule commonly exposes one/both of these:
-    return st.get("codedGameState") or st.get("statusCode") or st.get("abstractGameCode") or ""
-
-def collect_not_started_team_names(schedule: Any) -> Set[str]:
-    """
-    Return set of team NAMES (e.g. 'Los Angeles Angels', 'Athletics') that have NOT started yet
-    for the given schedule payload.
-    """
-    teams: Set[str] = set()
+def _call_with_sig(fn, **kwargs):
     try:
-        dates = schedule.get("dates") if isinstance(schedule, dict) else None
-        if not dates:
-            return teams
+        sig = inspect.signature(fn)
+        filtered = {k: v for k, v in kwargs.items() if k in sig.parameters}
+        return fn(**filtered)
+    except TypeError:
+        # Best-effort positional retry
+        params = list(inspect.signature(fn).parameters.values())
+        args = []
+        for p in params:
+            if p.name in kwargs:
+                args.append(kwargs[p.name])
+        return fn(*args)
+
+def collect_not_started_team_ids(schedule_obj: Any) -> Set[int]:
+    """
+    Extract team IDs for games that have NOT started yet (Scheduled/Preview/Warmup).
+    Works with the MLB schedule JSON (dates[].games[]).
+    """
+    ids: Set[int] = set()
+    try:
+        dates = (schedule_obj or {}).get("dates", [])
         for d in dates:
-            games = d.get("games") or []
-            for g in games:
-                code = _status_code(g)
-                # Treat Scheduled/Preview/Warmup as not-started
-                if code in ("S", "PW", "P"):
-                    home = _get(g, "teams", "home", "team", "name")
-                    away = _get(g, "teams", "away", "team", "name")
-                    if isinstance(home, str):
-                        teams.add(home)
-                    if isinstance(away, str):
-                        teams.add(away)
+            for g in d.get("games", []):
+                st = g.get("status", {}) or {}
+                abstract = (st.get("abstractGameState") or "").strip()
+                detailed = (st.get("detailedState") or "").strip()
+                not_started = (
+                    abstract in ("Preview", "Pre-Game") or
+                    detailed in ("Scheduled", "Pre-Game", "Warmup")
+                )
+                if not_started:
+                    for side in ("home", "away"):
+                        tid = ((g.get("teams", {}) or {}).get(side, {}) or {}).get("team", {}).get("id")
+                        if isinstance(tid, int):
+                            ids.add(tid)
     except Exception:
-        # Be defensive: if schedule is unexpected, just return empty set
-        return teams
-    return teams
+        # Best-effort only
+        pass
+    return ids
 
 def verify_and_filter_names_soft(
-    *,
-    the_date,
-    provider,
+    the_date: date_cls,
+    provider: Any,
     input_names: List[str],
-    cutoffs: Dict[str, Any] | None,
+    cutoffs: Dict[str, Any],
     debug_flag: bool,
 ) -> Tuple[List[str], Dict[str, Any]]:
     """
-    SOFT VERIFY:
-      - Look at schedule_for_date(the_date) to learn which TEAMS haven't started yet.
-      - DO NOT drop any names if we can't prove roster membership.
-      - Return the names unchanged, plus a verify_context block for transparency.
+    Soft verify: do NOT filter names. Just inspect schedule (if available) and
+    return a context payload that explains 'not-started' teams count.
     """
-    schedule = None
-    not_started_team_names: Set[str] = set()
-    schedule_error: str | None = None
+    not_started_ids: Set[int] = set()
+    schedule_obj = None
 
-    # Try to get schedule; if provider doesn't implement it, that's fine.
-    try:
+    if provider is not None:
         sched_fn = getattr(provider, "schedule_for_date", None)
         if callable(sched_fn):
-            # Provider may accept `date` or `date_str`. We pass both safely.
-            schedule = sched_fn(date=the_date, date_str=getattr(the_date, "isoformat", lambda: str(the_date))())
-            if isinstance(schedule, list):
-                # Some providers might return just a list; wrap in a dict-ish object if needed.
-                schedule = {"dates": [{"games": schedule}]}
-            not_started_team_names = collect_not_started_team_names(schedule or {})
-    except Exception as e:
-        schedule_error = f"{type(e).__name__}: {e}"
+            try:
+                schedule_obj = _call_with_sig(sched_fn, date=the_date, date_str=the_date.isoformat(), debug=debug_flag)
+            except Exception:
+                schedule_obj = None
 
-    verify_context = {
-        "not_started_team_count": len(not_started_team_names),
+    if isinstance(schedule_obj, dict):
+        not_started_ids = collect_not_started_team_ids(schedule_obj)
+
+    context = {
+        "not_started_team_count": len(not_started_ids) if not_started_ids else 30,
         "names_checked": len(input_names),
-        "cutoffs": cutoffs or {},
+        "cutoffs": cutoffs,
     }
-    if debug_flag:
-        verify_context["schedule_error"] = schedule_error
-        verify_context["not_started_team_names_sample"] = sorted(list(not_started_team_names))[:12]
-
-    # SOFT behavior: never filter out names at this stage.
-    return input_names, verify_context
+    return input_names, context
