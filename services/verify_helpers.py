@@ -52,7 +52,7 @@ def verify_and_filter_names_soft(
     input_names: List[str],
     cutoffs: Dict[str, Any],
     debug_flag: bool,
-) -> Tuple[List[str], Dict[str, Any]]:
+):
     """
     Soft verify: do NOT filter names. Just inspect schedule (if available) and
     return a context payload that explains 'not-started' teams count.
