@@ -55,19 +55,17 @@ def _full_from_parts(first: str, last: str) -> str:
     l = _norm_name(last)
     return (f"{f} {l}").strip()
 
-# ---------- robust exact person lookup ----------
+# ---------- extract helpers ----------
 
 def _extract_people_list(obj: Any) -> List[Dict[str, Any]]:
     if not isinstance(obj, dict):
         return []
-    # common shapes: {"people":[...]} or {"results":[...]}
     ppl = obj.get("people")
     if isinstance(ppl, list):
         return ppl
     res = obj.get("results")
     if isinstance(res, list):
         return res
-    # sometimes nested
     qr = obj.get("queryResults") or {}
     row = qr.get("row")
     if isinstance(row, list):
@@ -79,7 +77,6 @@ def _extract_people_list(obj: Any) -> List[Dict[str, Any]]:
 def _pick_exact_person(query_name: str, people: List[Dict[str, Any]]) -> Optional[int]:
     qn = _norm_name(query_name)
     exacts: List[Tuple[int, bool, bool]] = []  # (pid, has_team, active)
-
     for c in people:
         pid = c.get("id") or (c.get("person") or {}).get("id")
         if not isinstance(pid, int):
@@ -103,14 +100,10 @@ def _pick_exact_person(query_name: str, people: List[Dict[str, Any]]) -> Optiona
 
     if not exacts:
         return None
-    # prefer currentTeam, then active
     exacts.sort(key=lambda t: (t[1], t[2]), reverse=True)
     return exacts[0][0]
 
 def _confirm_person_name(pid: int) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Returns (fullName, teamName) for pid, or (None, None) on failure.
-    """
     try:
         data = _http_get_json(f"{_STATSAPI_BASE}/api/v1/people/{pid}", {"hydrate": "currentTeam"})
         ppl = (data.get("people") or [])
@@ -124,10 +117,49 @@ def _confirm_person_name(pid: int) -> Tuple[Optional[str], Optional[str]]:
     except Exception:
         return None, None
 
-def _lookup_person(query_name: str) -> Tuple[Optional[int], Optional[str], Optional[str], Optional[str]]:
+# ---------- roster fallback (exact full-name on rosters) ----------
+
+def _teams_list() -> List[Dict[str, Any]]:
+    try:
+        data = _http_get_json(f"{_STATSAPI_BASE}/api/v1/teams", {"sportId": 1})
+        return data.get("teams") or []
+    except Exception:
+        return []
+
+def _roster_for_team(team_id: int, season: int, roster_type: str) -> List[Dict[str, Any]]:
+    # roster_type: "active" or "40Man"
+    try:
+        data = _http_get_json(
+            f"{_STATSAPI_BASE}/api/v1/teams/{team_id}/roster/{roster_type}",
+            {"season": season}
+        )
+        return data.get("roster") or []
+    except Exception:
+        return []
+
+def _find_on_rosters(query_name: str, season: int) -> Tuple[Optional[int], Optional[str], Optional[str]]:
+    qn = _norm_name(query_name)
+    for t in _teams_list():
+        tid = t.get("id")
+        tname = t.get("name") or ""
+        if not isinstance(tid, int):
+            continue
+        # Try Active first, then 40-Man
+        for rtype in ("active", "40Man"):
+            roster = _roster_for_team(tid, season, rtype)
+            for r in roster:
+                p = r.get("person") or {}
+                pid = p.get("id")
+                full = _norm_name(p.get("fullName") or "")
+                if isinstance(pid, int) and full and full == qn:
+                    return pid, p.get("fullName") or query_name, tname
+    return None, None, None
+
+# ---------- primary lookup ----------
+
+def _lookup_person(query_name: str, season_hint: int) -> Tuple[Optional[int], Optional[str], Optional[str], Optional[str]]:
     """
-    Try /people/search then /people?search. Enforce an exact-match rule by confirming
-    the returned pid's fullName matches the query (normalized).
+    Try people/search, then people?search; if no exact match, fallback to scanning rosters (Active -> 40-Man).
     Returns (pid, matched_full_name, team_name, error_msg)
     """
     q = query_name.strip()
@@ -157,6 +189,13 @@ def _lookup_person(query_name: str) -> Tuple[Optional[int], Optional[str], Optio
                 return pid, full, team or "", None
     except Exception:
         pass
+
+    # 3) roster fallback (strict full-name equality, but far more reliable)
+    pid, full, team = _find_on_rosters(q, season_hint)
+    if pid:
+        # still confirm (hydrates team reliably)
+        cfull, cteam = _confirm_person_name(pid)
+        return pid, (cfull or full or q), (cteam or team or ""), None
 
     return None, None, None, "player not found (no exact match)"
 
@@ -245,7 +284,11 @@ def cold_candidates(
     debug: int = Query(0, ge=0, le=1),
 ):
     """
-    Exact-match name lookup (no guessing). Completed games only up to 'date'.
+    Exact-match resolution:
+      1) /people/search
+      2) /people?search
+      3) fallback: scan MLB rosters (Active, then 40-Man) for exact fullName
+    Only completed games up to 'date' are used when computing hitless streaks.
     """
     the_date: date_cls = parse_date(date)
     season = the_date.year
@@ -278,7 +321,7 @@ def cold_candidates(
     debugs: List[Dict[str, Any]] = []
 
     for nm in filtered_names:
-        pid, matched_full, team_name, err = _lookup_person(nm)
+        pid, matched_full, team_name, err = _lookup_person(nm, season)
         if not pid:
             debugs.append({"name": nm, "error": err or "player not found"})
             continue
