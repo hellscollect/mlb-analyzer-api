@@ -1,6 +1,5 @@
 # routes/cold_candidates.py
-from fastapi import APIRouter, Query
-from fastapi import HTTPException
+from fastapi import APIRouter, Query, HTTPException
 from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime
 import unicodedata
@@ -11,20 +10,17 @@ router = APIRouter(prefix="", tags=["cold_candidates"])
 STATS_BASE = "https://statsapi.mlb.com/api/v1"
 
 def _strip_accents(s: str) -> str:
-    return "".join(
-        c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) != "Mn"
-    )
+    return "".join(c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) != "Mn")
 
 def _norm(s: str) -> str:
-    return _strip_accents(s or "").lower().strip()
+    return _strip_accents((s or "").lower().strip())
 
-def _today_str_yyyy_mm_dd() -> str:
-    # local NY time semantics live elsewhere; here we accept date from query
+def _today_str() -> str:
+    # keep simple; upstream date parsing handled elsewhere in app
     return datetime.utcnow().date().isoformat()
 
 def _is_not_started(status: Dict[str, Any]) -> bool:
-    # Treat Preview / Pre-Game / Warmup as "not started"
-    # From MLB schedule payload: abstractGameCode: "P" for not-started, "L" live, "F"/"O" finished
+    # Not started: abstractGameCode == "P" or detailedState in these values
     agc = (status or {}).get("abstractGameCode", "")
     detailed = (status or {}).get("detailedState", "")
     return agc == "P" or detailed in ("Preview", "Pre-Game", "Warmup")
@@ -35,78 +31,63 @@ async def _get_not_started_team_ids(client: httpx.AsyncClient, date_str: str) ->
     r.raise_for_status()
     data = r.json()
     team_ids: List[int] = []
-    debug = {"games": []}
+    dbg = {"games": []}
     for d in data.get("dates", []):
         for g in d.get("games", []):
             status = g.get("status", {})
+            dbg["games"].append({
+                "gamePk": g.get("gamePk"),
+                "abstractGameCode": status.get("abstractGameCode"),
+                "detailedState": status.get("detailedState"),
+            })
             if _is_not_started(status):
                 away = g.get("teams", {}).get("away", {}).get("team", {})
                 home = g.get("teams", {}).get("home", {}).get("team", {})
-                aid = away.get("id")
-                hid = home.get("id")
-                if isinstance(aid, int):
-                    team_ids.append(aid)
-                if isinstance(hid, int):
-                    team_ids.append(hid)
-            debug["games"].append({
-                "gamePk": g.get("gamePk"),
-                "status": status.get("detailedState"),
-                "abstractGameCode": status.get("abstractGameCode"),
-            })
-    team_ids = sorted(set(team_ids))
-    return team_ids, debug
+                if isinstance(away.get("id"), int):
+                    team_ids.append(away["id"])
+                if isinstance(home.get("id"), int):
+                    team_ids.append(home["id"])
+    return sorted(set(team_ids)), dbg
 
-async def _people_search(client: httpx.AsyncClient, name: str) -> List[Dict[str, Any]]:
-    """
-    Robust search: try full name; if empty, try last-name-only and filter.
-    """
-    name = (name or "").strip()
-    if not name:
-        return []
-    # 1) direct
-    r = await client.get(f"{STATS_BASE}/people", params={"search": name}, timeout=15)
-    if r.status_code == 400:
-        # retry with ascii
-        r = await client.get(f"{STATS_BASE}/people", params={"search": _strip_accents(name)}, timeout=15)
+async def _fetch_active_roster(client: httpx.AsyncClient, team_id: int, season: int) -> Dict[str, Any]:
+    # Active roster endpoint
+    params = {"season": season}
+    r = await client.get(f"{STATS_BASE}/teams/{team_id}/roster/Active", params=params, timeout=15)
     r.raise_for_status()
-    data = r.json() if r.content else {}
-    people = data.get("people", []) or []
+    return r.json()
 
-    if people:
-        return people
-
-    # 2) last-name fallback
-    parts = [p for p in name.split() if p]
-    if len(parts) >= 2:
-        last = parts[-1]
-        r2 = await client.get(f"{STATS_BASE}/people", params={"search": last}, timeout=15)
-        if r2.status_code == 400:
-            r2 = await client.get(f"{STATS_BASE}/people", params={"search": _strip_accents(last)}, timeout=15)
-        r2.raise_for_status()
-        d2 = r2.json() if r2.content else {}
-        cand = d2.get("people", []) or []
-        if cand:
-            # prefer exact-ish last-name matches and same first initial
-            first_initial = _norm(parts[0])[:1]
-            last_norm = _norm(last)
-            filtered = []
-            for p in cand:
-                full = _norm(p.get("fullName", ""))
-                tokens = [t for t in full.split() if t]
-                if not tokens:
-                    continue
-                last_tok = tokens[-1]
-                fi = tokens[0][:1] if tokens else ""
-                if last_tok == last_norm and (not first_initial or fi == first_initial):
-                    filtered.append(p)
-            if filtered:
-                return filtered
-            return cand  # fall back to any last-name match
-    return []
+async def _build_roster_index(client: httpx.AsyncClient, team_ids: List[int], season: int) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, List[Dict[str, Any]]]]:
+    """
+    Return:
+      by_full_name_norm: fullName_norm -> player dict {id, fullName, teamId, teamName}
+      by_last_name_norm: lastName_norm -> [player dicts ...]
+    """
+    by_full: Dict[str, Dict[str, Any]] = {}
+    by_last: Dict[str, List[Dict[str, Any]]] = {}
+    for tid in team_ids:
+        try:
+            data = await _fetch_active_roster(client, tid, season)
+        except httpx.HTTPError:
+            continue
+        roster = data.get("roster") or []
+        team_name = (data.get("teamName") or "") or (data.get("teams", [{}])[0].get("name") if data.get("teams") else "")
+        for row in roster:
+            person = row.get("person") or {}
+            pid = person.get("id")
+            full = person.get("fullName") or ""
+            if not isinstance(pid, int) or not full:
+                continue
+            entry = {"id": pid, "fullName": full, "teamId": tid, "teamName": team_name}
+            by_full[_norm(full)] = entry
+            parts = [p for p in full.split() if p]
+            if parts:
+                last_norm = _norm(parts[-1])
+                by_last.setdefault(last_norm, []).append(entry)
+    return by_full, by_last
 
 async def _season_avg(client: httpx.AsyncClient, person_id: int, season: int) -> Optional[float]:
-    q = {"stats": "season", "group": "hitting", "season": season}
-    r = await client.get(f"{STATS_BASE}/people/{person_id}/stats", params=q, timeout=15)
+    params = {"stats": "season", "group": "hitting", "season": season}
+    r = await client.get(f"{STATS_BASE}/people/{person_id}/stats", params=params, timeout=15)
     r.raise_for_status()
     data = r.json()
     for s in (data.get("stats") or []):
@@ -121,18 +102,14 @@ async def _season_avg(client: httpx.AsyncClient, person_id: int, season: int) ->
     return None
 
 async def _hitless_streak(client: httpx.AsyncClient, person_id: int, season: int, last_n: int) -> int:
-    """
-    Count **consecutive** games (most recent backwards) with AB>0 and H==0.
-    """
-    q = {"stats": "gameLog", "group": "hitting", "season": season}
-    r = await client.get(f"{STATS_BASE}/people/{person_id}/stats", params=q, timeout=15)
+    params = {"stats": "gameLog", "group": "hitting", "season": season}
+    r = await client.get(f"{STATS_BASE}/people/{person_id}/stats", params=params, timeout=15)
     r.raise_for_status()
     data = r.json()
     splits = []
     for s in (data.get("stats") or []):
         splits.extend(s.get("splits") or [])
-    # Ensure most-recent first: game logs usually are newest first, but be safe:
-    # Each split may have "date" YYYY-MM-DD
+    # Ensure newest first by date
     splits.sort(key=lambda x: x.get("date", ""), reverse=True)
 
     streak = 0
@@ -140,15 +117,14 @@ async def _hitless_streak(client: httpx.AsyncClient, person_id: int, season: int
     for sp in splits:
         if checked >= max(last_n, 1):
             break
-        stat = sp.get("stat", {})
+        stat = sp.get("stat", {}) or {}
         try:
             ab = int(stat.get("atBats") or 0)
             hits = int(stat.get("hits") or 0)
         except Exception:
-            ab = 0
-            hits = 0
+            ab, hits = 0, 0
         if ab <= 0:
-            # skip games without an AB for streak purposes
+            # skip games without AB for streak purposes
             continue
         checked += 1
         if hits == 0:
@@ -169,96 +145,89 @@ async def cold_candidates(
     debug: int = Query(0, ge=0, le=1),
 ):
     """
-    Logic:
-      1) Get NOT-STARTED team IDs for the given date.
-      2) Resolve each provided name -> player(s) (robust search).
-      3) Keep only players whose currentTeam.id is in NOT-STARTED set.
-      4) Compute season AVG and hitless STREAK(last_n).
-      5) Filter by min_season_avg & min_hitless_games.
+    Resolution flow (no /people?search):
+      1) Find today's NOT-STARTED team IDs.
+      2) Build an index of active rosters for those teams.
+      3) Resolve each requested name by full match; else last-name (+first initial) within those rosters.
+      4) For resolved players, fetch season AVG and consecutive hitless streak (last_n).
+      5) Apply min_season_avg AND min_hitless_games filters.
     """
-    # Resolve 'date'
-    when = (date or "today").lower().strip()
-    if when in ("today", ""):
-        date_str = _today_str_yyyy_mm_dd()
-    else:
-        date_str = when
+    when = (date or "today").strip().lower()
+    date_str = _today_str() if when in ("", "today") else when
+    season = int(date_str.split("-")[0])
 
+    if not names:
+        return {"date": date_str, "season": season, "items": [], "debug": [{"note": "no names provided"}]}
+
+    raw_names = [n.strip() for n in names.split(",") if n.strip()]
     items: List[Dict[str, Any]] = []
     dbg: List[Dict[str, Any]] = []
 
-    if not names:
-        return {"date": date_str, "season": int(date_str.split("-")[0]), "items": [], "debug": [{"note": "no names provided"}]}
-
-    # Collect not-started teams
     async with httpx.AsyncClient() as client:
         try:
             not_started_team_ids, sched_dbg = await _get_not_started_team_ids(client, date_str)
         except httpx.HTTPError as e:
             raise HTTPException(status_code=502, detail=f"schedule fetch failed: {type(e).__name__}: {e}") from e
 
-        season = int(date_str.split("-")[0])
-        # Process each name
-        raw_names = [n.strip() for n in names.split(",") if n.strip()]
+        if not not_started_team_ids:
+            # nothing left today that hasn't started
+            return {"date": date_str, "season": season, "items": [], "debug": [{"note": "no not-started teams today"}]}
+
+        by_full, by_last = await _build_roster_index(client, not_started_team_ids, season)
+
         for name in raw_names:
+            nn = _norm(name)
+            candidate = by_full.get(nn)
+            if not candidate:
+                parts = [p for p in name.split() if p]
+                last = _norm(parts[-1]) if parts else ""
+                pool = by_last.get(last, [])
+                if pool:
+                    if len(parts) >= 1:
+                        first_initial = _norm(parts[0])[:1]
+                        narrowed = [p for p in pool if _norm(p["fullName"])[:1] == first_initial]
+                        candidate = (narrowed or pool)[0]
+                    else:
+                        candidate = pool[0]
+
+            if not candidate:
+                dbg.append({"name": name, "skip": "not on any active roster of a not-started team today"})
+                continue
+
+            pid = candidate["id"]
+            team_name = candidate["teamName"] or ""
             try:
-                people = await _people_search(client, name)
+                avg = await _season_avg(client, pid, season)
             except httpx.HTTPError as e:
-                dbg.append({"name": name, "error": f"HTTPError: {e}"})
+                dbg.append({"name": name, "team": team_name, "error": f"HTTPError fetching season stats: {e}"})
                 continue
-
-            if not people:
-                dbg.append({"name": name, "error": "not found in people search"})
-                continue
-
-            # choose the best candidate: prefer exact (accents-insensitive) full match if available
-            target = None
-            name_norm = _norm(name)
-            for p in people:
-                if _norm(p.get("fullName", "")) == name_norm:
-                    target = p
-                    break
-            if target is None:
-                target = people[0]
-
-            pid = target.get("id")
-            cteam = (target.get("currentTeam") or {}).get("id")
-            cteam_name = (target.get("currentTeam") or {}).get("name") or ""
-
-            if not isinstance(pid, int):
-                dbg.append({"name": name, "error": "bad/unknown player id"})
-                continue
-
-            if not isinstance(cteam, int):
-                dbg.append({"name": name, "skip": "no current team on record"})
-                continue
-
-            if cteam not in not_started_team_ids:
-                dbg.append({"name": name, "skip": "no not-started game today (not found on any active roster of a not-started team)"})
-                continue
-
-            # stats
-            avg = await _season_avg(client, pid, season)
             if avg is None:
-                dbg.append({"name": name, "team": cteam_name, "skip": "no season avg"})
+                dbg.append({"name": name, "team": team_name, "skip": "no season avg"})
                 continue
 
-            streak = await _hitless_streak(client, pid, season, last_n)
-            # Filter per thresholds
+            try:
+                streak = await _hitless_streak(client, pid, season, last_n)
+            except httpx.HTTPError as e:
+                dbg.append({"name": name, "team": team_name, "error": f"HTTPError fetching game logs: {e}"})
+                continue
+
+            # thresholds
             if avg < min_season_avg:
-                dbg.append({"name": name, "team": cteam_name, "skip": f"season_avg {avg:.3f} < min {min_season_avg:.3f}"})
+                dbg.append({"name": candidate["fullName"], "team": team_name, "skip": f"season_avg {avg:.3f} < min {min_season_avg:.3f}"})
                 continue
             if streak < min_hitless_games:
-                dbg.append({"name": name, "team": cteam_name, "skip": f"hitless_streak {streak} < min {min_hitless_games}"})
+                dbg.append({"name": candidate["fullName"], "team": team_name, "skip": f"hitless_streak {streak} < min {min_hitless_games}"})
                 continue
 
             items.append({
-                "name": target.get("fullName") or name,
-                "team": cteam_name,
+                "name": candidate["fullName"],
+                "team": team_name,
                 "season_avg": round(avg, 3),
                 "hitless_streak": streak,
             })
 
-    # enforce limit
     items = items[:limit]
-    out = {"date": date_str, "season": season, "items": items, "debug": dbg if debug or verify else []}
+    out = {"date": date_str, "season": season, "items": items}
+    if debug or verify:
+        out["debug"] = dbg
     return out
