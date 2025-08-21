@@ -143,18 +143,20 @@ def cold_candidates(
     date: str = Query("today", description="YYYY-MM-DD or 'today' (US/Eastern)"),
     season: int = Query(2025, ge=1900, le=2100),
     names: Optional[str] = Query(None, description="Optional comma-separated player names. If omitted, scans league rosters."),
-    min_season_avg: float = Query(0.26, ge=0.0, le=1.0, description="Only include hitters with season AVG >= this."),
-    min_hitless_games: int = Query(1, ge=1, description="Current hitless streak (AB>0) must be at least this."),
+    min_season_avg: float = Query(0.26, ge=0.0, le=1.0, description="Only include hitters with season AVG ≥ this (default .260)."),
+    min_hitless_games: int = Query(1, ge=1, description="Current hitless streak (AB>0) must be ≥ this."),
     limit: int = Query(30, ge=1, le=1000),
     verify: int = Query(1, ge=0, le=1, description="1 = only include players on teams that have NOT started yet today."),
+    # Back-compat: accept but ignore last_n so older GPT calls don't break.
+    last_n: Optional[int] = Query(None, description="Ignored. Accepted for backward compatibility."),
     debug: int = Query(0, ge=0, le=1),
 ):
     """
-    Produces: players with season AVG >= min_season_avg AND a current hitless streak >= min_hitless_games.
-    - Streak counts consecutive most-recent games with AB>0 and 0 hits; skips DNP/0-AB games.
-    - If names omitted, scans today's scheduled teams (fallback: all MLB).
+    Returns players with season AVG ≥ min_season_avg AND a current hitless streak ≥ min_hitless_games.
+    - Streak counts consecutive most-recent games with AB>0 and 0 hits; skips DNP/0-AB games entirely.
+    - If names omitted, scans today's scheduled teams' active rosters (fallback: all MLB teams).
     - If verify=1, keeps only players on not-started teams (status P/S).
-    Response fields: { "date": "...", "candidates": [...], "debug": [...]? }
+    Response: { "date": "...", "candidates": [...], "debug": [...]? }
     """
     date_str = _eastern_today_str() if _normalize(date) == "today" else date
 
@@ -229,14 +231,10 @@ def cold_candidates(
                 if debug_list is not None:
                     debug_list.append({"name": name, "error": f"{type(e).__name__}: {e}"})
 
-        # Sort: season_avg DESC, then hitless_streak DESC
+        # Sort primary: season_avg DESC; tiebreaker: hitless_streak DESC
         candidates.sort(key=lambda x: (x.get("season_avg", 0.0), x.get("hitless_streak", 0)), reverse=True)
 
-        # STRICT schema: only date, candidates, (debug?)
-        resp: Dict = {
-            "date": date_str,
-            "candidates": candidates[:limit],
-        }
+        resp: Dict = {"date": date_str, "candidates": candidates[:limit]}
         if debug_list is not None:
             resp["debug"] = debug_list
         return resp
