@@ -25,18 +25,15 @@ def _fetch_json(client: httpx.Client, url: str, params: Optional[Dict] = None) -
     return r.json()
 
 def _parse_dt(maybe: Optional[str]) -> Optional[datetime]:
-    """Parse MLB date strings robustly; return timezone-aware UTC if possible."""
     if not maybe:
         return None
     s = str(maybe)
-    # Primary: MLB gameDate is ISO like "2025-08-21T23:10:00Z"
     try:
         if s.endswith("Z"):
             return datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone(timezone.utc)
         return datetime.fromisoformat(s).astimezone(timezone.utc)
     except Exception:
         pass
-    # Fallbacks
     for fmt in ("%Y-%m-%d", "%m/%d/%Y"):
         try:
             return datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
@@ -49,11 +46,14 @@ def _schedule_for_date(client: httpx.Client, date_str: str) -> Dict:
     return _fetch_json(client, f"{MLB_BASE}/schedule", params={"sportId": 1, "date": date_str})
 
 def _not_started_team_ids_for_date(schedule_json: Dict) -> set[int]:
+    """
+    P = Preview, S = Scheduled (not started yet). Anything else = already started/finished.
+    """
     ns_ids: set[int] = set()
     for d in schedule_json.get("dates", []):
         for g in d.get("games", []):
             code = (g.get("status", {}) or {}).get("statusCode", "")
-            if code in ("P", "S"):  # Preview / Scheduled (not started)
+            if code in ("P", "S"):
                 try:
                     ns_ids.add(int(g["teams"]["home"]["team"]["id"]))
                     ns_ids.add(int(g["teams"]["away"]["team"]["id"]))
@@ -134,8 +134,8 @@ def _season_avg_from_people(people_entry: Dict) -> Optional[float]:
 
 def _game_log_newest_first_regular_season(client: httpx.Client, pid: int, season: int, max_entries: int = 120) -> List[Dict]:
     """
-    Fetch hitting game logs and return REGULAR SEASON games only, newest first,
-    sorted by parsed 'gameDate' (fallback to 'date').
+    Fetch hitting game logs (group=hitting, stats=gameLog) and return REGULAR SEASON ('R') only,
+    newest first by parsed 'gameDate' (fallback 'date'); ties broken by gamePk.
     """
     data = _fetch_json(
         client,
@@ -144,7 +144,6 @@ def _game_log_newest_first_regular_season(client: httpx.Client, pid: int, season
     )
     splits = ((data.get("stats") or [{}])[0].get("splits")) or []
 
-    # Filter to regular season when we can detect it
     filtered: List[Dict] = []
     for s in splits:
         gt = s.get("gameType")
@@ -154,9 +153,7 @@ def _game_log_newest_first_regular_season(client: httpx.Client, pid: int, season
 
     def sort_key(s: Dict[str, Any]) -> tuple:
         dt = _parse_dt(s.get("gameDate") or s.get("date"))
-        # Use negative timestamp for descending; None should be very old
         ts = dt.timestamp() if dt else -1.0
-        # GamePk as tie-breaker (higher = newer in practice)
         pk = s.get("game", {}).get("gamePk") or s.get("gamePk") or 0
         try:
             pk = int(pk)
@@ -167,26 +164,17 @@ def _game_log_newest_first_regular_season(client: httpx.Client, pid: int, season
     filtered.sort(key=sort_key, reverse=True)
     return filtered[:max_entries]
 
-def _current_hitless_streak_ab_gt0(game_splits: List[Dict], debug_capture: Optional[List[Dict]] = None) -> int:
+def _current_hitless_streak_ab_gt0(game_splits: List[Dict]) -> int:
     """
     Count consecutive MOST-RECENT games with AB>0 and H==0; skip 0-AB/DNP entirely.
-    If debug_capture is provided, append the first 3 AB>0 games encountered with (date, ab, hits).
     """
     streak = 0
-    captured = 0
     for s in game_splits:
         stat = s.get("stat") or {}
         ab = int(stat.get("atBats") or 0)
         if ab <= 0:
             continue
         hits = int(stat.get("hits") or 0)
-        if debug_capture is not None and captured < 3:
-            debug_capture.append({
-                "date": s.get("gameDate") or s.get("date"),
-                "ab": ab,
-                "hits": hits
-            })
-            captured += 1
         if hits == 0:
             streak += 1
         else:
@@ -202,7 +190,7 @@ def cold_candidates(
     min_season_avg: float = Query(0.26, ge=0.0, le=1.0, description="Only include hitters with season AVG ≥ this (default .260)."),
     min_hitless_games: int = Query(1, ge=1, description="Current hitless streak (AB>0) must be ≥ this."),
     limit: int = Query(30, ge=1, le=1000),
-    verify: int = Query(1, ge=0, le=1, description="1 = only include players on teams that have NOT started yet today. If empty after filter, we auto-fallback to include all teams."),
+    verify: int = Query(1, ge=0, le=1, description="1 = STRICT pregame only (teams not started yet). 0 = include all teams."),
     # Back-compat: accept but ignore last_n so older Action calls don't break.
     last_n: Optional[int] = Query(None, description="Ignored. Accepted for backward compatibility."),
     debug: int = Query(0, ge=0, le=1),
@@ -210,10 +198,9 @@ def cold_candidates(
     """
     Returns players with season AVG ≥ min_season_avg AND a current hitless streak ≥ min_hitless_games.
     - Streak = consecutive most-recent AB>0 games with 0 hits (DNP/0-AB ignored).
-    - Uses robust 'gameDate' ordering and filters to regular season games (gameType 'R' when present).
+    - Robust 'gameDate' ordering; regular season games only (when gameType present).
     - If names omitted, scans today's scheduled teams (fallback: all MLB).
-    - If verify=1, tries pregame-only; if that yields empty, auto-fallback to all teams.
-    Response: { "date": "...", "candidates": [...], "debug": [...]? }
+    - verify=1 is STRICT: only players on teams with status P/S (not started) are considered; no fallback.
     """
     date_str = _eastern_today_str() if _normalize(date) == "today" else date
 
@@ -251,7 +238,6 @@ def cold_candidates(
                 team_id = team_info.get("id")
                 team_name = (team_info.get("name") or "").strip()
 
-                # Season AVG gate
                 season_avg = _season_avg_from_people(person)
                 if season_avg is None or season_avg < min_season_avg:
                     if debug_list is not None:
@@ -260,74 +246,42 @@ def cold_candidates(
                     continue
 
                 # Current hitless streak (AB>0 only), using robust-ordered regular-season logs
-                last_ab_samples: List[Dict] = [] if debug else None  # type: ignore
                 logs = _game_log_newest_first_regular_season(client, pid, season, max_entries=120)
-                streak = _current_hitless_streak_ab_gt0(logs, debug_capture=last_ab_samples)
-
+                streak = _current_hitless_streak_ab_gt0(logs)
                 if streak < min_hitless_games:
                     if debug_list is not None:
-                        dbg = {"name": full, "team": team_name, "skip": f"hitless_streak {streak} < {min_hitless_games}"}
-                        if last_ab_samples:
-                            dbg["last_ab_samples"] = last_ab_samples
-                        debug_list.append(dbg)
+                        debug_list.append({"name": full, "team": team_name, "skip": f"hitless_streak {streak} < {min_hitless_games}"})
                     continue
 
-                cand = {
+                # If verify=1 (STRICT), exclude teams that have already started or finished
+                if verify:
+                    try:
+                        tid = int(team_id) if team_id is not None else None
+                    except Exception:
+                        tid = None
+                    if (tid is None) or (tid not in ns_team_ids):
+                        if debug_list is not None:
+                            debug_list.append({"name": full, "team": team_name, "skip": "verify(strict): team already started/finished or unknown"})
+                        continue
+
+                pre_candidates.append({
                     "name": full,
                     "team": team_name,
                     "season_avg": round(season_avg, 3),
                     "hitless_streak": streak,
-                    "_team_id": team_id,
-                }
-                if debug_list is not None and last_ab_samples:
-                    cand["_last_ab_samples"] = last_ab_samples  # candidate-level audit
+                })
 
-                pre_candidates.append(cand)
-
-                if len(pre_candidates) >= max(limit * 3, 60):  # reasonable cap during scans
+                if len(pre_candidates) >= max(limit * 3, 60):  # reasonable cap
                     break
 
             except Exception as e:
                 if debug_list is not None:
                     debug_list.append({"name": name, "error": f"{type(e).__name__}: {e}"})
 
-        # Apply verify filter if requested (pregame), with auto-fallback if empty
-        def _filter_by_pregame(cands: List[Dict]) -> List[Dict]:
-            out: List[Dict] = []
-            for it in cands:
-                tid = it.get("_team_id")
-                try:
-                    tid_int = int(tid) if tid is not None else None
-                except Exception:
-                    tid_int = None
-                if (tid_int is not None) and (tid_int in ns_team_ids):
-                    out.append(it)
-            return out
+        # Sort & limit
+        pre_candidates.sort(key=lambda x: (x.get("season_avg", 0.0), x.get("hitless_streak", 0)), reverse=True)
+        candidates = pre_candidates[:limit]
 
-        candidates = list(pre_candidates)
-        if verify:
-            filtered = _filter_by_pregame(pre_candidates)
-            if filtered:
-                candidates = filtered
-            else:
-                # auto-fallback
-                if debug_list is not None:
-                    reason = "no candidates after pregame filter" if ns_team_ids else "no not-started teams"
-                    debug_list.append({"note": f"verify auto-fallback to include all teams ({reason})"})
-                candidates = pre_candidates
-
-        # Strip internals
-        for it in candidates:
-            it.pop("_team_id", None)
-            it.pop("_last_ab_samples", None)  # keep debug list only in debug section
-
-        # Sort: season_avg DESC, then hitless_streak DESC
-        candidates.sort(key=lambda x: (x.get("season_avg", 0.0), x.get("hitless_streak", 0)), reverse=True)
-
-        # Limit
-        candidates = candidates[:limit]
-
-        # Response
         resp: Dict = {"date": date_str, "candidates": candidates}
         if debug_list is not None:
             resp["debug"] = debug_list
