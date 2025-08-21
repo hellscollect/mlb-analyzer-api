@@ -123,7 +123,7 @@ def _game_log_newest_first(client: httpx.Client, pid: int, season: int, max_entr
     return splits[:max_entries]
 
 def _current_hitless_streak_ab_gt0(game_splits: List[Dict]) -> int:
-    # Count consecutive MOST-RECENT games with AB>0 and H==0; skip 0-AB games.
+    # Count consecutive MOST-RECENT games with AB>0 and H==0; skip 0-AB/DNP games.
     streak = 0
     for s in game_splits:
         stat = s.get("stat") or {}
@@ -147,14 +147,14 @@ def cold_candidates(
     min_hitless_games: int = Query(1, ge=1, description="Current hitless streak (AB>0) must be ≥ this."),
     limit: int = Query(30, ge=1, le=1000),
     verify: int = Query(1, ge=0, le=1, description="1 = only include players on teams that have NOT started yet today."),
-    # Back-compat: accept but ignore last_n so older GPT calls don't break.
+    # Back-compat: accept but ignore last_n so older Action calls don't break.
     last_n: Optional[int] = Query(None, description="Ignored. Accepted for backward compatibility."),
     debug: int = Query(0, ge=0, le=1),
 ):
     """
     Returns players with season AVG ≥ min_season_avg AND a current hitless streak ≥ min_hitless_games.
-    - Streak counts consecutive most-recent games with AB>0 and 0 hits; skips DNP/0-AB games entirely.
-    - If names omitted, scans today's scheduled teams' active rosters (fallback: all MLB teams).
+    - Streak counts consecutive most-recent games with AB>0 and 0 hits; DNP/0-AB ignored.
+    - If names omitted, scans today's scheduled teams' active rosters (fallback: all MLB).
     - If verify=1, keeps only players on not-started teams (status P/S).
     Response: { "date": "...", "candidates": [...], "debug": [...]? }
     """
