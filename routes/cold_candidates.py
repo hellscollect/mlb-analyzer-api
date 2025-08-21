@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Query
 from typing import Dict, List, Optional, Iterable, Any
-from datetime import datetime, timezone
+from datetime import datetime, date as date_cls, timezone, timedelta
 import unicodedata
 import httpx
 import pytz
@@ -12,9 +12,16 @@ router = APIRouter()
 MLB_BASE = "https://statsapi.mlb.com/api/v1"
 
 # ---------- time & utils ----------
+_EASTERN = pytz.timezone("US/Eastern")
+
 def _eastern_today_str() -> str:
-    tz = pytz.timezone("US/Eastern")
-    return datetime.now(tz).date().isoformat()
+    return datetime.now(_EASTERN).date().isoformat()
+
+def _parse_ymd(s: str) -> date_cls:
+    return datetime.strptime(s, "%Y-%m-%d").date()
+
+def _next_ymd_str(s: str) -> str:
+    return (_parse_ymd(s) + timedelta(days=1)).isoformat()
 
 def _normalize(s: str) -> str:
     return unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii").lower().strip()
@@ -88,7 +95,7 @@ def _team_active_roster_people(client: httpx.Client, team_id: int, season: int) 
     return data.get("roster", []) or []
 
 def _iter_league_player_names_for_scan(client: httpx.Client, season: int, date_str: str) -> Iterable[str]:
-    # Prefer today's scheduled teams; fallback to all teams if schedule missing.
+    # Prefer scheduled teams for the effective slate date; fallback to all teams.
     sched = _schedule_for_date(client, date_str)
     team_ids = _team_ids_from_schedule(sched) or _all_mlb_team_ids(client, season)
     for tid in team_ids:
@@ -134,8 +141,7 @@ def _season_avg_from_people(people_entry: Dict) -> Optional[float]:
 
 def _game_log_newest_first_regular_season(client: httpx.Client, pid: int, season: int, max_entries: int = 120) -> List[Dict]:
     """
-    Fetch hitting game logs (group=hitting, stats=gameLog) and return REGULAR SEASON ('R') only,
-    newest first by parsed 'gameDate' (fallback 'date'); ties broken by gamePk.
+    Fetch hitting game logs and return REGULAR SEASON ('R') only, newest first by parsed gameDate (fallback date).
     """
     data = _fetch_json(
         client,
@@ -190,7 +196,8 @@ def cold_candidates(
     min_season_avg: float = Query(0.26, ge=0.0, le=1.0, description="Only include hitters with season AVG ≥ this (default .260)."),
     min_hitless_games: int = Query(1, ge=1, description="Current hitless streak (AB>0) must be ≥ this."),
     limit: int = Query(30, ge=1, le=1000),
-    verify: int = Query(1, ge=0, le=1, description="1 = STRICT pregame only (teams not started yet). 0 = include all teams."),
+    verify: int = Query(1, ge=0, le=1, description="1 = STRICT pregame only for the slate date (teams not started yet). 0 = include all teams."),
+    roll_to_next_slate_if_empty: int = Query(1, ge=0, le=1, description="If verify=1 and there are no pregame teams or no candidates, roll to the NEXT day's slate pregame and rerun."),
     # Back-compat: accept but ignore last_n so older Action calls don't break.
     last_n: Optional[int] = Query(None, description="Ignored. Accepted for backward compatibility."),
     debug: int = Query(0, ge=0, le=1),
@@ -198,21 +205,31 @@ def cold_candidates(
     """
     Returns players with season AVG ≥ min_season_avg AND a current hitless streak ≥ min_hitless_games.
     - Streak = consecutive most-recent AB>0 games with 0 hits (DNP/0-AB ignored).
-    - Robust 'gameDate' ordering; regular season games only (when gameType present).
-    - If names omitted, scans today's scheduled teams (fallback: all MLB).
-    - verify=1 is STRICT: only players on teams with status P/S (not started) are considered; no fallback.
+    - Regular-season logs only (when tagged), robust ordering by gameDate.
+    - If verify=1 and pregame set is empty, optionally roll to the NEXT day's slate (strict pregame) when roll_to_next_slate_if_empty=1.
+    Response: { "date": "<effective_slate_date>", "candidates": [...], "debug": [...]? }
     """
-    date_str = _eastern_today_str() if _normalize(date) == "today" else date
-
+    requested_date = _eastern_today_str() if _normalize(date) == "today" else date
+    effective_date = requested_date
     with httpx.Client(timeout=25) as client:
-        sched = _schedule_for_date(client, date_str)
-        ns_team_ids = _not_started_team_ids_for_date(sched) if (verify or debug) else set()
+        # 1) Compute slate and pregame set for requested date
+        sched = _schedule_for_date(client, effective_date)
+        ns_team_ids = _not_started_team_ids_for_date(sched) if verify else set()
 
-        # Build scan list
+        # 2) If strict pregame requested and it's empty, optionally roll to next day
+        rolled = False
+        if verify and roll_to_next_slate_if_empty:
+            if not ns_team_ids:
+                effective_date = _next_ymd_str(effective_date)
+                sched = _schedule_for_date(client, effective_date)
+                ns_team_ids = _not_started_team_ids_for_date(sched)
+                rolled = True
+
+        # 3) Build scan list from the EFFECTIVE slate date
         if names:
             requested = [n.strip() for n in names.split(",") if n.strip()]
         else:
-            requested = list(_iter_league_player_names_for_scan(client, season, date_str))
+            requested = list(_iter_league_player_names_for_scan(client, season, effective_date))
 
         pre_candidates: List[Dict] = []
         debug_list: Optional[List[Dict]] = [] if debug else None
@@ -245,7 +262,7 @@ def cold_candidates(
                         debug_list.append({"name": full, "team": team_name, "skip": reason})
                     continue
 
-                # Current hitless streak (AB>0 only), using robust-ordered regular-season logs
+                # Compute current streak across AB>0-only, regular-season logs
                 logs = _game_log_newest_first_regular_season(client, pid, season, max_entries=120)
                 streak = _current_hitless_streak_ab_gt0(logs)
                 if streak < min_hitless_games:
@@ -253,7 +270,7 @@ def cold_candidates(
                         debug_list.append({"name": full, "team": team_name, "skip": f"hitless_streak {streak} < {min_hitless_games}"})
                     continue
 
-                # If verify=1 (STRICT), exclude teams that have already started or finished
+                # Strict pregame filter for EFFECTIVE slate date
                 if verify:
                     try:
                         tid = int(team_id) if team_id is not None else None
@@ -261,7 +278,7 @@ def cold_candidates(
                         tid = None
                     if (tid is None) or (tid not in ns_team_ids):
                         if debug_list is not None:
-                            debug_list.append({"name": full, "team": team_name, "skip": "verify(strict): team already started/finished or unknown"})
+                            debug_list.append({"name": full, "team": team_name, "skip": "verify(strict): team not in pregame set for slate date"})
                         continue
 
                 pre_candidates.append({
@@ -271,7 +288,7 @@ def cold_candidates(
                     "hitless_streak": streak,
                 })
 
-                if len(pre_candidates) >= max(limit * 3, 60):  # reasonable cap
+                if len(pre_candidates) >= max(limit * 3, 60):
                     break
 
             except Exception as e:
@@ -282,7 +299,13 @@ def cold_candidates(
         pre_candidates.sort(key=lambda x: (x.get("season_avg", 0.0), x.get("hitless_streak", 0)), reverse=True)
         candidates = pre_candidates[:limit]
 
-        resp: Dict = {"date": date_str, "candidates": candidates}
+        # Response (report the EFFECTIVE slate date)
+        resp: Dict = {"date": effective_date, "candidates": candidates}
         if debug_list is not None:
+            dbg_note = {"requested_date": requested_date, "effective_date": effective_date}
+            if verify:
+                dbg_note["pregame_team_count"] = len(ns_team_ids)
+                dbg_note["rolled_to_next_slate"] = bool(rolled)
+            debug_list.insert(0, dbg_note)
             resp["debug"] = debug_list
         return resp
