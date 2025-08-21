@@ -126,7 +126,7 @@ def _season_avg_from_people(people_entry: Dict) -> Optional[float]:
 
 def _game_log_newest_first(client: httpx.Client, pid: int, season: int, last_n_cap: int = 60) -> List[Dict]:
     """
-    Return hitting game logs (newest first). We fetch full season log (MLB caps it)
+    Return hitting game logs (newest first). We fetch full season log (MLB caps it),
     then sort and take at most last_n_cap entries as a sanity ceiling.
     """
     data = _fetch_json(
@@ -136,7 +136,7 @@ def _game_log_newest_first(client: httpx.Client, pid: int, season: int, last_n_c
     )
     splits = ((data.get("stats") or [{}])[0].get("splits")) or []
     splits.sort(key=lambda s: s.get("date", s.get("gameDate", "")), reverse=True)
-    return splits[:last_n_cap]  # high cap to keep requests reasonable
+    return splits[:last_n_cap]
 
 def _current_hitless_streak_AB_gt0(game_splits: List[Dict]) -> int:
     """
@@ -192,7 +192,7 @@ def cold_candidates(
             requested_names = list(_iter_league_player_names_for_scan(client, season, date_str))
             name_source = "league-scan"
 
-        items: List[Dict] = []
+        candidates: List[Dict] = []
         debug_list: Optional[List[Dict]] = [] if debug else None
         seen: set[str] = set()
 
@@ -244,14 +244,14 @@ def cold_candidates(
                             debug_list.append({"name": full, "team": team_name, "skip": "verify: team already started or unknown"})
                         continue
 
-                items.append({
+                candidates.append({
                     "name": full,
                     "team": team_name,
                     "season_avg": round(season_avg, 3),
                     "hitless_streak": streak,
                 })
 
-                if len(items) >= limit:
+                if len(candidates) >= limit:
                     break
 
             except Exception as e:
@@ -259,12 +259,12 @@ def cold_candidates(
                     debug_list.append({"name": name, "error": f"{type(e).__name__}: {e}"})
 
         # sort: season_avg DESC, tie-break by hitless_streak DESC
-        items.sort(key=lambda x: (x.get("season_avg", 0.0), x.get("hitless_streak", 0)), reverse=True)
+        candidates.sort(key=lambda x: (x.get("season_avg", 0.0), x.get("hitless_streak", 0)), reverse=True)
 
         resp: Dict = {
             "date": date_str,
             "season": season,
-            "items": items[:limit],
+            "candidates": candidates[:limit],  # <- matches Action schema
         }
         if debug_list is not None:
             resp["debug"] = debug_list
