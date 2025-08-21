@@ -146,7 +146,7 @@ def cold_candidates(
     min_season_avg: float = Query(0.26, ge=0.0, le=1.0, description="Only include hitters with season AVG ≥ this (default .260)."),
     min_hitless_games: int = Query(1, ge=1, description="Current hitless streak (AB>0) must be ≥ this."),
     limit: int = Query(30, ge=1, le=1000),
-    verify: int = Query(1, ge=0, le=1, description="1 = only include players on teams that have NOT started yet today."),
+    verify: int = Query(1, ge=0, le=1, description="1 = only include players on teams that have NOT started yet today. If no pregame teams or result empty, we auto-fallback to include all teams."),
     # Back-compat: accept but ignore last_n so older Action calls don't break.
     last_n: Optional[int] = Query(None, description="Ignored. Accepted for backward compatibility."),
     debug: int = Query(0, ge=0, le=1),
@@ -155,7 +155,7 @@ def cold_candidates(
     Returns players with season AVG ≥ min_season_avg AND a current hitless streak ≥ min_hitless_games.
     - Streak counts consecutive most-recent games with AB>0 and 0 hits; DNP/0-AB ignored.
     - If names omitted, scans today's scheduled teams' active rosters (fallback: all MLB).
-    - If verify=1, keeps only players on not-started teams (status P/S).
+    - If verify=1: filter to not-started teams (status P/S). If that yields zero teams or zero candidates, auto-fallback to include all teams.
     Response: { "date": "...", "candidates": [...], "debug": [...]? }
     """
     date_str = _eastern_today_str() if _normalize(date) == "today" else date
@@ -164,13 +164,13 @@ def cold_candidates(
         sched = _schedule_for_date(client, date_str)
         ns_team_ids = _not_started_team_ids_for_date(sched) if (verify or debug) else set()
 
-        # Build scan list
+        # Determine scan list
         if names:
             requested = [n.strip() for n in names.split(",") if n.strip()]
         else:
             requested = list(_iter_league_player_names_for_scan(client, season, date_str))
 
-        candidates: List[Dict] = []
+        pre_candidates: List[Dict] = []
         debug_list: Optional[List[Dict]] = [] if debug else None
         seen: set[str] = set()
 
@@ -194,7 +194,6 @@ def cold_candidates(
                 team_id = team_info.get("id")
                 team_name = (team_info.get("name") or "").strip()
 
-                # Season AVG gate
                 season_avg = _season_avg_from_people(person)
                 if season_avg is None or season_avg < min_season_avg:
                     if debug_list is not None:
@@ -202,7 +201,6 @@ def cold_candidates(
                         debug_list.append({"name": full, "team": team_name, "skip": reason})
                     continue
 
-                # Current hitless streak (AB>0 only)
                 logs = _game_log_newest_first(client, pid, season, max_entries=60)
                 streak = _current_hitless_streak_ab_gt0(logs)
                 if streak < min_hitless_games:
@@ -210,31 +208,58 @@ def cold_candidates(
                         debug_list.append({"name": full, "team": team_name, "skip": f"hitless_streak {streak} < {min_hitless_games}"})
                     continue
 
-                # Verify: keep only not-started teams
-                if verify:
-                    tid = int(team_id) if (team_id is not None) else None
-                    if (tid is None) or (tid not in ns_team_ids):
-                        if debug_list is not None:
-                            debug_list.append({"name": full, "team": team_name, "skip": "verify: team already started or unknown"})
-                        continue
-
-                candidates.append({
+                pre_candidates.append({
                     "name": full,
                     "team": team_name,
                     "season_avg": round(season_avg, 3),
                     "hitless_streak": streak,
+                    "_team_id": team_id,
                 })
-                if len(candidates) >= limit:
+
+                if len(pre_candidates) >= max(limit * 3, 60):  # reasonable cap during scans
                     break
 
             except Exception as e:
                 if debug_list is not None:
                     debug_list.append({"name": name, "error": f"{type(e).__name__}: {e}"})
 
-        # Sort primary: season_avg DESC; tiebreaker: hitless_streak DESC
+        # Apply verify filter if requested
+        def _filter_by_pregame(cands: List[Dict]) -> List[Dict]:
+            out: List[Dict] = []
+            for it in cands:
+                tid = it.get("_team_id")
+                try:
+                    tid_int = int(tid) if tid is not None else None
+                except Exception:
+                    tid_int = None
+                if (tid_int is not None) and (tid_int in ns_team_ids):
+                    out.append(it)
+            return out
+
+        candidates = list(pre_candidates)
+        used_fallback = False
+        if verify:
+            candidates = _filter_by_pregame(pre_candidates)
+            # AUTO-FALLBACK if no pregame teams OR empty after filter
+            if (not ns_team_ids) or (not candidates):
+                candidates = list(pre_candidates)
+                used_fallback = True
+                if debug_list is not None:
+                    reason = "no not-started teams" if not ns_team_ids else "no candidates after pregame filter"
+                    debug_list.append({"note": f"verify auto-fallback to include all teams ({reason})"})
+
+        # Strip internals
+        for it in candidates:
+            it.pop("_team_id", None)
+
+        # Sort: season_avg DESC, then hitless_streak DESC
         candidates.sort(key=lambda x: (x.get("season_avg", 0.0), x.get("hitless_streak", 0)), reverse=True)
 
-        resp: Dict = {"date": date_str, "candidates": candidates[:limit]}
+        # Limit
+        candidates = candidates[:limit]
+
+        # Build response (strict keys)
+        resp: Dict = {"date": date_str, "candidates": candidates}
         if debug_list is not None:
             resp["debug"] = debug_list
         return resp
