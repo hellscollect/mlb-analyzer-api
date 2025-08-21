@@ -1,10 +1,12 @@
+# main.py
 import os
 import importlib
 import inspect
+import logging
 from datetime import datetime, timedelta, date as date_cls
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-from fastapi import FastAPI, Query, HTTPException
+from fastapi import FastAPI, Query, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -14,7 +16,7 @@ import pytz
 from services.dates import parse_date
 
 APP_NAME = "MLB Analyzer API"
-APP_VERSION = "1.1.7"
+APP_VERSION = "1.4.0"  # bumped
 
 class UTF8JSONResponse(JSONResponse):
     media_type = "application/json; charset=utf-8"
@@ -33,6 +35,7 @@ app = FastAPI(
     default_response_class=UTF8JSONResponse,
 )
 
+# --- CORS ---
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -41,6 +44,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# --- Provider loading ---
 _last_provider_error: Optional[str] = None
 
 def load_provider() -> Tuple[Optional[Any], Optional[str], Optional[str]]:
@@ -171,6 +175,7 @@ def _as_list_from_provider(obj: Union[List[Dict[str, Any]], Dict[str, Any]], key
                 return v
     return []
 
+# --- Models ---
 class HealthResp(BaseModel):
     ok: bool
     provider_loaded: bool
@@ -232,6 +237,7 @@ class DateOnlyReq(BaseModel):
     date: Optional[str] = None
     debug: int = 0
 
+# --- Root & health (with explicit HEAD handlers) ---
 @app.get("/", operation_id="root")
 def root():
     tz = pytz.timezone("America/New_York")
@@ -242,6 +248,10 @@ def root():
         "docs": f"{EXTERNAL_URL}/docs",
         "health": f"{EXTERNAL_URL}/health?tz=America/New_York",
     }
+
+@app.head("/", include_in_schema=False)
+def root_head():
+    return Response(status_code=200)
 
 @app.get("/health", response_model=HealthResp, operation_id="health")
 def health(tz: str = Query("America/New_York", description="IANA timezone for timestamp echo")):
@@ -259,6 +269,11 @@ def health(tz: str = Query("America/New_York", description="IANA timezone for ti
         now_local=now_str,
     )
 
+@app.head("/health", include_in_schema=False)
+def health_head():
+    return Response(status_code=200)
+
+# --- Provider passthrough / helpers ---
 @app.get("/provider_raw", operation_id="provider_raw")
 def provider_raw(
     date: Optional[str] = Query(None),
@@ -423,6 +438,7 @@ def _schedule_for_date(the_date: date_cls, debug: bool):
         return _deep_fix(resp.get("matchups") or [])
     return _deep_fix(resp)
 
+# --- public endpoints using provider ---
 @app.get("/hot_streak_hitters", operation_id="hot_streak_hitters")
 def hot_streak_hitters(
     date: Optional[str] = Query(None),
@@ -580,29 +596,37 @@ try:
     app.include_router(league_scan_router)
     print("[routes] loaded /league_scan")
 except Exception as e:
-    print(f"[routes] failed to load league_scan: {type(e).__name__}: {e}")
+    print(f("[routes] failed to load league_scan: {type(e).__name__}: {e}"))
 
 try:
     from routes.self_test import router as self_test_router
     app.include_router(self_test_router)
     print("[routes] loaded /self_test")
 except Exception as e:
-    print(f"[routes] failed to load self_test: {type(e).__name__}: {e}")
+    print(f("[routes] failed to load self_test: {type(e).__name__}: {e}"))
 
 try:
     from routes.cold_candidates import router as cold_candidates_router
     app.include_router(cold_candidates_router)
     print("[routes] loaded /cold_candidates")
 except Exception as e:
-    print(f"[routes] failed to load cold_candidates: {type(e).__name__}: {e}")
+    print(f("[routes] failed to load cold_candidates: {type(e).__name__}: {e}"))
 
 try:
     from routes.mlb_routes import router as mlb_router
     app.include_router(mlb_router)
     print("[routes] loaded /mlb")
 except Exception as e:
-    print(f"[routes] failed to load mlb_routes: {type(e).__name__}: {e}")
+    print(f("[routes] failed to load mlb_routes: {type(e).__name__}: {e}"))
+
+# --- Startup log (optional) ---
+@app.on_event("startup")
+async def _startup():
+    logging.getLogger("uvicorn.error").setLevel(logging.INFO)
+    logging.getLogger("uvicorn.access").setLevel(logging.INFO)
+    logging.info("MLB Analyzer API startup complete.")
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=True)
+    # IMPORTANT for Render: no --reload in production
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=False)
