@@ -273,7 +273,7 @@ def health(tz: str = Query("America/New_York", description="IANA timezone for ti
 def health_head():
     return Response(status_code=200)
 
-# --- Provider passthrough / helpers ---
+# --- Provider passthrough / helpers & public endpoints (unchanged logic) ---
 @app.get("/provider_raw", operation_id="provider_raw")
 def provider_raw(
     date: Optional[str] = Query(None),
@@ -537,7 +537,7 @@ def cold_pitchers_post(req: ColdPitchersReq):
     the_date = parse_date(req.date)
     data = safe_call(provider, "cold_pitchers",
         date=the_date, min_era=req.min_era, min_runs_each=req.min_runs_each,
-        last_starts=req.last_starts, debug=bool(req.debug))
+        req_last_starts=req.last_starts, debug=bool(req.debug))
     return _deep_fix(data)
 
 @app.get("/league_scan", operation_id="league_scan")
@@ -596,28 +596,28 @@ try:
     app.include_router(league_scan_router)
     print("[routes] loaded /league_scan")
 except Exception as e:
-    print(f("[routes] failed to load league_scan: {type(e).__name__}: {e}"))
+    print(f"[routes] failed to load league_scan: {type(e).__name__}: {e}")
 
 try:
     from routes.self_test import router as self_test_router
     app.include_router(self_test_router)
     print("[routes] loaded /self_test")
 except Exception as e:
-    print(f("[routes] failed to load self_test: {type(e).__name__}: {e}"))
+    print(f"[routes] failed to load self_test: {type(e).__name__}: {e}")
 
 try:
     from routes.cold_candidates import router as cold_candidates_router
     app.include_router(cold_candidates_router)
     print("[routes] loaded /cold_candidates")
 except Exception as e:
-    print(f("[routes] failed to load cold_candidates: {type(e).__name__}: {e}"))
+    print(f"[routes] failed to load cold_candidates: {type(e).__name__}: {e}")
 
 try:
     from routes.mlb_routes import router as mlb_router
     app.include_router(mlb_router)
     print("[routes] loaded /mlb")
 except Exception as e:
-    print(f("[routes] failed to load mlb_routes: {type(e).__name__}: {e}"))
+    print(f"[routes] failed to load mlb_routes: {type(e).__name__}: {e}")
 
 # --- Startup log (optional) ---
 @app.on_event("startup")
