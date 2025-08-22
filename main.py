@@ -612,6 +612,15 @@ try:
 except Exception as e:
     print(f"[routes] failed to load cold_candidates: {type(e).__name__}: {e}")
 
+# >>> NEW (additive): mount schedule proxy so /schedule_for_date works
+try:
+    from routes.schedule_proxy import router as schedule_proxy_router
+    app.include_router(schedule_proxy_router)
+    print("[routes] loaded /schedule_for_date (and /mlb/schedule_for_date)")
+except Exception as e:
+    print(f"[routes] failed to load schedule_proxy: {type(e).__name__}: {e}")
+# <<< END NEW
+
 try:
     from routes.mlb_routes import router as mlb_router
     app.include_router(mlb_router)
