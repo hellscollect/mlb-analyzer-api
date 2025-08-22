@@ -15,13 +15,23 @@ def _normalize_date(date_str: str | None) -> str:
     Otherwise pass through YYYY-MM-DD.
     """
     if not date_str or date_str.lower() == "today":
-        tz = pytz.timezone("America/New_York")
-        return datetime.now(tz).strftime("%Y-%m-%d")
+        et = pytz.timezone("America/New_York")
+        return datetime.now(et).strftime("%Y-%m-%d")
+    if date_str.lower() in ("tomorrow", "yesterday"):
+        et = pytz.timezone("America/New_York")
+        now = datetime.now(et)
+        if date_str.lower() == "tomorrow":
+            return (now + timedelta(days=1)).strftime("%Y-%m-%d")
+        else:
+            return (now - timedelta(days=1)).strftime("%Y-%m-%d")
+    # basic sanity: accept YYYY-MM-DD as-is
     return date_str
 
-@router.get("/mlb/schedule_for_date")
+# Serve both aliases so schema/instructions match code
+@router.get("/schedule_for_date")        # NEW alias to match your schema/instructions
+@router.get("/mlb/schedule_for_date")    # existing path kept for compatibility
 async def schedule_for_date(date: str = Query("today")):
-    """Proxy MLB schedule so /mlb/schedule_for_date returns 200 with JSON."""
+    """Proxy MLB schedule so /schedule_for_date and /mlb/schedule_for_date return 200 with JSON."""
     date_str = _normalize_date(date)
     async with httpx.AsyncClient(timeout=15.0) as client:
         r = await client.get(
