@@ -180,6 +180,54 @@ def _game_log_regular_season_desc(client: httpx.Client, pid: int, season: int, m
 def _date_in_eastern(dt_utc: datetime) -> date_cls:
     return dt_utc.astimezone(_EASTERN).date()
 
+def _extract_team_name_from_person_or_logs(
+    person_like: Dict,
+    team_map: Optional[Dict[int, Tuple[int, str]]] = None,
+    pid: Optional[int] = None,
+    logs: Optional[List[Dict]] = None,
+    slate_date_ymd: Optional[str] = None,
+) -> str:
+    """
+    Robust team-name fallback order:
+    1) person.currentTeam.name
+    2) person.team.name  (present on many /people hydrates)
+    3) latest pre-slate log's team.name
+    4) team_map[pid].name (if available)
+    5) "N/A"
+    """
+    # 1) currentTeam
+    team_info = (person_like.get("currentTeam") or {}) if isinstance(person_like, dict) else {}
+    name = (team_info.get("name") or "").strip()
+    if name:
+        return name
+
+    # 2) top-level team
+    t2 = (person_like.get("team") or {})
+    name2 = (t2.get("name") or "").strip()
+    if name2:
+        return name2
+
+    # 3) pull from logs (most recent PRE-slate entry)
+    if logs and slate_date_ymd:
+        slate_date = _parse_ymd(slate_date_ymd)
+        for s in logs:
+            dt_utc = _parse_dt_utc(s.get("gameDate") or s.get("date"))
+            if not dt_utc:
+                continue
+            if _date_in_eastern(dt_utc) >= slate_date:
+                continue
+            t = (s.get("team") or {})
+            nm = (t.get("name") or "").strip()
+            if nm:
+                return nm
+
+    # 4) team_map
+    if pid is not None and team_map and pid in team_map:
+        return (team_map[pid][1] or "").strip() or "N/A"
+
+    # 5) fallback
+    return "N/A"
+
 def _current_hitless_streak_before_slate(
     game_splits: List[Dict],
     slate_date_ymd: str,
@@ -479,8 +527,6 @@ def cold_candidates(
         verify_effective = 1 if int(verify) == 1 else 0
 
     # --- as_of snapshot handling
-    # If as_of is provided and not today in ET, use it for streak math.
-    # For historical snapshots, STRICT pregame verification does not make sense → disable verify and do not roll.
     as_of_norm = (as_of or "").strip()
     historical_mode = False
     if as_of_norm:
@@ -549,30 +595,22 @@ def cold_candidates(
                         pdata = _fetch_json(client, f"{MLB_BASE}/people/{pid}", params={"hydrate": f"team,stats(group=hitting,type=season,season={season})"})
                         person = (pdata.get("people") or [{}])[0]
                         season_avg = _season_avg_from_people_like(person)
-                        team_info = person.get("currentTeam") or {}
-                        team_id = team_info.get("id")
-                        team_name = (team_info.get("name") or "").strip()
-                        if season_avg is None or season_avg < min_season_avg:
-                            if debug_list is not None:
-                                why = "no season stats" if season_avg is None else f"season_avg {season_avg:.3f} < {min_season_avg:.3f}"
-                                debug_list.append({"name": person.get("fullName") or name, "team": team_name, "skip": why})
-                            continue
-                        if verify_effective:
-                            try:
-                                tid = int(team_id) if team_id is not None else None
-                            except Exception:
-                                tid = None
-                            if (tid is None) or (tid not in ns_ids):
-                                if debug_list is not None:
-                                    debug_list.append({"name": person.get("fullName") or name, "team": team_name, "skip": "verify(strict): team not pregame"})
-                                continue
+
+                        # Logs for team fallback and streaks
                         logs = _game_log_regular_season_desc(client, pid, season, max_entries=160)
                         streak = _current_hitless_streak_before_slate(logs, target_date, exclude_pks_for_date)
-                        if streak < min_hitless_games:
+                        if season_avg is None or season_avg < min_season_avg or streak < min_hitless_games:
                             if debug_list is not None:
-                                debug_list.append({"name": person.get("fullName") or name, "team": team_name, "skip": f"hitless_streak {streak} < {min_hitless_games}"})
+                                why = []
+                                if season_avg is None: why.append("no season stats")
+                                elif season_avg < min_season_avg: why.append(f"season_avg {season_avg:.3f} < {min_season_avg:.3f}")
+                                if streak < min_hitless_games: why.append(f"hitless_streak {streak} < {min_hitless_games}")
+                                debug_list.append({"name": person.get("fullName") or name, "skip": ", ".join(why) or "filtered"})
                             continue
+
+                        team_name = _extract_team_name_from_person_or_logs(person, None, pid, logs, target_date)
                         avg_season_hitless = _average_hitless_streak_before_slate(logs, target_date, exclude_pks_for_date)
+
                         candidates.append({
                             "name": person.get("fullName") or name,
                             "team": team_name,
@@ -611,24 +649,32 @@ def cold_candidates(
                 season_avg = _season_avg_from_people_like(p)
                 if season_avg is None or season_avg < min_season_avg:
                     continue
-                team_info = p.get("currentTeam") or {}
-                team_name = (team_info.get("name") or "").strip()
                 try:
-                    team_id = int(team_info.get("id")) if team_info.get("id") is not None else None
-                except Exception:
-                    team_id = None
-                if verify_effective and (team_id is None or team_id not in ns_ids):
-                    continue
-                pid = p.get("id")
-                try:
-                    pid = int(pid)
+                    pid = int(p.get("id"))
                 except Exception:
                     pid = None
                 if pid is None:
                     continue
+
+                # team verification only when verify_effective = 1
+                if verify_effective:
+                    team_info = p.get("currentTeam") or {}
+                    try:
+                        team_id = int(team_info.get("id")) if team_info.get("id") is not None else None
+                    except Exception:
+                        team_id = None
+                    if team_id is None or team_id not in ns_ids:
+                        continue
+
+                # stash for later streak calc
                 prospects.append((
                     float(season_avg),
-                    {"pid": pid, "name": p.get("fullName") or "", "team": team_name, "season_avg": round(float(season_avg), 3)}
+                    {
+                        "pid": pid,
+                        "name": p.get("fullName") or "",
+                        "person": p,
+                        "season_avg": round(float(season_avg), 3),
+                    }
                 ))
 
             prospects.sort(key=lambda x: x[0], reverse=True)
@@ -644,16 +690,19 @@ def cold_candidates(
                     streak = _current_hitless_streak_before_slate(logs, target_date, exclude_pks_for_date)
                     if streak >= min_hitless_games:
                         avg_season_hitless = _average_hitless_streak_before_slate(logs, target_date, exclude_pks_for_date)
+                        team_name = _extract_team_name_from_person_or_logs(
+                            meta["person"], team_map, meta["pid"], logs, target_date
+                        )
                         candidates.append({
                             "name": meta["name"],
-                            "team": meta["team"],
+                            "team": team_name,
                             "season_avg": meta["season_avg"],
                             "hitless_streak": streak,
                             "avg_hitless_streak_season": round(avg_season_hitless, 2) if avg_season_hitless is not None else 0.0,
                         })
                 except Exception as e:
                     if debug_list is not None:
-                        debug_list.append({"name": meta["name"], "team": meta["team"], "error": f"{type(e).__name__}: {e}"})
+                        debug_list.append({"name": meta.get("name", ""), "error": f"{type(e).__name__}: {e}"})
 
             candidates = _apply_sort(candidates, sort_spec)
             if debug_list is not None:
