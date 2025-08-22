@@ -387,7 +387,6 @@ def _apply_sort(candidates: List[Dict], sort_spec: List[Tuple[str, bool]]) -> Li
         keys = []
         for field, desc in sort_spec:
             v = item.get(field, 0)
-            # numeric sorts only here; if non-numeric slips in, fallback 0
             try:
                 v = float(v)
             except Exception:
@@ -467,7 +466,7 @@ def cold_candidates(
     if (group_by or "").strip().lower() == "none":
         sort_spec = _parse_sort_by(sort_by)
     else:
-        # Preserve your preferred default: -hitless_streak,-season_avg,-avg_hitless_streak_season
+        # Preserve default: -hitless_streak,-season_avg,-avg_hitless_streak_season
         sort_spec = _parse_sort_by(sort_by) if sort_by else [("hitless_streak", True), ("season_avg", True), ("avg_hitless_streak_season", True)]
 
     with httpx.Client(timeout=25) as client:
