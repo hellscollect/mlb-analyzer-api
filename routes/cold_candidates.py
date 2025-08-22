@@ -78,6 +78,22 @@ def _team_ids_from_schedule(schedule_json: Dict) -> List[int]:
                 pass
     return sorted(ids)
 
+def _game_pks_for_date(schedule_json: Dict) -> Set[int]:
+    """
+    All gamePk values for the slate date (used to exclude same-day logs robustly,
+    even if provider timestamps are weird or in-progress rows are present).
+    """
+    pks: Set[int] = set()
+    for d in schedule_json.get("dates", []):
+        for g in d.get("games", []):
+            pk = g.get("gamePk")
+            try:
+                if pk is not None:
+                    pks.add(int(pk))
+            except Exception:
+                continue
+    return pks
+
 def _all_mlb_team_ids(client: httpx.Client, season: int) -> List[int]:
     data = _fetch_json(client, f"{MLB_BASE}/teams", params={"sportId": 1, "season": season})
     teams = data.get("teams", []) or []
@@ -164,19 +180,34 @@ def _game_log_regular_season_desc(client: httpx.Client, pid: int, season: int, m
 def _date_in_eastern(dt_utc: datetime) -> date_cls:
     return dt_utc.astimezone(_EASTERN).date()
 
-def _current_hitless_streak_before_slate(game_splits: List[Dict], slate_date_ymd: str) -> int:
+def _current_hitless_streak_before_slate(
+    game_splits: List[Dict],
+    slate_date_ymd: str,
+    exclude_game_pks: Optional[Set[int]] = None
+) -> int:
     """
     Consecutive MOST-RECENT games with AB>0 and H==0 BEFORE the slate date (ET).
-    Ignores 0-AB games. Excludes same-day games.
+    Ignores 0-AB games. Excludes same-day games. Additionally skips any game
+    whose gamePk is on the slate's schedule (to avoid in-progress inclusion).
     """
     slate_date = _parse_ymd(slate_date_ymd)
+    exclude_game_pks = exclude_game_pks or set()
     streak = 0
     for s in game_splits:
+        # exclude explicit same-day by gamePk first (robust vs provider quirks)
+        pk = s.get("game", {}).get("gamePk") or s.get("gamePk")
+        try:
+            if pk is not None and int(pk) in exclude_game_pks:
+                continue
+        except Exception:
+            pass
+
         dt_utc = _parse_dt_utc(s.get("gameDate") or s.get("date"))
         if not dt_utc:
             continue
         if _date_in_eastern(dt_utc) >= slate_date:
-            continue  # exclude same-day
+            continue  # exclude same-day/future
+
         stat = s.get("stat") or {}
         try:
             ab = int(stat.get("atBats") or 0)
@@ -191,17 +222,29 @@ def _current_hitless_streak_before_slate(game_splits: List[Dict], slate_date_ymd
             break
     return streak
 
-def _average_hitless_streak_before_slate(game_splits: List[Dict], slate_date_ymd: str) -> Optional[float]:
+def _average_hitless_streak_before_slate(
+    game_splits: List[Dict],
+    slate_date_ymd: str,
+    exclude_game_pks: Optional[Set[int]] = None
+) -> Optional[float]:
     """
     Average length of COMPLETED hitless streaks (AB>0 only) over the season
-    BEFORE the slate date (ET). Excludes same-day games and excludes the
-    current ongoing run (if still not ended by a hit).
+    BEFORE the slate date (ET). Excludes same-day games and the current
+    ongoing run; also skips any game whose gamePk is on the slate schedule.
     """
     slate_date = _parse_ymd(slate_date_ymd)
+    exclude_game_pks = exclude_game_pks or set()
 
     # Build chronological list of prior games with AB>0 (oldest -> newest)
-    prior = []
+    prior: List[Dict] = []
     for s in game_splits:
+        pk = s.get("game", {}).get("gamePk") or s.get("gamePk")
+        try:
+            if pk is not None and int(pk) in exclude_game_pks:
+                continue
+        except Exception:
+            pass
+
         dt_utc = _parse_dt_utc(s.get("gameDate") or s.get("date"))
         if not dt_utc:
             continue
@@ -230,7 +273,6 @@ def _average_hitless_streak_before_slate(game_splits: List[Dict], slate_date_ymd
             if run > 0:
                 streaks.append(run)
                 run = 0
-    # Do NOT append trailing run — that’s the current ongoing hitless streak (not completed).
 
     if not streaks:
         return None
@@ -462,32 +504,26 @@ def cold_candidates(
     MAX_LOG_CHECKS = max_log_checks if max_log_checks is not None else computed_max
 
     # --- sort/group presets
-    # group_by='streak' sets the familiar default sort preset; 'none' uses provided sort_by or fallback.
     if (group_by or "").strip().lower() == "none":
         sort_spec = _parse_sort_by(sort_by)
     else:
-        # Preserve default: -hitless_streak,-season_avg,-avg_hitless_streak_season
         sort_spec = _parse_sort_by(sort_by) if sort_by else [("hitless_streak", True), ("season_avg", True), ("avg_hitless_streak_season", True)]
 
     with httpx.Client(timeout=25) as client:
-        # schedule / pregame set
-        if verify_effective:
-            sched = _schedule_for_date(client, effective_date)
-            ns_team_ids_today = _not_started_team_ids_for_date(sched)
-            slate_team_ids_today = _team_ids_from_schedule(sched) or _all_mlb_team_ids(client, season)
-        else:
-            # When including all teams or historical snapshot, don't restrict to not-started teams
-            sched = _schedule_for_date(client, effective_date) if not historical_mode else {}
-            ns_team_ids_today = set()
-            slate_team_ids_today = _team_ids_from_schedule(sched) if sched else _all_mlb_team_ids(client, season)
+        # schedule & helpers for this date
+        sched = _schedule_for_date(client, effective_date) if not historical_mode or verify_effective else _schedule_for_date(client, effective_date)
+        ns_team_ids_today = _not_started_team_ids_for_date(sched) if verify_effective else set()
+        slate_team_ids_today = _team_ids_from_schedule(sched) if sched else _all_mlb_team_ids(client, season)
+        # robust guard: exclude *any* gamePk on the schedule date from streak math
+        exclude_pks_for_date = _game_pks_for_date(sched) if sched else set()
 
         rolled = False
         if (verify_effective == 1) and roll_enabled and len(ns_team_ids_today) == 0:
-            # Only roll forward when we are in STRICT pregame mode and there are zero pregame teams on the requested date.
             effective_date = _next_ymd_str(effective_date)
             sched = _schedule_for_date(client, effective_date)
             ns_team_ids_today = _not_started_team_ids_for_date(sched)
             slate_team_ids_today = _team_ids_from_schedule(sched) or slate_team_ids_today
+            exclude_pks_for_date = _game_pks_for_date(sched)
             rolled = True
 
         debug_list: Optional[List[Dict]] = [] if debug else None
@@ -531,12 +567,12 @@ def cold_candidates(
                                     debug_list.append({"name": person.get("fullName") or name, "team": team_name, "skip": "verify(strict): team not pregame"})
                                 continue
                         logs = _game_log_regular_season_desc(client, pid, season, max_entries=160)
-                        streak = _current_hitless_streak_before_slate(logs, target_date)
+                        streak = _current_hitless_streak_before_slate(logs, target_date, exclude_pks_for_date)
                         if streak < min_hitless_games:
                             if debug_list is not None:
                                 debug_list.append({"name": person.get("fullName") or name, "team": team_name, "skip": f"hitless_streak {streak} < {min_hitless_games}"})
                             continue
-                        avg_season_hitless = _average_hitless_streak_before_slate(logs, target_date)
+                        avg_season_hitless = _average_hitless_streak_before_slate(logs, target_date, exclude_pks_for_date)
                         candidates.append({
                             "name": person.get("fullName") or name,
                             "team": team_name,
@@ -605,9 +641,9 @@ def cold_candidates(
                 checks += 1
                 try:
                     logs = _game_log_regular_season_desc(client, meta["pid"], season, max_entries=160)
-                    streak = _current_hitless_streak_before_slate(logs, target_date)
+                    streak = _current_hitless_streak_before_slate(logs, target_date, exclude_pks_for_date)
                     if streak >= min_hitless_games:
-                        avg_season_hitless = _average_hitless_streak_before_slate(logs, target_date)
+                        avg_season_hitless = _average_hitless_streak_before_slate(logs, target_date, exclude_pks_for_date)
                         candidates.append({
                             "name": meta["name"],
                             "team": meta["team"],
