@@ -16,6 +16,12 @@ _EASTERN = pytz.timezone("US/Eastern")
 def _eastern_today_str() -> str:
     return datetime.now(_EASTERN).date().isoformat()
 
+def _is_today_et(ymd: str) -> bool:
+    try:
+        return _eastern_today_str() == ymd
+    except Exception:
+        return False
+
 def _parse_ymd(s: str) -> date_cls:
     return datetime.strptime(s, "%Y-%m-%d").date()
 
@@ -354,6 +360,42 @@ def _batch_people_with_stats(client: httpx.Client, ids: List[int], season: int, 
                 dbg.append({"people_batch_chunk": len(sub), "error": f"{type(e).__name__}: {e}"})
     return out
 
+# ---------- sorting helpers ----------
+_VALID_SORT_KEYS = {"hitless_streak", "season_avg", "avg_hitless_streak_season"}
+
+def _parse_sort_by(sort_by: Optional[str]) -> List[Tuple[str, bool]]:
+    """
+    Returns list of (field, desc). Supports comma-separated fields with optional '-' prefix for DESC.
+    Unknown fields are ignored.
+    """
+    default = [("hitless_streak", True), ("season_avg", True), ("avg_hitless_streak_season", True)]
+    if not sort_by:
+        return default
+    out: List[Tuple[str, bool]] = []
+    for raw in sort_by.split(","):
+        k = raw.strip()
+        if not k:
+            continue
+        desc = k.startswith("-")
+        field = k[1:] if desc else k
+        if field in _VALID_SORT_KEYS:
+            out.append((field, desc))
+    return out or default
+
+def _apply_sort(candidates: List[Dict], sort_spec: List[Tuple[str, bool]]) -> List[Dict]:
+    def key_fn(item: Dict):
+        keys = []
+        for field, desc in sort_spec:
+            v = item.get(field, 0)
+            # numeric sorts only here; if non-numeric slips in, fallback 0
+            try:
+                v = float(v)
+            except Exception:
+                v = 0.0
+            keys.append(-v if desc else v)
+        return tuple(keys)
+    return sorted(candidates, key=key_fn)
+
 # ---------- route ----------
 @router.get("/cold_candidates")
 def cold_candidates(
@@ -369,6 +411,11 @@ def cold_candidates(
     scan_multiplier: int = Query(8, ge=1, le=40, description="How many logs to check: limit × scan_multiplier (cap applies)"),
     max_log_checks: Optional[int] = Query(None, ge=1, le=5000, description="Hard cap for log checks; overrides scan_multiplier."),
     debug: int = Query(0, ge=0, le=1),
+    # --- New additive params ---
+    mode: Optional[str] = Query(None, description="Alias for verify. 'pregame' -> verify=1, 'all' -> verify=0. If set, overrides verify."),
+    as_of: Optional[str] = Query(None, description="YYYY-MM-DD snapshot for streak math. If not today ET, verification is disabled and no roll-forward."),
+    group_by: str = Query("streak", description="Streak grouping preset: 'streak' or 'none' (affects sort preset only; response shape unchanged)."),
+    sort_by: Optional[str] = Query(None, description="Comma-separated fields with optional '-' for DESC. Fields: hitless_streak,season_avg,avg_hitless_streak_season."),
 ):
     """
     VERIFIED cold-hitter candidates:
@@ -376,26 +423,71 @@ def cold_candidates(
       • Current hitless streak (AB>0 only; DNP/0-AB ignored)
       • STRICT pregame when verify=1 (exclude in-progress/finished)
       • Exclude same-day games from streak calc (use previous games only)
-      • Also returns avg_hitless_streak_season = average length of COMPLETED hitless streaks before the slate date
+      • avg_hitless_streak_season = average length of COMPLETED hitless streaks before the slate date
     """
     requested_date = _eastern_today_str() if _normalize(date) == "today" else date
     effective_date = requested_date
 
+    # --- mode alias mapping (mode takes precedence over verify if provided)
+    mode_norm = (mode or "").strip().lower() if mode else None
+    if mode_norm in ("pregame", "pre", "strict"):
+        verify_effective = 1
+    elif mode_norm in ("all", "any"):
+        verify_effective = 0
+    else:
+        verify_effective = 1 if int(verify) == 1 else 0
+
+    # --- as_of snapshot handling
+    # If as_of is provided and not today in ET, use it for streak math.
+    # For historical snapshots, STRICT pregame verification does not make sense → disable verify and do not roll.
+    as_of_norm = (as_of or "").strip()
+    historical_mode = False
+    if as_of_norm:
+        try:
+            _ = _parse_ymd(as_of_norm)  # validate
+            effective_date = as_of_norm
+            if not _is_today_et(as_of_norm):
+                historical_mode = True
+        except Exception:
+            pass
+
+    if historical_mode:
+        verify_effective = 0  # disable pregame check
+        roll_enabled = False
+    else:
+        roll_enabled = bool(roll_to_next_slate_if_empty)
+
+    # --- scan budget
     DEFAULT_MULT = max(1, int(scan_multiplier))
     computed_max = min(3000, limit * DEFAULT_MULT)
     MAX_LOG_CHECKS = max_log_checks if max_log_checks is not None else computed_max
 
+    # --- sort/group presets
+    # group_by='streak' sets the familiar default sort preset; 'none' uses provided sort_by or fallback.
+    if (group_by or "").strip().lower() == "none":
+        sort_spec = _parse_sort_by(sort_by)
+    else:
+        # Preserve your preferred default: -hitless_streak,-season_avg,-avg_hitless_streak_season
+        sort_spec = _parse_sort_by(sort_by) if sort_by else [("hitless_streak", True), ("season_avg", True), ("avg_hitless_streak_season", True)]
+
     with httpx.Client(timeout=25) as client:
         # schedule / pregame set
-        sched = _schedule_for_date(client, effective_date)
-        ns_team_ids_today = _not_started_team_ids_for_date(sched) if verify else set()
-        slate_team_ids_today = _team_ids_from_schedule(sched) or _all_mlb_team_ids(client, season)
+        if verify_effective:
+            sched = _schedule_for_date(client, effective_date)
+            ns_team_ids_today = _not_started_team_ids_for_date(sched)
+            slate_team_ids_today = _team_ids_from_schedule(sched) or _all_mlb_team_ids(client, season)
+        else:
+            # When including all teams or historical snapshot, don't restrict to not-started teams
+            sched = _schedule_for_date(client, effective_date) if not historical_mode else {}
+            ns_team_ids_today = set()
+            slate_team_ids_today = _team_ids_from_schedule(sched) if sched else _all_mlb_team_ids(client, season)
 
         rolled = False
-        if verify and roll_to_next_slate_if_empty and len(ns_team_ids_today) == 0:
+        if (verify_effective == 1) and roll_enabled and len(ns_team_ids_today) == 0:
+            # Only roll forward when we are in STRICT pregame mode and there are zero pregame teams on the requested date.
             effective_date = _next_ymd_str(effective_date)
             sched = _schedule_for_date(client, effective_date)
-            ns_team_ids_today = _not_started_team_ids_for_date(sched) if verify else set()
+            ns_team_ids_today = _not_started_team_ids_for_date(sched)
             slate_team_ids_today = _team_ids_from_schedule(sched) or slate_team_ids_today
             rolled = True
 
@@ -430,7 +522,7 @@ def cold_candidates(
                                 why = "no season stats" if season_avg is None else f"season_avg {season_avg:.3f} < {min_season_avg:.3f}"
                                 debug_list.append({"name": person.get("fullName") or name, "team": team_name, "skip": why})
                             continue
-                        if verify:
+                        if verify_effective:
                             try:
                                 tid = int(team_id) if team_id is not None else None
                             except Exception:
@@ -458,11 +550,11 @@ def cold_candidates(
                     except Exception as e:
                         if debug_list is not None:
                             debug_list.append({"name": name, "error": f"{type(e).__name__}: {e}"})
-                candidates.sort(key=lambda x: (x.get("hitless_streak", 0), x.get("season_avg", 0.0), x.get("avg_hitless_streak_season", 0.0)), reverse=True)
+                candidates = _apply_sort(candidates, sort_spec)
                 return {"candidates": candidates[:limit]}
 
-            # league scan mode (STRICT pregame when verify=1)
-            scan_team_ids = sorted(ns_ids) if verify else team_ids
+            # league scan mode
+            scan_team_ids = sorted(ns_ids) if verify_effective else team_ids
 
             # (A) Union of player IDs across roster endpoints + team hydrate
             union_ids, team_map = _collect_union_player_ids(client, scan_team_ids, season, debug_list)
@@ -490,7 +582,7 @@ def cold_candidates(
                     team_id = int(team_info.get("id")) if team_info.get("id") is not None else None
                 except Exception:
                     team_id = None
-                if verify and (team_id is None or team_id not in ns_ids):
+                if verify_effective and (team_id is None or team_id not in ns_ids):
                     continue
                 pid = p.get("id")
                 try:
@@ -528,7 +620,7 @@ def cold_candidates(
                     if debug_list is not None:
                         debug_list.append({"name": meta["name"], "team": meta["team"], "error": f"{type(e).__name__}: {e}"})
 
-            candidates.sort(key=lambda x: (x.get("hitless_streak", 0), x.get("season_avg", 0.0), x.get("avg_hitless_streak_season", 0.0)), reverse=True)
+            candidates = _apply_sort(candidates, sort_spec)
             if debug_list is not None:
                 debug_list.insert(0, {
                     "prospects_scanned": len(prospects),
@@ -545,7 +637,7 @@ def cold_candidates(
             stamp = {
                 "requested_date": requested_date,
                 "effective_date": effective_date,
-                "verify": int(verify),
+                "verify": int(verify_effective),
                 "rolled_to_next_slate": bool(rolled),
                 "pregame_team_count": len(ns_team_ids_today),
                 "slate_team_count": len(slate_team_ids_today),
@@ -556,6 +648,12 @@ def cold_candidates(
                     "scan_multiplier": DEFAULT_MULT,
                     "max_log_checks": MAX_LOG_CHECKS,
                 },
+                "params": {
+                    "mode": mode_norm or None,
+                    "as_of": as_of_norm or None,
+                    "group_by": group_by,
+                    "sort_by": sort_by or None,
+                }
             }
             debug_list.insert(0, stamp)
             response["debug"] = debug_list
