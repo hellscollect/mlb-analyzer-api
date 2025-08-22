@@ -45,11 +45,11 @@ def _fetch_json(client: httpx.Client, url: str, params: Optional[Dict] = None) -
 def _schedule_for_date(client: httpx.Client, date_str: str) -> Dict:
     return _fetch_json(client, f"{MLB_BASE}/schedule", params={"sportId": 1, "date": date_str})
 
-def _not_started_team_ids_for_date(schedule_json: Dict) -> set[int]:
+def _not_started_team_ids_for_date(schedule_json: Dict) -> Set[int]:
     """
-    P = Preview, S = Scheduled (not started yet). Others = already started/finished.
+    STRICT pregame set: P = Preview, S = Scheduled (not started yet).
     """
-    ns_ids: set[int] = set()
+    ns_ids: Set[int] = set()
     for d in schedule_json.get("dates", []):
         for g in d.get("games", []):
             code = (g.get("status", {}) or {}).get("statusCode", "")
@@ -62,7 +62,7 @@ def _not_started_team_ids_for_date(schedule_json: Dict) -> set[int]:
     return ns_ids
 
 def _team_ids_from_schedule(schedule_json: Dict) -> List[int]:
-    ids: set[int] = set()
+    ids: Set[int] = set()
     for d in schedule_json.get("dates", []):
         for g in d.get("games", []):
             try:
@@ -401,7 +401,7 @@ def cold_candidates(
 
         debug_list: Optional[List[Dict]] = [] if debug else None
 
-        def run_once_for_date(target_date: str, ns_ids: set[int], team_ids: List[int]) -> Dict:
+        def run_once_for_date(target_date: str, ns_ids: Set[int], team_ids: List[int]) -> Dict:
             candidates: List[Dict] = []
 
             # explicit names mode
