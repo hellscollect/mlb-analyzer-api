@@ -90,9 +90,45 @@ def _all_mlb_team_ids(client: httpx.Client, season: int) -> List[int]:
     return sorted(out)
 
 # ---------- stats & logs ----------
+def _choose_best_mlb_season_split(splits: List[Dict]) -> Optional[Dict]:
+    """
+    From a list of 'season' splits, pick the MLB-level one (AL/NL) with the MOST AB.
+    Heuristics:
+      • Prefer league.id in {103, 104}  (AL=103, NL=104)
+      • Else prefer sport.id == 1       (MLB sport)
+      • Else fallback to the split with the most AB
+    Return the chosen split dict or None.
+    """
+    if not splits:
+        return None
+
+    def split_score(sp: Dict) -> Tuple[int, int]:
+        league_id = (((sp.get("league") or {}) or {}).get("id"))
+        sport_id = (((sp.get("sport") or {}) or {}).get("id"))
+        # some payloads nest sport under team
+        if sport_id is None:
+            sport_id = (((sp.get("team") or {}).get("sport") or {}) or {}).get("id")
+        try:
+            ab = int((sp.get("stat") or {}).get("atBats") or 0)
+        except Exception:
+            ab = 0
+        # priority: AL/NL gets 2, sport==1 gets 1, else 0
+        p = 2 if league_id in (103, 104) else (1 if sport_id == 1 else 0)
+        return (p, ab)
+
+    best = None
+    best_key = (-1, -1)
+    for sp in splits:
+        key = split_score(sp)
+        if key > best_key:
+            best_key = key
+            best = sp
+    return best
+
 def _season_avg_from_people_like(obj: Dict) -> Optional[float]:
     """
-    Extract season AVG from either a 'people' entry or a hydrated 'person' object.
+    Extract SEASON AVG from either a 'people' entry or hydrated 'person'.
+    Choose the MLB-level split (AL/NL) with max AB; fallback to most-AB split.
     """
     stats = (obj.get("stats") or [])
     for block in stats:
@@ -102,12 +138,15 @@ def _season_avg_from_people_like(obj: Dict) -> Optional[float]:
         type_cd = (block.get("type") or {}).get("code", "")
         if (group_dn == "hitting" or group_cd == "hitting") and (type_dn.lower() == "season" or type_cd == "season"):
             splits = block.get("splits") or []
-            if splits:
-                avg_str = (splits[0].get("stat") or {}).get("avg")
-                try:
-                    return float(avg_str)
-                except (TypeError, ValueError):
-                    return None
+            chosen = _choose_best_mlb_season_split(splits)
+            if not chosen:
+                continue
+            avg_str = (chosen.get("stat") or {}).get("avg")
+            try:
+                # handle ".305", "0.305", or None/"-.-"
+                return float(str(avg_str))
+            except Exception:
+                return None
     return None
 
 def _game_log_newest_first_regular_season(client: httpx.Client, pid: int, season: int, max_entries: int = 120) -> List[Dict]:
@@ -157,14 +196,14 @@ def _current_hitless_streak_ab_gt0(game_splits: List[Dict]) -> int:
             break
     return streak
 
-# ---------- roster fetchers (robust) ----------
+# ---------- roster fetchers ----------
 def _team_roster_ids_multi(client: httpx.Client, team_id: int, season: int, dbg: Optional[List[Dict]]) -> List[int]:
     """
     Try multiple roster types; return person IDs.
     """
     attempts = [
         ("active", {"rosterType": "active"}),
-        ("Active", {"rosterType": "Active"}),  # some payloads are case-sensitive in cached mirrors
+        ("Active", {"rosterType": "Active"}),
         ("40Man", {"rosterType": "40Man"}),
         ("fullSeason", {"rosterType": "fullSeason", "season": season}),
         ("season", {"season": season})
@@ -180,29 +219,25 @@ def _team_roster_ids_multi(client: httpx.Client, team_id: int, season: int, dbg:
                 pid = person.get("id")
                 try:
                     if pid is not None:
-                        ids.append(int(pid))
-                        got += 1
+                        ids.append(int(pid)); got += 1
                 except Exception:
                     continue
             if dbg is not None:
                 dbg.append({"team_id": team_id, "roster_source": label, "count": got})
             if ids:
-                break  # stop on first non-empty source
+                break
         except Exception as e:
             if dbg is not None:
                 dbg.append({"team_id": team_id, "roster_source": label, "error": f"{type(e).__name__}: {e}"})
             continue
     return ids
 
-def _hydrate_roster_people_stats(
-    client: httpx.Client, team_ids: List[int], season: int, dbg: Optional[List[Dict]]
-) -> List[Dict]:
+def _hydrate_roster_people_stats(client: httpx.Client, team_ids: List[int], season: int, dbg: Optional[List[Dict]]) -> List[Dict]:
     """
-    Fallback: use /teams?teamIds=...&hydrate=roster(person,person.stats(...))
-    Returns a list of hydrated person dicts with stats and currentTeam.
+    Fallback: /teams?teamIds=...&hydrate=roster(person,person.stats(...))
     """
     people: List[Dict] = []
-    for i in range(0, len(team_ids), 8):  # conservative chunk size
+    for i in range(0, len(team_ids), 8):
         sub = team_ids[i:i+8]
         params = {
             "teamIds": ",".join(str(t) for t in sub),
@@ -215,28 +250,20 @@ def _hydrate_roster_people_stats(
             for t in data.get("teams", []) or []:
                 team_id = t.get("id")
                 roster_container = t.get("roster")
-                # hydrate may return {"roster": {"roster": [...]}} or just a list
-                if isinstance(roster_container, dict):
-                    entries = roster_container.get("roster", []) or []
-                else:
-                    entries = roster_container or []
+                entries = (roster_container.get("roster", []) if isinstance(roster_container, dict) else roster_container) or []
                 for entry in entries:
                     person = entry.get("person") or {}
-                    # Ensure team context is present
                     if "currentTeam" not in person and team_id is not None:
                         person["currentTeam"] = {"id": team_id, "name": t.get("name", "")}
                     people.append(person)
             if dbg is not None:
-                dbg.append({"teams_hydrate_chunk": sub, "persons": len(people)})
+                dbg.append({"teams_hydrate_chunk": sub, "persons_accum": len(people)})
         except Exception as e:
             if dbg is not None:
                 dbg.append({"teams_hydrate_chunk": sub, "error": f"{type(e).__name__}: {e}"})
     return people
 
 def _batch_people_with_stats(client: httpx.Client, ids: List[int], season: int, dbg: Optional[List[Dict]]) -> List[Dict]:
-    """
-    Batch fetch /people with team + season stats.
-    """
     out: List[Dict] = []
     for i in range(0, len(ids), 100):
         sub = ids[i:i+100]
@@ -277,12 +304,11 @@ def _prospects_from_teams(
     if person_ids:
         people = _batch_people_with_stats(client, person_ids, season, dbg)
 
-    # 2) If still empty (or very small), use team hydrate fallback
+    # 2) If still light, use team-hydrate fallback and merge
     if not people or len(people) < 20:
         if dbg is not None:
             dbg.append({"fallback": "teams_hydrate", "why": f"people_count={len(people)}"})
         hydrated_people = _hydrate_roster_people_stats(client, team_ids, season, dbg)
-        # merge unique by id (prefer batch /people entries, then add new)
         have = {p.get("id") for p in people}
         for hp in hydrated_people:
             if hp.get("id") not in have:
