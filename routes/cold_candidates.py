@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Query
-from typing import Dict, List, Optional, Iterable, Any, Tuple
+from typing import Dict, List, Optional, Any, Tuple
 from datetime import datetime, date as date_cls, timezone, timedelta
 import unicodedata
 import httpx
@@ -25,11 +25,6 @@ def _next_ymd_str(s: str) -> str:
 def _normalize(s: str) -> str:
     return unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii").lower().strip()
 
-def _fetch_json(client: httpx.Client, url: str, params: Optional[Dict] = None) -> Dict:
-    r = client.get(url, params=params)
-    r.raise_for_status()
-    return r.json()
-
 def _parse_dt(maybe: Optional[str]) -> Optional[datetime]:
     if not maybe:
         return None
@@ -46,6 +41,11 @@ def _parse_dt(maybe: Optional[str]) -> Optional[datetime]:
         except Exception:
             continue
     return None
+
+def _fetch_json(client: httpx.Client, url: str, params: Optional[Dict] = None) -> Dict:
+    r = client.get(url, params=params)
+    r.raise_for_status()
+    return r.json()
 
 # ---------- schedule helpers ----------
 def _schedule_for_date(client: httpx.Client, date_str: str) -> Dict:
@@ -92,11 +92,10 @@ def _all_mlb_team_ids(client: httpx.Client, season: int) -> List[int]:
 # ---------- stats & logs ----------
 def _season_avg_from_people_like(obj: Dict) -> Optional[float]:
     """
-    Extract season AVG from either a 'people' entry or a 'person' (hydrated roster) entry.
+    Extract season AVG from either a 'people' entry or a hydrated 'person' object.
     """
     stats = (obj.get("stats") or [])
     for block in stats:
-        # Accept either displayName or code for robustness
         group_dn = (block.get("group") or {}).get("displayName", "")
         group_cd = (block.get("group") or {}).get("code", "")
         type_dn = (block.get("type") or {}).get("displayName", "")
@@ -121,7 +120,6 @@ def _game_log_newest_first_regular_season(client: httpx.Client, pid: int, season
         params={"stats": "gameLog", "group": "hitting", "season": season, "sportIds": 1},
     )
     splits = ((data.get("stats") or [{}])[0].get("splits")) or []
-
     filtered: List[Dict] = []
     for s in splits:
         gt = s.get("gameType")
@@ -159,65 +157,137 @@ def _current_hitless_streak_ab_gt0(game_splits: List[Dict]) -> int:
             break
     return streak
 
-# ---------- robust roster -> people(stats) ----------
-def _team_active_roster_ids(client: httpx.Client, team_id: int, season: int) -> List[int]:
+# ---------- roster fetchers (robust) ----------
+def _team_roster_ids_multi(client: httpx.Client, team_id: int, season: int, dbg: Optional[List[Dict]]) -> List[int]:
     """
-    Pull a team's active roster and return MLB person IDs.
+    Try multiple roster types; return person IDs.
     """
-    # season param is tolerated; rosterType=active is key
-    data = _fetch_json(client, f"{MLB_BASE}/teams/{team_id}/roster", params={"rosterType": "active", "season": season})
-    roster = data.get("roster", []) or []
-    out: List[int] = []
-    for r in roster:
-        person = r.get("person") or {}
-        pid = person.get("id")
+    attempts = [
+        ("active", {"rosterType": "active"}),
+        ("Active", {"rosterType": "Active"}),  # some payloads are case-sensitive in cached mirrors
+        ("40Man", {"rosterType": "40Man"}),
+        ("fullSeason", {"rosterType": "fullSeason", "season": season}),
+        ("season", {"season": season})
+    ]
+    ids: List[int] = []
+    for label, params in attempts:
         try:
-            if pid is not None:
-                out.append(int(pid))
-        except Exception:
-            pass
-    return out
+            data = _fetch_json(client, f"{MLB_BASE}/teams/{team_id}/roster", params=params)
+            roster = data.get("roster", []) or []
+            got = 0
+            for r in roster:
+                person = r.get("person") or {}
+                pid = person.get("id")
+                try:
+                    if pid is not None:
+                        ids.append(int(pid))
+                        got += 1
+                except Exception:
+                    continue
+            if dbg is not None:
+                dbg.append({"team_id": team_id, "roster_source": label, "count": got})
+            if ids:
+                break  # stop on first non-empty source
+        except Exception as e:
+            if dbg is not None:
+                dbg.append({"team_id": team_id, "roster_source": label, "error": f"{type(e).__name__}: {e}"})
+            continue
+    return ids
 
-def _batch_people_with_stats(client: httpx.Client, ids: List[int], season: int, chunk: int = 100) -> List[Dict]:
+def _hydrate_roster_people_stats(
+    client: httpx.Client, team_ids: List[int], season: int, dbg: Optional[List[Dict]]
+) -> List[Dict]:
     """
-    Batch fetch /people with team+season hitting stats. Returns list of person dicts.
+    Fallback: use /teams?teamIds=...&hydrate=roster(person,person.stats(...))
+    Returns a list of hydrated person dicts with stats and currentTeam.
     """
     people: List[Dict] = []
-    for i in range(0, len(ids), chunk):
-        sub = ids[i:i+chunk]
+    for i in range(0, len(team_ids), 8):  # conservative chunk size
+        sub = team_ids[i:i+8]
         params = {
-            "personIds": ",".join(str(x) for x in sub),
-            "hydrate": f"team,stats(group=hitting,type=season,season={season})",
+            "teamIds": ",".join(str(t) for t in sub),
+            "sportId": 1,
+            "season": season,
+            "hydrate": f"roster(person,person.stats(group=hitting,type=season,season={season}))"
         }
-        data = _fetch_json(client, f"{MLB_BASE}/people", params=params)
-        ppl = data.get("people", []) or []
-        people.extend(ppl)
+        try:
+            data = _fetch_json(client, f"{MLB_BASE}/teams", params=params)
+            for t in data.get("teams", []) or []:
+                team_id = t.get("id")
+                roster_container = t.get("roster")
+                # hydrate may return {"roster": {"roster": [...]}} or just a list
+                if isinstance(roster_container, dict):
+                    entries = roster_container.get("roster", []) or []
+                else:
+                    entries = roster_container or []
+                for entry in entries:
+                    person = entry.get("person") or {}
+                    # Ensure team context is present
+                    if "currentTeam" not in person and team_id is not None:
+                        person["currentTeam"] = {"id": team_id, "name": t.get("name", "")}
+                    people.append(person)
+            if dbg is not None:
+                dbg.append({"teams_hydrate_chunk": sub, "persons": len(people)})
+        except Exception as e:
+            if dbg is not None:
+                dbg.append({"teams_hydrate_chunk": sub, "error": f"{type(e).__name__}: {e}"})
     return people
 
-def _prospects_via_people_batch(
+def _batch_people_with_stats(client: httpx.Client, ids: List[int], season: int, dbg: Optional[List[Dict]]) -> List[Dict]:
+    """
+    Batch fetch /people with team + season stats.
+    """
+    out: List[Dict] = []
+    for i in range(0, len(ids), 100):
+        sub = ids[i:i+100]
+        try:
+            params = {
+                "personIds": ",".join(str(x) for x in sub),
+                "hydrate": f"team,stats(group=hitting,type=season,season={season})",
+            }
+            data = _fetch_json(client, f"{MLB_BASE}/people", params=params)
+            ppl = data.get("people", []) or []
+            out.extend(ppl)
+            if dbg is not None:
+                dbg.append({"people_batch_chunk": len(sub), "returned": len(ppl)})
+        except Exception as e:
+            if dbg is not None:
+                dbg.append({"people_batch_chunk": len(sub), "error": f"{type(e).__name__}: {e}"})
+    return out
+
+def _prospects_from_teams(
     client: httpx.Client,
     season: int,
     team_ids: List[int],
     verify_ns_team_ids: Optional[set[int]],
     min_season_avg: float,
+    dbg: Optional[List[Dict]],
 ) -> List[Tuple[float, Dict]]:
     """
-    For a set of team IDs, fetch active roster IDs, then batch /people with stats, and
-    build a list of (season_avg, person_meta).
+    Build (season_avg, meta) prospects from multiple roster sources with robust fallbacks.
     """
-    all_ids: List[int] = []
+    # 1) Try per-team roster endpoints
+    person_ids: List[int] = []
     for tid in team_ids:
-        try:
-            ids = _team_active_roster_ids(client, tid, season)
-            all_ids.extend(ids)
-        except Exception:
-            continue
-    # Deduplicate
-    if not all_ids:
-        return []
-    all_ids = sorted(set(all_ids))
+        ids = _team_roster_ids_multi(client, tid, season, dbg)
+        person_ids.extend(ids)
+    person_ids = sorted(set(x for x in person_ids if isinstance(x, int)))
 
-    people = _batch_people_with_stats(client, all_ids, season)
+    people: List[Dict] = []
+    if person_ids:
+        people = _batch_people_with_stats(client, person_ids, season, dbg)
+
+    # 2) If still empty (or very small), use team hydrate fallback
+    if not people or len(people) < 20:
+        if dbg is not None:
+            dbg.append({"fallback": "teams_hydrate", "why": f"people_count={len(people)}"})
+        hydrated_people = _hydrate_roster_people_stats(client, team_ids, season, dbg)
+        # merge unique by id (prefer batch /people entries, then add new)
+        have = {p.get("id") for p in people}
+        for hp in hydrated_people:
+            if hp.get("id") not in have:
+                people.append(hp)
+
     prospects: List[Tuple[float, Dict]] = []
     for p in people:
         season_avg = _season_avg_from_people_like(p)
@@ -241,14 +311,9 @@ def _prospects_via_people_batch(
             continue
         prospects.append((
             float(season_avg),
-            {
-                "pid": pid,
-                "name": p.get("fullName") or "",
-                "team": team_name,
-                "team_id": team_id,
-                "season_avg": round(float(season_avg), 3),
-            }
+            {"pid": pid, "name": p.get("fullName") or "", "team": team_name, "team_id": team_id, "season_avg": round(float(season_avg), 3)}
         ))
+
     prospects.sort(key=lambda x: x[0], reverse=True)
     return prospects
 
@@ -264,7 +329,6 @@ def cold_candidates(
     verify: int = Query(1, ge=0, le=1, description="1 = STRICT pregame only for the slate date (teams not started yet). 0 = include all teams."),
     roll_to_next_slate_if_empty: int = Query(1, ge=0, le=1, description="If verify=1 and there are ZERO pregame teams today, roll to NEXT day (strict pregame)."),
     last_n: Optional[int] = Query(None, description="Ignored. Backward compatibility only."),
-    # knobs for breadth:
     scan_multiplier: int = Query(8, ge=1, le=40, description="How many logs to check: limit * scan_multiplier."),
     max_log_checks: Optional[int] = Query(None, ge=1, le=5000, description="Hard cap for log checks; overrides scan_multiplier."),
     debug: int = Query(0, ge=0, le=1),
@@ -273,24 +337,23 @@ def cold_candidates(
     Verified cold-hitter candidates for betting:
       • Good hitters (season AVG ≥ min_season_avg)
       • Current hitless streak (AB>0 only; DNP/0-AB ignored)
-      • STRICT pregame when verify=1 (exclude in-progress/finished); optional auto-roll ONLY if no pregame teams today
+      • STRICT pregame when verify=1 (exclude in-progress/finished);
+        roll to tomorrow ONLY if there are zero pregame teams today.
     Response: { "date": "<effective_slate_date>", "candidates": [...], "debug": [...]? }
     """
     requested_date = _eastern_today_str() if _normalize(date) == "today" else date
     effective_date = requested_date
 
-    # breadth caps
     DEFAULT_MULT = max(1, int(scan_multiplier))
-    computed_max = min(1000, limit * DEFAULT_MULT)
+    computed_max = min(2000, limit * DEFAULT_MULT)
     MAX_LOG_CHECKS = max_log_checks if max_log_checks is not None else computed_max
 
-    with httpx.Client(timeout=15) as client:
-        # --- build pregame set for requested date
+    with httpx.Client(timeout=20) as client:
+        # schedule / pregame set
         sched = _schedule_for_date(client, effective_date)
         ns_team_ids_today = _not_started_team_ids_for_date(sched) if verify else set()
         slate_team_ids_today = _team_ids_from_schedule(sched) or _all_mlb_team_ids(client, season)
 
-        # --- Only roll to next slate if verify=1 and there are ZERO pregame teams today
         rolled = False
         if verify and roll_to_next_slate_if_empty and len(ns_team_ids_today) == 0:
             effective_date = _next_ymd_str(effective_date)
@@ -299,12 +362,12 @@ def cold_candidates(
             slate_team_ids_today = _team_ids_from_schedule(sched) or slate_team_ids_today
             rolled = True
 
-        # helper to run a single sweep for a given (effective) date
+        debug_list: Optional[List[Dict]] = [] if debug else None
+
         def run_once_for_date(target_date: str, ns_ids: set[int], team_ids: List[int]) -> Dict:
             candidates: List[Dict] = []
-            dbg: List[Dict] = []
 
-            # Names mode (explicit)
+            # explicit names mode
             if names:
                 requested_names = [n.strip() for n in names.split(",") if n.strip()]
                 for name in requested_names:
@@ -312,8 +375,8 @@ def cold_candidates(
                         data = _fetch_json(client, f"{MLB_BASE}/people/search", params={"names": name})
                         people = data.get("people", []) or []
                         if not people:
-                            if debug:
-                                dbg.append({"name": name, "skip": "player not found"})
+                            if debug_list is not None:
+                                debug_list.append({"name": name, "skip": "player not found"})
                             continue
                         norm_target = _normalize(name)
                         p0 = None
@@ -332,9 +395,9 @@ def cold_candidates(
                         team_id = team_info.get("id")
                         team_name = (team_info.get("name") or "").strip()
                         if season_avg is None or season_avg < min_season_avg:
-                            if debug:
+                            if debug_list is not None:
                                 reason = "no season stats" if season_avg is None else f"season_avg {season_avg:.3f} < {min_season_avg:.3f}"
-                                dbg.append({"name": person.get("fullName") or name, "team": team_name, "skip": reason})
+                                debug_list.append({"name": person.get("fullName") or name, "team": team_name, "skip": reason})
                             continue
                         if verify:
                             try:
@@ -342,14 +405,14 @@ def cold_candidates(
                             except Exception:
                                 tid = None
                             if (tid is None) or (tid not in ns_ids):
-                                if debug:
-                                    dbg.append({"name": person.get("fullName") or name, "team": team_name, "skip": "verify(strict): team not pregame"})
+                                if debug_list is not None:
+                                    debug_list.append({"name": person.get("fullName") or name, "team": team_name, "skip": "verify(strict): team not pregame"})
                                 continue
                         logs = _game_log_newest_first_regular_season(client, pid, season, max_entries=120)
                         streak = _current_hitless_streak_ab_gt0(logs)
                         if streak < min_hitless_games:
-                            if debug:
-                                dbg.append({"name": person.get("fullName") or name, "team": team_name, "skip": f"hitless_streak {streak} < {min_hitless_games}"})
+                            if debug_list is not None:
+                                debug_list.append({"name": person.get("fullName") or name, "team": team_name, "skip": f"hitless_streak {streak} < {min_hitless_games}"})
                             continue
                         candidates.append({
                             "name": person.get("fullName") or name,
@@ -358,25 +421,24 @@ def cold_candidates(
                             "hitless_streak": streak,
                         })
                         if len(candidates) >= limit:
-                            # don't over-collect
-                            pass
+                            break
                     except Exception as e:
-                        if debug:
-                            dbg.append({"name": name, "error": f"{type(e).__name__}: {e}"})
+                        if debug_list is not None:
+                            debug_list.append({"name": name, "error": f"{type(e).__name__}: {e}"})
                 candidates.sort(key=lambda x: (x.get("season_avg", 0.0), x.get("hitless_streak", 0)), reverse=True)
-                return {"candidates": candidates[:limit], "debug": dbg}
+                return {"candidates": candidates[:limit]}
 
-            # League scan mode: robust roster -> batch people(stats) -> selective logs
+            # league scan mode
             verify_set = ns_ids if verify else None
-            prospects = _prospects_via_people_batch(
+            prospects = _prospects_from_teams(
                 client=client,
                 season=season,
-                team_ids=team_ids if not verify else sorted(ns_ids),
+                team_ids=(sorted(ns_ids) if verify else team_ids),
                 verify_ns_team_ids=verify_set,
                 min_season_avg=min_season_avg,
+                dbg=debug_list,
             )
 
-            # selective logs (breadth controlled)
             checks = 0
             for _, meta in prospects:
                 if checks >= MAX_LOG_CHECKS:
@@ -395,21 +457,23 @@ def cold_candidates(
                         if len(candidates) >= limit:
                             break
                 except Exception as e:
-                    if debug:
-                        dbg.append({"name": meta["name"], "team": meta["team"], "error": f"{type(e).__name__}: {e}"})
+                    if debug_list is not None:
+                        debug_list.append({"name": meta["name"], "team": meta["team"], "error": f"{type(e).__name__}: {e}"})
 
             candidates.sort(key=lambda x: (x.get("season_avg", 0.0), x.get("hitless_streak", 0)), reverse=True)
-            if debug:
-                dbg.insert(0, {"prospects_scanned": len(prospects), "log_checks": checks, "max_log_checks": MAX_LOG_CHECKS})
-            return {"candidates": candidates[:limit], "debug": dbg}
+            if debug_list is not None:
+                debug_list.insert(0, {
+                    "prospects_scanned": len(prospects),
+                    "log_checks": checks,
+                    "max_log_checks": MAX_LOG_CHECKS
+                })
+            return {"candidates": candidates[:limit]}
 
-        # run for the (possibly rolled) effective date
-        run = run_once_for_date(effective_date, ns_team_ids_today, slate_team_ids_today)
-        candidates = run["candidates"]
-        debug_list = run["debug"] if debug else None
+        result = run_once_for_date(effective_date, ns_team_ids_today, slate_team_ids_today)
+        items = result["candidates"]
 
-        resp: Dict = {"date": effective_date, "candidates": candidates}
-        if debug:
+        response: Dict = {"date": effective_date, "candidates": items}
+        if debug_list is not None:
             stamp = {
                 "requested_date": requested_date,
                 "effective_date": effective_date,
@@ -425,8 +489,6 @@ def cold_candidates(
                     "max_log_checks": MAX_LOG_CHECKS,
                 },
             }
-            if debug_list is None:
-                debug_list = []
             debug_list.insert(0, stamp)
-            resp["debug"] = debug_list
-        return resp
+            response["debug"] = debug_list
+        return response
