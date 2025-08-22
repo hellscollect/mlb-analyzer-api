@@ -25,7 +25,7 @@ def _next_ymd_str(s: str) -> str:
 def _normalize(s: str) -> str:
     return unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii").lower().strip()
 
-def _parse_dt(maybe: Optional[str]) -> Optional[datetime]:
+def _parse_dt_utc(maybe: Optional[str]) -> Optional[datetime]:
     if not maybe:
         return None
     s = str(maybe)
@@ -34,13 +34,7 @@ def _parse_dt(maybe: Optional[str]) -> Optional[datetime]:
             return datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone(timezone.utc)
         return datetime.fromisoformat(s).astimezone(timezone.utc)
     except Exception:
-        pass
-    for fmt in ("%Y-%m-%d", "%m/%d/%Y"):
-        try:
-            return datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
-        except Exception:
-            continue
-    return None
+        return None
 
 def _fetch_json(client: httpx.Client, url: str, params: Optional[Dict] = None) -> Dict:
     r = client.get(url, params=params)
@@ -95,9 +89,8 @@ def _choose_best_mlb_season_split(splits: List[Dict]) -> Optional[Dict]:
     From a list of 'season' splits, pick the MLB-level one (AL/NL) with the MOST AB.
     Heuristics:
       • Prefer league.id in {103, 104}  (AL=103, NL=104)
-      • Else prefer sport.id == 1       (MLB sport)
+      • Else prefer sport.id == 1       (MLB)
       • Else fallback to the split with the most AB
-    Return the chosen split dict or None.
     """
     if not splits:
         return None
@@ -105,16 +98,14 @@ def _choose_best_mlb_season_split(splits: List[Dict]) -> Optional[Dict]:
     def split_score(sp: Dict) -> Tuple[int, int]:
         league_id = (((sp.get("league") or {}) or {}).get("id"))
         sport_id = (((sp.get("sport") or {}) or {}).get("id"))
-        # some payloads nest sport under team
         if sport_id is None:
             sport_id = (((sp.get("team") or {}).get("sport") or {}) or {}).get("id")
         try:
             ab = int((sp.get("stat") or {}).get("atBats") or 0)
         except Exception:
             ab = 0
-        # priority: AL/NL gets 2, sport==1 gets 1, else 0
-        p = 2 if league_id in (103, 104) else (1 if sport_id == 1 else 0)
-        return (p, ab)
+        priority = 2 if league_id in (103, 104) else (1 if sport_id == 1 else 0)
+        return (priority, ab)
 
     best = None
     best_key = (-1, -1)
@@ -128,7 +119,7 @@ def _choose_best_mlb_season_split(splits: List[Dict]) -> Optional[Dict]:
 def _season_avg_from_people_like(obj: Dict) -> Optional[float]:
     """
     Extract SEASON AVG from either a 'people' entry or hydrated 'person'.
-    Choose the MLB-level split (AL/NL) with max AB; fallback to most-AB split.
+    Choose MLB split (AL/NL) w/ max AB; fallback to most-AB split.
     """
     stats = (obj.get("stats") or [])
     for block in stats:
@@ -143,13 +134,12 @@ def _season_avg_from_people_like(obj: Dict) -> Optional[float]:
                 continue
             avg_str = (chosen.get("stat") or {}).get("avg")
             try:
-                # handle ".305", "0.305", or None/"-.-"
                 return float(str(avg_str))
             except Exception:
                 return None
     return None
 
-def _game_log_newest_first_regular_season(client: httpx.Client, pid: int, season: int, max_entries: int = 120) -> List[Dict]:
+def _game_log_regular_season_desc(client: httpx.Client, pid: int, season: int, max_entries: int = 120) -> List[Dict]:
     """
     Fetch hitting game logs and return REGULAR SEASON ('R') only, newest first.
     """
@@ -159,15 +149,13 @@ def _game_log_newest_first_regular_season(client: httpx.Client, pid: int, season
         params={"stats": "gameLog", "group": "hitting", "season": season, "sportIds": 1},
     )
     splits = ((data.get("stats") or [{}])[0].get("splits")) or []
-    filtered: List[Dict] = []
-    for s in splits:
+
+    def is_regular(s: Dict) -> bool:
         gt = s.get("gameType")
-        if gt is not None and gt != "R":
-            continue
-        filtered.append(s)
+        return (gt is None) or (gt == "R")
 
     def sort_key(s: Dict[str, Any]) -> tuple:
-        dt = _parse_dt(s.get("gameDate") or s.get("date"))
+        dt = _parse_dt_utc(s.get("gameDate") or s.get("date"))
         ts = dt.timestamp() if dt else -1.0
         pk = s.get("game", {}).get("gamePk") or s.get("gamePk") or 0
         try:
@@ -176,27 +164,44 @@ def _game_log_newest_first_regular_season(client: httpx.Client, pid: int, season
             pk = 0
         return (ts, pk)
 
+    filtered = [s for s in splits if is_regular(s)]
     filtered.sort(key=sort_key, reverse=True)
     return filtered[:max_entries]
 
-def _current_hitless_streak_ab_gt0(game_splits: List[Dict]) -> int:
+def _date_in_eastern(dt_utc: datetime) -> date_cls:
+    return dt_utc.astimezone(_EASTERN).date()
+
+def _current_hitless_streak_before_slate(game_splits: List[Dict], slate_date_ymd: str) -> int:
     """
-    Consecutive MOST-RECENT games with AB>0 and H==0; skip 0-AB/DNP entirely.
+    Consecutive MOST-RECENT games with AB>0 and H==0 **BEFORE the slate date (US/Eastern)**.
+    Skips any entries with 0 AB (DNP/PR only). Excludes all games on the slate date.
     """
+    slate_date = _parse_ymd(slate_date_ymd)
     streak = 0
     for s in game_splits:
-        stat = s.get("stat") or {}
-        ab = int(stat.get("atBats") or 0)
-        if ab <= 0:
+        dt_utc = _parse_dt_utc(s.get("gameDate") or s.get("date"))
+        if not dt_utc:
             continue
-        hits = int(stat.get("hits") or 0)
+        game_local_date = _date_in_eastern(dt_utc)
+        if game_local_date >= slate_date:
+            # exclude same-day (>= slate date); we only want strictly before the slate
+            continue
+        stat = s.get("stat") or {}
+        try:
+            ab = int(stat.get("atBats") or 0)
+            hits = int(stat.get("hits") or 0)
+        except Exception:
+            ab, hits = 0, 0
+        if ab <= 0:
+            # no AB -> ignore and continue scanning earlier games
+            continue
         if hits == 0:
             streak += 1
         else:
             break
     return streak
 
-# ---------- roster fetchers ----------
+# ---------- roster fetchers (robust) ----------
 def _team_roster_ids_multi(client: httpx.Client, team_id: int, season: int, dbg: Optional[List[Dict]]) -> List[int]:
     """
     Try multiple roster types; return person IDs.
@@ -206,7 +211,7 @@ def _team_roster_ids_multi(client: httpx.Client, team_id: int, season: int, dbg:
         ("Active", {"rosterType": "Active"}),
         ("40Man", {"rosterType": "40Man"}),
         ("fullSeason", {"rosterType": "fullSeason", "season": season}),
-        ("season", {"season": season})
+        ("season", {"season": season}),
     ]
     ids: List[int] = []
     for label, params in attempts:
@@ -360,12 +365,11 @@ def cold_candidates(
     debug: int = Query(0, ge=0, le=1),
 ):
     """
-    Verified cold-hitter candidates for betting:
+    VERIFIED cold-hitter candidates:
       • Good hitters (season AVG ≥ min_season_avg)
       • Current hitless streak (AB>0 only; DNP/0-AB ignored)
-      • STRICT pregame when verify=1 (exclude in-progress/finished);
-        roll to tomorrow ONLY if there are zero pregame teams today.
-    Response: { "date": "<effective_slate_date>", "candidates": [...], "debug": [...]? }
+      • STRICT pregame when verify=1 (exclude in-progress/finished)
+      • Exclude same-day games from streak calc (use previous games only)
     """
     requested_date = _eastern_today_str() if _normalize(date) == "today" else date
     effective_date = requested_date
@@ -374,7 +378,7 @@ def cold_candidates(
     computed_max = min(2000, limit * DEFAULT_MULT)
     MAX_LOG_CHECKS = max_log_checks if max_log_checks is not None else computed_max
 
-    with httpx.Client(timeout=20) as client:
+    with httpx.Client(timeout=25) as client:
         # schedule / pregame set
         sched = _schedule_for_date(client, effective_date)
         ns_team_ids_today = _not_started_team_ids_for_date(sched) if verify else set()
@@ -434,11 +438,25 @@ def cold_candidates(
                                 if debug_list is not None:
                                     debug_list.append({"name": person.get("fullName") or name, "team": team_name, "skip": "verify(strict): team not pregame"})
                                 continue
-                        logs = _game_log_newest_first_regular_season(client, pid, season, max_entries=120)
-                        streak = _current_hitless_streak_ab_gt0(logs)
+                        logs = _game_log_regular_season_desc(client, pid, season, max_entries=120)
+                        streak = _current_hitless_streak_before_slate(logs, target_date)
                         if streak < min_hitless_games:
                             if debug_list is not None:
-                                debug_list.append({"name": person.get("fullName") or name, "team": team_name, "skip": f"hitless_streak {streak} < {min_hitless_games}"})
+                                # capture last prior game sample for transparency
+                                sample = None
+                                for s in logs:
+                                    dt_utc = _parse_dt_utc(s.get("gameDate") or s.get("date"))
+                                    if not dt_utc:
+                                        continue
+                                    if _date_in_eastern(dt_utc) < _parse_ymd(target_date):
+                                        sample = s
+                                        break
+                                debug_list.append({
+                                    "name": person.get("fullName") or name,
+                                    "team": team_name,
+                                    "skip": f"hitless_streak {streak} < {min_hitless_games}",
+                                    "last_prior_game": sample
+                                })
                             continue
                         candidates.append({
                             "name": person.get("fullName") or name,
@@ -471,8 +489,8 @@ def cold_candidates(
                     break
                 checks += 1
                 try:
-                    logs = _game_log_newest_first_regular_season(client, meta["pid"], season, max_entries=120)
-                    streak = _current_hitless_streak_ab_gt0(logs)
+                    logs = _game_log_regular_season_desc(client, meta["pid"], season, max_entries=120)
+                    streak = _current_hitless_streak_before_slate(logs, target_date)
                     if streak >= min_hitless_games:
                         candidates.append({
                             "name": meta["name"],
