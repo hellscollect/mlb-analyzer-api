@@ -1,7 +1,7 @@
 # routes/schedule_proxy.py
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from fastapi import APIRouter, Query
 import httpx
 import pytz
@@ -28,7 +28,7 @@ def _normalize_date(date_str: str | None) -> str:
     return date_str
 
 # Serve both aliases so schema/instructions match code
-@router.get("/schedule_for_date")        # NEW alias to match your schema/instructions
+@router.get("/schedule_for_date")        # NEW alias to match schema/instructions
 @router.get("/mlb/schedule_for_date")    # existing path kept for compatibility
 async def schedule_for_date(date: str = Query("today")):
     """Proxy MLB schedule so /schedule_for_date and /mlb/schedule_for_date return 200 with JSON."""
