@@ -47,17 +47,25 @@ def _fetch_json(client: httpx.Client, url: str, params: Optional[Dict] = None) -
     r.raise_for_status()
     return r.json()
 
+def _fetch_json_safe(client: httpx.Client, url: str, params: Optional[Dict], dbg: Optional[List[Dict]], label: str) -> Dict:
+    try:
+        return _fetch_json(client, url, params=params)
+    except Exception as e:
+        if dbg is not None:
+            dbg.append({"fetch_error": label, "error": f"{type(e).__name__}: {e}"})
+        return {}
+
 # ---------- schedule helpers ----------
-def _schedule_for_date(client: httpx.Client, date_str: str) -> Dict:
-    return _fetch_json(client, f"{MLB_BASE}/schedule", params={"sportId": 1, "date": date_str})
+def _schedule_for_date(client: httpx.Client, date_str: str, dbg: Optional[List[Dict]]) -> Dict:
+    return _fetch_json_safe(client, f"{MLB_BASE}/schedule", {"sportId": 1, "date": date_str}, dbg, f"schedule:{date_str}")
 
 def _not_started_team_ids_for_date(schedule_json: Dict) -> Set[int]:
     """
     STRICT pregame set: P = Preview, S = Scheduled (not started yet).
     """
     ns_ids: Set[int] = set()
-    for d in schedule_json.get("dates", []):
-        for g in d.get("games", []):
+    for d in schedule_json.get("dates", []) or []:
+        for g in d.get("games", []) or []:
             code = (g.get("status", {}) or {}).get("statusCode", "")
             if code in ("P", "S"):
                 try:
@@ -69,8 +77,8 @@ def _not_started_team_ids_for_date(schedule_json: Dict) -> Set[int]:
 
 def _team_ids_from_schedule(schedule_json: Dict) -> List[int]:
     ids: Set[int] = set()
-    for d in schedule_json.get("dates", []):
-        for g in d.get("games", []):
+    for d in schedule_json.get("dates", []) or []:
+        for g in d.get("games", []) or []:
             try:
                 ids.add(int(g["teams"]["home"]["team"]["id"]))
                 ids.add(int(g["teams"]["away"]["team"]["id"]))
@@ -84,8 +92,8 @@ def _game_pks_for_date(schedule_json: Dict) -> Set[int]:
     even if provider timestamps are weird or in-progress rows are present).
     """
     pks: Set[int] = set()
-    for d in schedule_json.get("dates", []):
-        for g in d.get("games", []):
+    for d in schedule_json.get("dates", []) or []:
+        for g in d.get("games", []) or []:
             pk = g.get("gamePk")
             try:
                 if pk is not None:
@@ -94,8 +102,8 @@ def _game_pks_for_date(schedule_json: Dict) -> Set[int]:
                 continue
     return pks
 
-def _all_mlb_team_ids(client: httpx.Client, season: int) -> List[int]:
-    data = _fetch_json(client, f"{MLB_BASE}/teams", params={"sportId": 1, "season": season})
+def _all_mlb_team_ids(client: httpx.Client, season: int, dbg: Optional[List[Dict]]) -> List[int]:
+    data = _fetch_json_safe(client, f"{MLB_BASE}/teams", {"sportId": 1, "season": season}, dbg, f"teams:{season}")
     teams = data.get("teams", []) or []
     out: List[int] = []
     for t in teams:
@@ -151,11 +159,12 @@ def _season_avg_from_people_like(obj: Dict) -> Optional[float]:
                 return None
     return None
 
-def _game_log_regular_season_desc(client: httpx.Client, pid: int, season: int, max_entries: int = 160) -> List[Dict]:
-    data = _fetch_json(
+def _game_log_regular_season_desc(client: httpx.Client, pid: int, season: int, max_entries: int, dbg: Optional[List[Dict]]) -> List[Dict]:
+    data = _fetch_json_safe(
         client,
         f"{MLB_BASE}/people/{pid}/stats",
-        params={"stats": "gameLog", "group": "hitting", "season": season, "sportIds": 1},
+        {"stats": "gameLog", "group": "hitting", "season": season, "sportIds": 1},
+        dbg, f"gameLog:{pid}:{season}"
     )
     splits = ((data.get("stats") or [{}])[0].get("splits")) or []
 
@@ -190,24 +199,19 @@ def _extract_team_name_from_person_or_logs(
     """
     Robust team-name fallback order:
     1) person.currentTeam.name
-    2) person.team.name  (present on many /people hydrates)
+    2) person.team.name
     3) latest pre-slate log's team.name
-    4) team_map[pid].name (if available)
+    4) team_map[pid].name
     5) "N/A"
     """
-    # 1) currentTeam
     team_info = (person_like.get("currentTeam") or {}) if isinstance(person_like, dict) else {}
     name = (team_info.get("name") or "").strip()
     if name:
         return name
-
-    # 2) top-level team
     t2 = (person_like.get("team") or {})
     name2 = (t2.get("name") or "").strip()
     if name2:
         return name2
-
-    # 3) pull from logs (most recent PRE-slate entry)
     if logs and slate_date_ymd:
         slate_date = _parse_ymd(slate_date_ymd)
         for s in logs:
@@ -220,12 +224,8 @@ def _extract_team_name_from_person_or_logs(
             nm = (t.get("name") or "").strip()
             if nm:
                 return nm
-
-    # 4) team_map
     if pid is not None and team_map and pid in team_map:
         return (team_map[pid][1] or "").strip() or "N/A"
-
-    # 5) fallback
     return "N/A"
 
 def _current_hitless_streak_before_slate(
@@ -242,7 +242,6 @@ def _current_hitless_streak_before_slate(
     exclude_game_pks = exclude_game_pks or set()
     streak = 0
     for s in game_splits:
-        # exclude explicit same-day by gamePk first (robust vs provider quirks)
         pk = s.get("game", {}).get("gamePk") or s.get("gamePk")
         try:
             if pk is not None and int(pk) in exclude_game_pks:
@@ -283,7 +282,6 @@ def _average_hitless_streak_before_slate(
     slate_date = _parse_ymd(slate_date_ymd)
     exclude_game_pks = exclude_game_pks or set()
 
-    # Build chronological list of prior games with AB>0 (oldest -> newest)
     prior: List[Dict] = []
     for s in game_splits:
         pk = s.get("game", {}).get("gamePk") or s.get("gamePk")
@@ -297,7 +295,7 @@ def _average_hitless_streak_before_slate(
         if not dt_utc:
             continue
         if _date_in_eastern(dt_utc) >= slate_date:
-            continue  # exclude same-day and future
+            continue
         stat = s.get("stat") or {}
         try:
             ab = int(stat.get("atBats") or 0)
@@ -500,7 +498,7 @@ def cold_candidates(
     scan_multiplier: int = Query(8, ge=1, le=40, description="How many logs to check: limit × scan_multiplier (cap applies)"),
     max_log_checks: Optional[int] = Query(None, ge=1, le=5000, description="Hard cap for log checks; overrides scan_multiplier."),
     debug: int = Query(0, ge=0, le=1),
-    # --- New additive params ---
+    # --- Additive params ---
     mode: Optional[str] = Query(None, description="Alias for verify. 'pregame' -> verify=1, 'all' -> verify=0. If set, overrides verify."),
     as_of: Optional[str] = Query(None, description="YYYY-MM-DD snapshot for streak math. If not today ET, verification is disabled and no roll-forward."),
     group_by: str = Query("streak", description="Streak grouping preset: 'streak' or 'none' (affects sort preset only; response shape unchanged)."),
@@ -549,30 +547,37 @@ def cold_candidates(
     computed_max = min(3000, limit * DEFAULT_MULT)
     MAX_LOG_CHECKS = max_log_checks if max_log_checks is not None else computed_max
 
+    # Adaptive load shedding for verify=0 (ALL teams) when user didn't set caps
+    if verify_effective == 0:
+        # only impose caps if the user didn't explicitly set them
+        if max_log_checks is None:
+            MAX_LOG_CHECKS = min(MAX_LOG_CHECKS, 400)
+        if "limit" in cold_candidates.__signature__.parameters:  # safety no-op, always true
+            if limit > 30:
+                limit = 30  # gentle cap to avoid timeouts
+
     # --- sort/group presets
     if (group_by or "").strip().lower() == "none":
         sort_spec = _parse_sort_by(sort_by)
     else:
         sort_spec = _parse_sort_by(sort_by) if sort_by else [("hitless_streak", True), ("season_avg", True), ("avg_hitless_streak_season", True)]
 
-    with httpx.Client(timeout=25) as client:
-        # schedule & helpers for this date
-        sched = _schedule_for_date(client, effective_date) if not historical_mode or verify_effective else _schedule_for_date(client, effective_date)
-        ns_team_ids_today = _not_started_team_ids_for_date(sched) if verify_effective else set()
-        slate_team_ids_today = _team_ids_from_schedule(sched) if sched else _all_mlb_team_ids(client, season)
-        # robust guard: exclude *any* gamePk on the schedule date from streak math
+    with httpx.Client(timeout=45) as client:
+        # schedule & helpers for this date (fault tolerant)
+        debug_list: Optional[List[Dict]] = [] if debug else None
+        sched = _schedule_for_date(client, effective_date, debug_list)
+        ns_team_ids_today = _not_started_team_ids_for_date(sched) if (verify_effective == 1) else set()
+        slate_team_ids_today = _team_ids_from_schedule(sched) if sched else _all_mlb_team_ids(client, season, debug_list)
         exclude_pks_for_date = _game_pks_for_date(sched) if sched else set()
 
         rolled = False
         if (verify_effective == 1) and roll_enabled and len(ns_team_ids_today) == 0:
             effective_date = _next_ymd_str(effective_date)
-            sched = _schedule_for_date(client, effective_date)
+            sched = _schedule_for_date(client, effective_date, debug_list)
             ns_team_ids_today = _not_started_team_ids_for_date(sched)
             slate_team_ids_today = _team_ids_from_schedule(sched) or slate_team_ids_today
             exclude_pks_for_date = _game_pks_for_date(sched)
             rolled = True
-
-        debug_list: Optional[List[Dict]] = [] if debug else None
 
         def run_once_for_date(target_date: str, ns_ids: Set[int], team_ids: List[int]) -> Dict:
             candidates: List[Dict] = []
@@ -596,8 +601,7 @@ def cold_candidates(
                         person = (pdata.get("people") or [{}])[0]
                         season_avg = _season_avg_from_people_like(person)
 
-                        # Logs for team fallback and streaks
-                        logs = _game_log_regular_season_desc(client, pid, season, max_entries=160)
+                        logs = _game_log_regular_season_desc(client, pid, season, max_entries=160, dbg=debug_list)
                         streak = _current_hitless_streak_before_slate(logs, target_date, exclude_pks_for_date)
                         if season_avg is None or season_avg < min_season_avg or streak < min_hitless_games:
                             if debug_list is not None:
@@ -627,7 +631,7 @@ def cold_candidates(
                 return {"candidates": candidates[:limit]}
 
             # league scan mode
-            scan_team_ids = sorted(ns_ids) if verify_effective else team_ids
+            scan_team_ids = sorted(ns_ids) if verify_effective == 1 else team_ids
 
             # (A) Union of player IDs across roster endpoints + team hydrate
             union_ids, team_map = _collect_union_player_ids(client, scan_team_ids, season, debug_list)
@@ -656,8 +660,7 @@ def cold_candidates(
                 if pid is None:
                     continue
 
-                # team verification only when verify_effective = 1
-                if verify_effective:
+                if verify_effective == 1:
                     team_info = p.get("currentTeam") or {}
                     try:
                         team_id = int(team_info.get("id")) if team_info.get("id") is not None else None
@@ -666,7 +669,6 @@ def cold_candidates(
                     if team_id is None or team_id not in ns_ids:
                         continue
 
-                # stash for later streak calc
                 prospects.append((
                     float(season_avg),
                     {
@@ -686,7 +688,7 @@ def cold_candidates(
                     break
                 checks += 1
                 try:
-                    logs = _game_log_regular_season_desc(client, meta["pid"], season, max_entries=160)
+                    logs = _game_log_regular_season_desc(client, meta["pid"], season, max_entries=160, dbg=debug_list)
                     streak = _current_hitless_streak_before_slate(logs, target_date, exclude_pks_for_date)
                     if streak >= min_hitless_games:
                         avg_season_hitless = _average_hitless_streak_before_slate(logs, target_date, exclude_pks_for_date)
@@ -739,6 +741,5 @@ def cold_candidates(
                     "sort_by": sort_by or None,
                 }
             }
-            debug_list.insert(0, stamp)
-            response["debug"] = debug_list
+            response["debug"] = [stamp] + (debug_list or [])
         return response
