@@ -497,7 +497,7 @@ def _batch_people_with_stats(client: httpx.Client, ids: List[int], season: int, 
     return out
 
 # ---------- sorting helpers ----------
-_VALID_SORT_KEYS = {"hitless_streak", "season_avg", "avg_hitless_streak_season", "break_prob_next", "pressure", "score"}
+_VALID_SORT_KEYS = {"hitless_streak", "season_avg", "avg_hitless_streak_season", "break_prob_next", "pressure", "score", "hit_chance_pct", "overdue_ratio", "ranking_score"}
 
 def _parse_sort_by(sort_by: Optional[str]) -> List[Tuple[str, bool]]:
     """
@@ -550,7 +550,7 @@ def cold_candidates(
     mode: Optional[str] = Query(None, description="Alias for verify. 'pregame' -> verify=1, 'all' -> verify=0. If set, overrides verify."),
     as_of: Optional[str] = Query(None, description="YYYY-MM-DD snapshot for streak math. If not today ET, verification is disabled and no roll-forward."),
     group_by: str = Query("streak", description="Grouping preset: 'streak' (default) or 'none'. If 'streak', we bucket by hitless_streak and sort inside buckets by score."),
-    sort_by: Optional[str] = Query(None, description="When group_by='none', comma-separated fields with optional '-' for DESC. Fields: hitless_streak,season_avg,avg_hitless_streak_season,break_prob_next,pressure,score."),
+    sort_by: Optional[str] = Query(None, description="When group_by='none', comma-separated fields with optional '-' for DESC. Fields: hitless_streak,season_avg,avg_hitless_streak_season,break_prob_next,pressure,score,hit_chance_pct,overdue_ratio,ranking_score."),
 ):
     """
     VERIFIED cold-hitter candidates:
@@ -559,8 +559,8 @@ def cold_candidates(
       • STRICT pregame when verify=1 (exclude in-progress/finished)
       • Exclude same-day games from streak calc (use previous games only)
       • avg_hitless_streak_season = average length of COMPLETED hitless streaks before the slate date
-      • NEW: break_prob_next (tonight’s ≥1 hit probability), expected_abs (season AB/G), pressure, score = break_prob_next × pressure
-      • Default presentation: grouped by hitless_streak; within each group sorted by score (desc)
+      • Derived: expected_abs (season AB/G), break_prob_next (0..100%), pressure, score=break_prob_next×pressure
+      • Aliases for clarity: hit_chance_pct (== break_prob_next), overdue_ratio (== pressure), ranking_score (== score)
     """
     requested_date = _eastern_today_str() if _normalize(date) == "today" else date
     effective_date = requested_date
@@ -628,15 +628,14 @@ def cold_candidates(
 
         def _decorate_candidate(base: Dict, logs: Optional[List[Dict]], as_of_date: str) -> Dict:
             """
-            Add expected_abs, break_prob_next, pressure, score to a candidate dict.
+            Add expected_abs, break_prob_next, pressure, score and aliases to a candidate dict.
             """
             person_like = base.get("_person_like") or {}
             season_avg = float(base.get("season_avg", 0.0))
 
             expected_abs = _expected_abs_from_person(person_like)
-            break_prob = _break_prob_from_avg_and_ab(season_avg, expected_abs)
+            break_prob = _break_prob_from_avg_and_ab(season_avg, expected_abs)  # 0..1
 
-            # pressure = current_streak / max(0.5, avg_hitless_streak_season or 1.0)
             current = int(base.get("hitless_streak", 0))
             avg_streak = base.get("avg_hitless_streak_season", None)
             try:
@@ -648,10 +647,17 @@ def cold_candidates(
 
             score = break_prob * pressure
 
+            # canonical fields
             base["expected_abs"] = round(expected_abs, 2)
-            base["break_prob_next"] = round(break_prob * 100.0, 1)  # percentage 0..100 for display
+            base["break_prob_next"] = round(break_prob * 100.0, 1)  # percent display
             base["pressure"] = round(pressure, 3)
-            base["score"] = round(score * 100.0, 1)  # scaled to 0..100 for display
+            base["score"] = round(score * 100.0, 1)
+
+            # alias fields (preferred names for UI/GPT)
+            base["hit_chance_pct"] = base["break_prob_next"]
+            base["overdue_ratio"] = base["pressure"]
+            base["ranking_score"] = base["score"]
+
             base.pop("_person_like", None)
             return base
 
@@ -708,21 +714,19 @@ def cold_candidates(
                             debug_list.append({"name": name, "error": f"{type(e).__name__}: {e}"})
                 # Presentation
                 if group_mode == "streak":
-                    # group by hitless_streak desc, within group by score desc
                     buckets: Dict[int, List[Dict]] = {}
                     for c in candidates:
                         buckets.setdefault(int(c.get("hitless_streak", 0)), []).append(c)
                     out_list: List[Dict] = []
                     for k in sorted(buckets.keys(), reverse=True):
-                        grp = sorted(buckets[k], key=lambda x: float(x.get("score", 0.0)), reverse=True)
+                        grp = sorted(buckets[k], key=lambda x: float(x.get("ranking_score", x.get("score", 0.0))), reverse=True)
                         out_list.extend(grp)
                     candidates = out_list[:limit]
                 else:
-                    # group_by=none uses explicit sort_by if provided, else score desc then season_avg desc
                     if sort_spec:
                         candidates = _apply_sort(candidates, sort_spec)
                     else:
-                        candidates = sorted(candidates, key=lambda x: (float(x.get("score", 0.0)), float(x.get("season_avg", 0.0))), reverse=True)
+                        candidates = sorted(candidates, key=lambda x: (float(x.get("ranking_score", x.get("score", 0.0))), float(x.get("season_avg", 0.0))), reverse=True)
                     candidates = candidates[:limit]
                 return {"candidates": candidates}
 
@@ -777,7 +781,7 @@ def cold_candidates(
 
             prospects.sort(key=lambda x: x[0], reverse=True)
 
-            # (E) Logs+streaks for prospects (capped), and include avg_hitless_streak_season + derived metrics
+            # (E) Logs+streaks for prospects (capped), and include derived metrics
             checks = 0
             for _, meta in prospects:
                 if checks >= MAX_LOG_CHECKS or len(candidates) >= limit:
@@ -803,7 +807,8 @@ def cold_candidates(
                         candidates.append(cand)
                 except Exception as e:
                     if debug_list is not None:
-                        debug_list.append({"name": meta.get("name", ""), "error": f"{type(e).__name__}: {e}"})
+                        dbg_name = meta.get("name", "")
+                        debug_list.append({"name": dbg_name, "error": f"{type(e).__name__}: {e}"})
 
             # Presentation
             if group_mode == "streak":
@@ -812,14 +817,14 @@ def cold_candidates(
                     buckets.setdefault(int(c.get("hitless_streak", 0)), []).append(c)
                 out_list: List[Dict] = []
                 for k in sorted(buckets.keys(), reverse=True):
-                    grp = sorted(buckets[k], key=lambda x: float(x.get("score", 0.0)), reverse=True)
+                    grp = sorted(buckets[k], key=lambda x: float(x.get("ranking_score", x.get("score", 0.0))), reverse=True)
                     out_list.extend(grp)
                 candidates = out_list[:limit]
             else:
                 if sort_spec:
                     candidates = _apply_sort(candidates, sort_spec)
                 else:
-                    candidates = sorted(candidates, key=lambda x: (float(x.get("score", 0.0)), float(x.get("season_avg", 0.0))), reverse=True)
+                    candidates = sorted(candidates, key=lambda x: (float(x.get("ranking_score", x.get("score", 0.0))), float(x.get("season_avg", 0.0))), reverse=True)
                 candidates = candidates[:limit]
 
             if debug_list is not None:
