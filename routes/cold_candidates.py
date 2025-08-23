@@ -229,12 +229,16 @@ def _extract_team_name_from_person_or_logs(
         return (team_map[pid][1] or "").strip() or "N/A"
     return "N/A"
 
-# ---------- hitless streak math (excludes same-day; AB>0 only; can exclude slate gamePks) ----------
 def _current_hitless_streak_before_slate(
     game_splits: List[Dict],
     slate_date_ymd: str,
     exclude_game_pks: Optional[Set[int]] = None
 ) -> int:
+    """
+    Consecutive MOST-RECENT games with AB>0 and H==0 BEFORE the slate date (ET).
+    Ignores 0-AB games. Excludes same-day games. Additionally skips any game
+    whose gamePk is on the slate's schedule (to avoid in-progress inclusion).
+    """
     slate_date = _parse_ymd(slate_date_ymd)
     exclude_game_pks = exclude_game_pks or set()
     streak = 0
@@ -266,15 +270,15 @@ def _current_hitless_streak_before_slate(
             break
     return streak
 
-def _completed_hitless_streak_lengths_before_slate(
+def _average_hitless_streak_before_slate(
     game_splits: List[Dict],
     slate_date_ymd: str,
     exclude_game_pks: Optional[Set[int]] = None
-) -> List[int]:
+) -> Optional[float]:
     """
-    Return lengths of COMPLETED hitless streaks (AB>0 only) prior to the slate date.
-    Excludes same-day and skips any game whose gamePk is on the slate schedule.
-    Does NOT include the current unfinished run.
+    Average length of COMPLETED hitless streaks (AB>0 only) over the season
+    BEFORE the slate date (ET). Excludes same-day games and the current
+    ongoing run; also skips any game whose gamePk is on the slate schedule.
     """
     slate_date = _parse_ymd(slate_date_ymd)
     exclude_game_pks = exclude_game_pks or set()
@@ -287,6 +291,7 @@ def _completed_hitless_streak_lengths_before_slate(
                 continue
         except Exception:
             pass
+
         dt_utc = _parse_dt_utc(s.get("gameDate") or s.get("date"))
         if not dt_utc:
             continue
@@ -315,31 +320,54 @@ def _completed_hitless_streak_lengths_before_slate(
             if run > 0:
                 streaks.append(run)
                 run = 0
-    # trailing run (if any) is unfinished -> excluded
-    return streaks
 
-def _avg_std_p95_from_lengths(lengths: List[int]) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    if not streaks:
+        return None
+    return sum(streaks) / len(streaks)
+
+def _avg_ab_per_game_before_slate(
+    game_splits: List[Dict],
+    slate_date_ymd: str,
+    exclude_game_pks: Optional[Set[int]] = None
+) -> Optional[float]:
     """
-    Return (avg, std, p95). std is population std (n), not sample (n-1).
-    p95 is an empirical percentile from the sorted list.
+    Compute average AB per game BEFORE the slate date (ET).
+    - Ignores games with missing stats.
+    - Includes 0-AB games to avoid overstating AB expectation.
+    - Skips same-day/future games and any gamePk on the slate.
     """
-    if not lengths:
-        return None, None, None
-    n = len(lengths)
-    avg = sum(lengths) / n
-    if n >= 2:
-        var = sum((x - avg) ** 2 for x in lengths) / n
-        std = math.sqrt(var)
-    else:
-        std = None
-    # empirical percentile
-    sl = sorted(lengths)
-    if n == 1:
-        p95 = float(sl[0])
-    else:
-        idx = int(round(0.95 * (n - 1)))
-        p95 = float(sl[max(0, min(idx, n - 1))])
-    return float(avg), (float(std) if std is not None else None), float(p95)
+    slate_date = _parse_ymd(slate_date_ymd)
+    exclude_game_pks = exclude_game_pks or set()
+    total_ab = 0
+    games = 0
+    for s in game_splits:
+        pk = s.get("game", {}).get("gamePk") or s.get("gamePk")
+        try:
+            if pk is not None and int(pk) in exclude_game_pks:
+                continue
+        except Exception:
+            pass
+
+        dt_utc = _parse_dt_utc(s.get("gameDate") or s.get("date"))
+        if not dt_utc:
+            continue
+        if _date_in_eastern(dt_utc) >= slate_date:
+            continue
+
+        stat = s.get("stat") or {}
+        if not isinstance(stat, dict):
+            continue
+        try:
+            ab = int(stat.get("atBats") or 0)
+        except Exception:
+            ab = 0
+
+        total_ab += ab
+        games += 1
+
+    if games <= 0:
+        return None
+    return total_ab / games
 
 # ---------- roster & people collection ----------
 def _team_roster_ids_multi(client: httpx.Client, team_id: int, season: int, dbg: Optional[List[Dict]]) -> List[int]:
@@ -471,9 +499,8 @@ _VALID_SORT_KEYS = {
     "season_avg",
     "avg_hitless_streak_season",
     "streak_pressure",
-    "streak_z",
-    "streak_vs_p95",
-    "max_hitless_streak_season",
+    "break_prob_next",
+    "break_score",
 }
 
 def _parse_sort_by(sort_by: Optional[str]) -> List[Tuple[str, bool]]:
@@ -508,6 +535,60 @@ def _apply_sort(candidates: List[Dict], sort_spec: List[Tuple[str, bool]]) -> Li
         return tuple(keys)
     return sorted(candidates, key=key_fn)
 
+# ---------- compute add-ons for each candidate ----------
+def _attach_due_metrics(
+    *,
+    candidate: Dict,
+    logs: List[Dict],
+    slate_date_ymd: str,
+    expected_ab_override: Optional[float],
+    exclude_game_pks: Optional[Set[int]],
+) -> None:
+    """
+    Mutates candidate in place to add:
+      - streak_pressure
+      - break_prob_next
+      - break_score
+      - expected_ab_used
+    Uses season_avg (as per-AB hit prob) and AB/game from logs before slate (or override).
+    """
+    season_avg = float(candidate.get("season_avg") or 0.0)
+    hitless_streak = int(candidate.get("hitless_streak") or 0)
+    avg_streak = candidate.get("avg_hitless_streak_season")
+    try:
+        avg_streak = None if avg_streak is None else float(avg_streak)
+    except Exception:
+        avg_streak = None
+
+    # streak_pressure
+    denom = max(1.0, (avg_streak if (avg_streak is not None and avg_streak > 0) else 1.0))
+    streak_pressure = hitless_streak / denom
+    candidate["streak_pressure"] = round(streak_pressure, 3)
+
+    # expected AB
+    if expected_ab_override is not None and expected_ab_override > 0:
+        expected_ab = float(expected_ab_override)
+    else:
+        ab_avg = _avg_ab_per_game_before_slate(logs, slate_date_ymd, exclude_game_pks)
+        if ab_avg is None or ab_avg <= 0:
+            expected_ab = 4.1  # sane slate-wide fallback
+        else:
+            expected_ab = max(2.5, min(5.5, float(ab_avg)))  # clamp for stability
+    candidate["expected_ab_used"] = round(expected_ab, 2)
+
+    # break_prob_next = 1 - (1 - AVG) ^ expected_ab
+    p_hit_per_ab = max(0.0, min(1.0, season_avg))
+    try:
+        break_prob_next = 1.0 - math.pow(1.0 - p_hit_per_ab, expected_ab)
+    except Exception:
+        break_prob_next = 0.0
+    candidate["break_prob_next"] = round(break_prob_next, 4)
+
+    # break_score (0–100): 60% tonight probability, 40% “overdue” pressure
+    pressure_scaled = min(1.5, streak_pressure) / 1.5  # cap tails; scale to [0,1]
+    break_score = 100.0 * (0.6 * break_prob_next + 0.4 * pressure_scaled)
+    candidate["break_score"] = round(break_score, 1)
+
 # ---------- route ----------
 @router.get("/cold_candidates")
 def cold_candidates(
@@ -527,7 +608,8 @@ def cold_candidates(
     mode: Optional[str] = Query(None, description="Alias for verify. 'pregame' -> verify=1, 'all' -> verify=0. If set, overrides verify."),
     as_of: Optional[str] = Query(None, description="YYYY-MM-DD snapshot for streak math. If not today ET, verification is disabled and no roll-forward."),
     group_by: str = Query("streak", description="Streak grouping preset: 'streak' or 'none' (affects sort preset only; response shape unchanged)."),
-    sort_by: Optional[str] = Query(None, description="Comma-separated fields with optional '-' for DESC. Fields include: hitless_streak,season_avg,avg_hitless_streak_season,streak_pressure,streak_z,streak_vs_p95,max_hitless_streak_season."),
+    sort_by: Optional[str] = Query(None, description="Comma-separated fields with optional '-' for DESC. Fields: hitless_streak,season_avg,avg_hitless_streak_season,streak_pressure,break_prob_next,break_score."),
+    expected_ab: Optional[float] = Query(None, ge=0.0, description="Override expected AB for break_prob_next/break_score; if omitted, use season AB/game before slate."),
 ):
     """
     VERIFIED cold-hitter candidates:
@@ -536,10 +618,7 @@ def cold_candidates(
       • STRICT pregame when verify=1 (exclude in-progress/finished)
       • Exclude same-day games from streak calc (use previous games only)
       • avg_hitless_streak_season = average length of COMPLETED hitless streaks before the slate date
-      • streak_pressure = hitless_streak / avg_hitless_streak_season (if avg > 0)
-      • streak_z = z-score of current streak vs distribution of completed hitless streaks
-      • streak_vs_p95 = hitless_streak / player’s season 95th percentile completed streak length
-      • max_hitless_streak_season = max completed run (context for ceiling)
+      • NEW: streak_pressure, break_prob_next, break_score (uses season AVG + expected AB)
     """
     requested_date = _eastern_today_str() if _normalize(date) == "today" else date
     effective_date = requested_date
@@ -580,15 +659,18 @@ def cold_candidates(
     if verify_effective == 0:
         if max_log_checks is None:
             MAX_LOG_CHECKS = min(MAX_LOG_CHECKS, 400)
-        if "limit" in cold_candidates.__signature__.parameters:
-            if limit > 30:
-                limit = 30  # avoid timeouts
+        if "limit" in cold_candidates.__signature__.parameters and limit > 30:
+            limit = 30  # avoid timeouts
 
     # --- sort/group presets
     if (group_by or "").strip().lower() == "none":
         sort_spec = _parse_sort_by(sort_by)
     else:
-        sort_spec = _parse_sort_by(sort_by) if sort_by else [("hitless_streak", True), ("season_avg", True), ("avg_hitless_streak_season", True)]
+        sort_spec = _parse_sort_by(sort_by) if sort_by else [
+            ("hitless_streak", True),
+            ("season_avg", True),
+            ("avg_hitless_streak_season", True),
+        ]
 
     with httpx.Client(timeout=45) as client:
         # schedule & helpers for this date (fault tolerant)
@@ -631,11 +713,6 @@ def cold_candidates(
 
                         logs = _game_log_regular_season_desc(client, pid, season, max_entries=160, dbg=debug_list)
                         streak = _current_hitless_streak_before_slate(logs, target_date, exclude_pks_for_date)
-
-                        # completed streak distribution
-                        completed = _completed_hitless_streak_lengths_before_slate(logs, target_date, exclude_pks_for_date)
-                        avg_len, std_len, p95_len = _avg_std_p95_from_lengths(completed)
-
                         if season_avg is None or season_avg < min_season_avg or streak < min_hitless_games:
                             if debug_list is not None:
                                 why = []
@@ -646,27 +723,24 @@ def cold_candidates(
                             continue
 
                         team_name = _extract_team_name_from_person_or_logs(person, None, pid, logs, target_date)
+                        avg_season_hitless = _average_hitless_streak_before_slate(logs, target_date, exclude_pks_for_date)
 
-                        avg_season_hitless = avg_len
-                        pressure = round(streak / avg_season_hitless, 2) if (avg_season_hitless and avg_season_hitless > 0) else None
-                        z = None
-                        if std_len and std_len > 0 and avg_len is not None:
-                            z = round((streak - avg_len) / std_len, 2)
-                        vs_p95 = None
-                        if p95_len and p95_len > 0:
-                            vs_p95 = round(streak / p95_len, 2)
-
-                        candidates.append({
+                        cand = {
                             "name": person.get("fullName") or name,
                             "team": team_name,
                             "season_avg": round(float(season_avg), 3),
                             "hitless_streak": streak,
                             "avg_hitless_streak_season": round(avg_season_hitless, 2) if avg_season_hitless is not None else 0.0,
-                            "max_hitless_streak_season": (max(completed) if completed else 0),
-                            "streak_pressure": pressure,
-                            "streak_z": z,
-                            "streak_vs_p95": vs_p95,
-                        })
+                        }
+                        _attach_due_metrics(
+                            candidate=cand,
+                            logs=logs,
+                            slate_date_ymd=target_date,
+                            expected_ab_override=expected_ab,
+                            exclude_game_pks=exclude_pks_for_date,
+                        )
+
+                        candidates.append(cand)
                         if len(candidates) >= limit:
                             break
                     except Exception as e:
@@ -726,7 +800,7 @@ def cold_candidates(
 
             prospects.sort(key=lambda x: x[0], reverse=True)
 
-            # (E) Logs+streaks for prospects (capped), with distribution metrics
+            # (E) Logs+streaks for prospects (capped), compute metrics, include avg_hitless_streak_season
             checks = 0
             for _, meta in prospects:
                 if checks >= MAX_LOG_CHECKS or len(candidates) >= limit:
@@ -736,31 +810,25 @@ def cold_candidates(
                     logs = _game_log_regular_season_desc(client, meta["pid"], season, max_entries=160, dbg=debug_list)
                     streak = _current_hitless_streak_before_slate(logs, target_date, exclude_pks_for_date)
                     if streak >= min_hitless_games:
-                        completed = _completed_hitless_streak_lengths_before_slate(logs, target_date, exclude_pks_for_date)
-                        avg_len, std_len, p95_len = _avg_std_p95_from_lengths(completed)
-
-                        pressure = round(streak / avg_len, 2) if (avg_len and avg_len > 0) else None
-                        z = None
-                        if std_len and std_len > 0 and avg_len is not None:
-                            z = round((streak - avg_len) / std_len, 2)
-                        vs_p95 = None
-                        if p95_len and p95_len > 0:
-                            vs_p95 = round(streak / p95_len, 2)
-
+                        avg_season_hitless = _average_hitless_streak_before_slate(logs, target_date, exclude_pks_for_date)
                         team_name = _extract_team_name_from_person_or_logs(
                             meta["person"], team_map, meta["pid"], logs, target_date
                         )
-                        candidates.append({
+                        cand = {
                             "name": meta["name"],
                             "team": team_name,
                             "season_avg": meta["season_avg"],
                             "hitless_streak": streak,
-                            "avg_hitless_streak_season": round(avg_len, 2) if avg_len is not None else 0.0,
-                            "max_hitless_streak_season": (max(completed) if completed else 0),
-                            "streak_pressure": pressure,
-                            "streak_z": z,
-                            "streak_vs_p95": vs_p95,
-                        })
+                            "avg_hitless_streak_season": round(avg_season_hitless, 2) if avg_season_hitless is not None else 0.0,
+                        }
+                        _attach_due_metrics(
+                            candidate=cand,
+                            logs=logs,
+                            slate_date_ymd=target_date,
+                            expected_ab_override=expected_ab,
+                            exclude_game_pks=exclude_pks_for_date,
+                        )
+                        candidates.append(cand)
                 except Exception as e:
                     if debug_list is not None:
                         debug_list.append({"name": meta.get("name", ""), "error": f"{type(e).__name__}: {e}"})
@@ -798,6 +866,7 @@ def cold_candidates(
                     "as_of": as_of_norm or None,
                     "group_by": group_by,
                     "sort_by": sort_by or None,
+                    "expected_ab": expected_ab if expected_ab is not None else "(season_ab_per_game)",
                 }
             }
             response["debug"] = [stamp] + (debug_list or [])
