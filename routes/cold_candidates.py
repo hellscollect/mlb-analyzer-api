@@ -590,11 +590,13 @@ def _fetch_hit_odds(names: List[str], *, sportsbook: str = "draftkings", market:
 
 def _build_summary_line(row: Dict[str, Any]) -> str:
     nm = row.get("name","")
-    avg = row.get("season_avg", 0.0)
-    streak = int(row.get("hitless_streak", 0))
-    avg_hitless = row.get("avg_hitless_streak_season", 0.0)
-    hitp = row.get("break_prob_next", 0.0)
+    avg = float(row.get("season_avg", 0.0) or 0.0)
+    streak = int(row.get("hitless_streak", 0) or 0)
+    avg_hitless = float(row.get("avg_hitless_streak_season", 0.0) or 0.0)
+    hitp = float(row.get("break_prob_next", 0.0) or 0.0)  # %
     filters = row.get("filters_applied") or []
+    value_note = row.get("value_note")
+
     parts: List[str] = []
     if avg >= 0.300:
         parts.append(f"elite .{int(round(avg,3)*1000):03d} AVG")
@@ -602,14 +604,19 @@ def _build_summary_line(row: Dict[str, Any]) -> str:
         parts.append(f".{int(round(avg,3)*1000):03d} AVG")
     parts.append(f"{streak}-game streak (season avg hitless {avg_hitless:.2f})")
     parts.append(f"{hitp:.1f}% hit chance")
+
     if filters:
-        drivers = ", ".join(filters[:2])
+        drivers = ", ".join(filters[:3])
         parts.append(drivers)
-    note = row.get("value_note")
-    if isinstance(note, str) and note:
-        parts.append(note.replace("Implied", "Implied"))
-    sentence = f"{nm} stands out due to " + "; ".join(parts) + "."
-    return sentence
+
+    if isinstance(value_note, str) and value_note:
+        parts.append(value_note)
+    else:
+        # Explicitly state when overlays are neutral/missing so the user isn’t left guessing.
+        if not filters:
+            parts.append("no recent Statcast/odds signal")
+
+    return f"{nm} stands out due to " + "; ".join(parts) + "."
 
 def _aggregate_and_score_bookmaker(
     candidates: List[Dict[str, Any]],
