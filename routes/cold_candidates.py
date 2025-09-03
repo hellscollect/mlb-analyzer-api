@@ -497,7 +497,11 @@ def _batch_people_with_stats(client: httpx.Client, ids: List[int], season: int, 
     return out
 
 # ---------- sorting helpers ----------
-_VALID_SORT_KEYS = {"hitless_streak", "season_avg", "avg_hitless_streak_season", "break_prob_next", "pressure", "score", "hit_chance_pct", "overdue_ratio", "ranking_score", "score_plus", "bookmaker_score", "crossref_rank"}
+_VALID_SORT_KEYS = {
+    "hitless_streak", "season_avg", "avg_hitless_streak_season", "break_prob_next",
+    "pressure", "score", "hit_chance_pct", "overdue_ratio", "ranking_score",
+    "score_plus", "bookmaker_score", "crossref_rank", "composite_score"
+}
 
 def _parse_sort_by(sort_by: Optional[str]) -> List[Tuple[str, bool]]:
     """
@@ -531,7 +535,7 @@ def _apply_sort(candidates: List[Dict], sort_spec: List[Tuple[str, bool]]) -> Li
         return tuple(keys)
     return sorted(candidates, key=key_fn)
 
-# ---------- bookmaker helpers (added) ----------
+# ---------- bookmaker overlays (stubs; safe to ship) ----------
 def _min_max_norm(vals: List[float]) -> List[float]:
     if not vals:
         return []
@@ -569,8 +573,7 @@ def _implied_prob_from_american(odds: Optional[float]) -> Optional[float]:
 
 def _fetch_statcast_overlays(names: List[str], *, recent_days: int = 14, timeout_s: float = 2.5) -> Dict[str, Dict[str, Any]]:
     """
-    FAIL-SOFT STUB: wire your Baseball Savant/Statcast client here.
-    Return shape per-name:
+    FAIL-SOFT STUB: wire real Statcast here. Return per-name dict:
       {
         "hard_hit_pct_recent": 0..100,
         "barrel_pct_recent": 0..100,
@@ -580,26 +583,56 @@ def _fetch_statcast_overlays(names: List[str], *, recent_days: int = 14, timeout
         "lineup_slot": int|None,
       }
     """
-    # TODO: integrate real Statcast. Keep shape identical.
     return {}
 
 def _fetch_hit_odds(names: List[str], *, sportsbook: str = "draftkings", market: str = "1+ hit", timeout_s: float = 2.5) -> Dict[str, Dict[str, Any]]:
     """
-    FAIL-SOFT STUB: wire your odds source here.
-    Return shape per-name: {"odds_hit_1plus": <american odds or None>}
+    FAIL-SOFT STUB: wire real odds here. Return per-name dict:
+      {"odds_hit_1plus": <american odds or None>}
     """
-    # TODO: integrate real odds feed. Keep shape identical.
     return {}
 
-def _aggregate_and_score_bookmaker(candidates: List[Dict[str, Any]],
-                                   savant: Optional[Dict[str, Dict[str, Any]]] = None,
-                                   odds: Optional[Dict[str, Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
+def _build_summary_line(row: Dict[str, Any]) -> str:
     """
-    Always compute:
-      - crossref_rank (0..1) across your three sorts (score/hit/overdue)
-      - bookmaker_score (0..1) emphasizing elite skill and consensus
-      - score_plus = scaled version of your score (up to +25% multiplier)
-    Sort by score_plus (fallback score).
+    1–2 sentence summary for Tier S/A targets.
+    """
+    nm = row.get("name","")
+    avg = row.get("season_avg", 0.0)
+    streak = int(row.get("hitless_streak", 0))
+    avg_hitless = row.get("avg_hitless_streak_season", 0.0)
+    hitp = row.get("break_prob_next", 0.0)
+    filters = row.get("filters_applied") or []
+    parts: List[str] = []
+    if avg >= 0.300:
+        parts.append(f"elite .{int(round(avg,3)*1000):03d} AVG")
+    else:
+        parts.append(f".{int(round(avg,3)*1000):03d} AVG")
+    parts.append(f"{streak}-game streak (season avg hitless {avg_hitless:.2f})")
+    parts.append(f"{hitp:.1f}% hit chance")
+    if filters:
+        # Keep concise: show up to 2 drivers
+        drivers = ", ".join(filters[:2])
+        parts.append(drivers)
+    note = row.get("value_note")
+    if isinstance(note, str) and note:
+        parts.append(note.replace("Implied", "Implied"))
+    sentence = f"{nm} stands out due to " + "; ".join(parts) + "."
+    return sentence
+
+def _aggregate_and_score_bookmaker(
+    candidates: List[Dict[str, Any]],
+    savant: Optional[Dict[str, Dict[str, Any]]] = None,
+    odds: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Enrich each candidate with:
+      - crossref_rank (consensus of Score, Hit chance, Overdue)
+      - bookmaker_score (0..1 composite)
+      - score_plus (score scaled by bookmaker_score)
+      - filters_applied, value_note
+      - composite_score (0..100) using weights: Hit chance 55, Elite AVG 12.5, Overdue 12.5, Savant overlays 20
+      - tier ("S" or "A" or None) using thresholds: S if score_plus≥200 & bookmaker≥0.450; A if 150–199 & bookmaker≥0.400
+      - summary (1–2 sentence rationale for S/A only)
     """
     n = len(candidates)
     if n == 0:
@@ -621,20 +654,20 @@ def _aggregate_and_score_bookmaker(candidates: List[Dict[str, Any]],
     avgs = [float(row.get("season_avg", 0.0)) for row in candidates]
     avgs_norm = _min_max_norm(avgs)
 
-    out: List[Dict[str, Any]] = []
+    enriched: List[Dict[str, Any]] = []
     for idx, row in enumerate(candidates):
         nm = row.get("name")
         base_score = float(row.get("score", 0.0))
-        hit_p = float(row.get("break_prob_next", 0.0)) / 100.0
-        pressure = float(row.get("pressure", 0.0))
+        hitp_pct = float(row.get("break_prob_next", 0.0))  # 0..100
+        pressure = float(row.get("pressure", 0.0))         # ratio (e.g., 0.7..4.0)
         season_avg = float(row.get("season_avg", 0.0))
         streak = int(row.get("hitless_streak", 0))
 
         c_cross  = crossref_map.get(nm, 0.0)
-        c_avg    = avgs_norm[idx]
-        c_elite  = _cap((season_avg - 0.300) / 0.030, 0.0, 1.0)  # extra push for .300+ types
-        c_hit    = _cap(hit_p, 0.0, 1.0)
-        c_over   = _cap(pressure / 2.5, 0.0, 1.0)
+        c_avg_norm = avgs_norm[idx]
+        c_elite  = _cap((season_avg - 0.300) / 0.030, 0.0, 1.0)  # 0..1
+        c_hit    = _cap(hitp_pct / 100.0, 0.0, 1.0)
+        c_over   = _cap(pressure / 2.5, 0.0, 1.0)  # normalized around 2.5x cap
         c_strk   = math.log(1 + min(streak, 3)) / math.log(1 + 3) if streak >= 0 else 0.0
 
         # Statcast overlays (fail-soft)
@@ -645,63 +678,88 @@ def _aggregate_and_score_bookmaker(candidates: List[Dict[str, Any]],
             hh = sv.get("hard_hit_pct_recent")
             xgap = sv.get("xba_gap_recent")
             pfit = sv.get("pitcher_fit")
-            park = sv.get("park_flag")
+            parkf = sv.get("park_flag")
             lslot = sv.get("lineup_slot")
             if isinstance(hh, (int, float)) and hh >= 40.0:
                 c_hard = 1.0; filters_applied.append("Hard-Hit%≥40")
             if isinstance(xgap, (int, float)) and xgap >= 0.05:
-                c_xgap = _cap(xgap / 0.10, 0.0, 1.0); filters_applied.append("xBA-BA≥.050")
+                # scale 0.05..0.10 -> 0..1
+                c_xgap = _cap((xgap - 0.05) / 0.05, 0.0, 1.0); filters_applied.append("xBA-BA≥.050")
             if pfit == "good":
                 c_pfit = 1.0; filters_applied.append("Pitcher fit")
-            if park is True:
+            if parkf is True:
                 c_park = 1.0; filters_applied.append("Hitter park")
             if isinstance(lslot, int) and lslot <= 5:
                 c_line = 1.0; filters_applied.append("Lineup≤5")
 
-        # Odds value (fail-soft)
+        # Odds value (fail-soft; currently neutral unless wired)
         c_value = 0.0
         value_note = None
         if odds and nm in odds:
             quoted = odds[nm].get("odds_hit_1plus")
             implied = _implied_prob_from_american(quoted)
-            if implied is not None and hit_p > 0.0:
-                edge = hit_p - implied
+            if implied is not None and hitp_pct > 0.0:
+                modelp = hitp_pct / 100.0
+                edge = modelp - implied
                 if edge > 0:
                     c_value = _cap(edge / 0.10, 0.0, 1.0)
-                    value_note = f"Implied {implied*100:.1f}%, model {hit_p*100:.1f}%"
+                    value_note = f"Implied {implied*100:.1f}%, model {modelp*100:.1f}%"
 
-        # Bookmaker composite (0..1)
+        # Bookmaker composite (0..1) — unchanged; used to scale Score into Score+
         bookmaker_score = (
-            0.25 * c_avg   +
+            0.25 * c_avg_norm +
             0.15 * c_elite +
             0.20 * c_cross +
-            0.15 * c_hit   +
-            0.10 * c_over  +
-            0.05 * c_strk  +
-            0.03 * c_hard  +
-            0.03 * c_xgap  +
-            0.02 * c_pfit  +
-            0.01 * c_park  +
-            0.01 * c_line  +
+            0.15 * c_hit +
+            0.10 * c_over +
+            0.05 * c_strk +
+            0.03 * c_hard +
+            0.03 * c_xgap +
+            0.02 * c_pfit +
+            0.01 * c_park +
+            0.01 * c_line +
             0.10 * c_value
         )
         bookmaker_score = _cap(bookmaker_score, 0.0, 1.0)
-
         m = 1.0 + 0.25 * bookmaker_score
         score_plus = round(base_score * m, 1)
+
+        # --- NEW: Composite score for *correctness-first* ranking (0..100)
+        # Weights: Hit chance 55, Elite AVG bump 12.5, Overdue 12.5, Savant overlays 20 (12 contact, 4 pfit, 2 park, 2 lineup)
+        elite_grade = c_elite  # 0..1
+        overdue_grade = _cap(pressure / 3.0, 0.0, 1.0)  # 3.0x cap
+        contact_grade = (c_hard + c_xgap) / 2.0
+        overlay_points = 12.0 * contact_grade + 4.0 * c_pfit + 2.0 * c_park + 2.0 * c_line  # 0..20
+        composite_score = (0.55 * hitp_pct) + (12.5 * elite_grade) + (12.5 * overdue_grade) + overlay_points
+        composite_score = round(composite_score, 1)
+
+        # Tier assignment for shortlist
+        tier = None
+        if score_plus >= 200.0 and bookmaker_score >= 0.450:
+            tier = "S"
+        elif (150.0 <= score_plus <= 199.9) and bookmaker_score >= 0.400:
+            tier = "A"
 
         new_row = dict(row)
         new_row["crossref_rank"] = round(crossref_map.get(nm, 0.0), 4)
         new_row["bookmaker_score"] = round(bookmaker_score, 4)
         new_row["score_plus"] = score_plus
+        new_row["composite_score"] = composite_score
+        if tier:
+            new_row["tier"] = tier
         if filters_applied:
             new_row["filters_applied"] = filters_applied
         if value_note:
             new_row["value_note"] = value_note
-        out.append(new_row)
 
-    out.sort(key=lambda r: (float(r.get("score_plus") or r.get("score") or 0.0)), reverse=True)
-    return out
+        # Optional plain-English summary for S/A only
+        if tier in ("S","A"):
+            new_row["summary"] = _build_summary_line(new_row)
+
+        enriched.append(new_row)
+
+    enriched.sort(key=lambda r: (float(r.get("score_plus") or r.get("score") or 0.0)), reverse=True)
+    return enriched
 
 # ---------- route ----------
 @router.get("/cold_candidates")
@@ -722,8 +780,7 @@ def cold_candidates(
     mode: Optional[str] = Query(None, description="Alias for verify. 'pregame' -> verify=1, 'all' -> verify=0. If set, overrides verify."),
     as_of: Optional[str] = Query(None, description="YYYY-MM-DD snapshot for streak math. If not today ET, verification is disabled and no roll-forward."),
     group_by: str = Query("streak", description="Grouping preset: 'streak' (default) or 'none'. If 'streak', we bucket by hitless_streak and sort inside buckets by score_plus."),
-    sort_by: Optional[str] = Query(None, description="When group_by='none', comma-separated fields with optional '-' for DESC. Fields: hitless_streak,season_avg,avg_hitless_streak_season,break_prob_next,pressure,score,hit_chance_pct,overdue_ratio,ranking_score,score_plus,bookmaker_score,crossref_rank."),
-    # --- Bookmaker context lookback for Statcast (safe default; stubbed) ---
+    sort_by: Optional[str] = Query(None, description="When group_by='none', comma-separated fields with optional '-' for DESC. Fields: hitless_streak,season_avg,avg_hitless_streak_season,break_prob_next,pressure,score,hit_chance_pct,overdue_ratio,ranking_score,score_plus,bookmaker_score,crossref_rank,composite_score."),
     hh_recent_days: int = Query(14, ge=3, le=60, description="Statcast lookback window used by bookmaker overlays."),
 ):
     """
@@ -731,17 +788,17 @@ def cold_candidates(
       • Good hitters (season AVG ≥ min_season_avg)
       • Current hitless streak (AB>0 only; DNP/0-AB ignored)
       • STRICT pregame when verify=1 (exclude in-progress/finished)
-      • Exclude same-day games from streak calc (use previous games only)
+      • Exclude same-day games from streak calc
       • avg_hitless_streak_season = average length of COMPLETED hitless streaks before the slate date
-      • Derived: expected_abs (season AB/G), break_prob_next (0..100%), pressure, score=break_prob_next×pressure
-      • Aliases for clarity: hit_chance_pct (== break_prob_next), overdue_ratio (== pressure), ranking_score (== score)
-      • Bookmaker fields (ALWAYS computed): crossref_rank (0..1), bookmaker_score (0..1), score_plus, filters_applied*, value_note*
-        *filters_applied/value_note appear when overlays contribute
+      • Derived: expected_abs, break_prob_next (0..100%), pressure, score
+      • Aliases: hit_chance_pct==break_prob_next, overdue_ratio==pressure, ranking_score==score
+      • Bookmaker: crossref_rank (0..1), bookmaker_score (0..1), score_plus, composite_score (0..100), tier (S/A), filters_applied[], value_note, summary (S/A only)
+      • Response includes best_targets (Tier S/A, up to 10, sorted by composite_score)
     """
     requested_date = _eastern_today_str() if _normalize(date) == "today" else date
     effective_date = requested_date
 
-    # --- mode alias mapping (mode takes precedence over verify if provided)
+    # mode alias mapping
     mode_norm = (mode or "").strip().lower() if mode else None
     if mode_norm in ("pregame", "pre", "strict"):
         verify_effective = 1
@@ -750,12 +807,12 @@ def cold_candidates(
     else:
         verify_effective = 1 if int(verify) == 1 else 0
 
-    # --- as_of snapshot handling
+    # as_of snapshot handling
     as_of_norm = (as_of or "").strip()
     historical_mode = False
     if as_of_norm:
         try:
-            _ = _parse_ymd(as_of_norm)  # validate
+            _ = _parse_ymd(as_of_norm)
             effective_date = as_of_norm
             if not _is_today_et(as_of_norm):
                 historical_mode = True
@@ -763,30 +820,26 @@ def cold_candidates(
             pass
 
     if historical_mode:
-        verify_effective = 0  # disable pregame check
+        verify_effective = 0
         roll_enabled = False
     else:
         roll_enabled = bool(roll_to_next_slate_if_empty)
 
-    # --- scan budget
     DEFAULT_MULT = max(1, int(scan_multiplier))
     computed_max = min(3000, limit * DEFAULT_MULT)
     MAX_LOG_CHECKS = max_log_checks if max_log_checks is not None else computed_max
 
-    # Adaptive load shedding for verify=0 (ALL teams) when user didn't set caps
     if verify_effective == 0:
         if max_log_checks is None:
             MAX_LOG_CHECKS = min(MAX_LOG_CHECKS, 400)
         if "limit" in cold_candidates.__signature__.parameters:
             if limit > 30:
-                limit = 30  # gentle cap to avoid timeouts
+                limit = 30  # avoid heavy scans when including ALL teams
 
-    # --- sort/group presets
     group_mode = (group_by or "").strip().lower()
     sort_spec = _parse_sort_by(sort_by) if group_mode == "none" else []
 
     with httpx.Client(timeout=45) as client:
-        # schedule & helpers for this date (fault tolerant)
         debug_list: Optional[List[Dict]] = [] if debug else None
         sched = _schedule_for_date(client, effective_date, debug_list)
         ns_team_ids_today = _not_started_team_ids_for_date(sched) if (verify_effective == 1) else set()
@@ -803,9 +856,6 @@ def cold_candidates(
             rolled = True
 
         def _decorate_candidate(base: Dict, logs: Optional[List[Dict]], as_of_date: str) -> Dict:
-            """
-            Add expected_abs, break_prob_next, pressure, score and aliases to a candidate dict.
-            """
             person_like = base.get("_person_like") or {}
             season_avg = float(base.get("season_avg", 0.0))
 
@@ -823,13 +873,11 @@ def cold_candidates(
 
             score = break_prob * pressure
 
-            # canonical fields
             base["expected_abs"] = round(expected_abs, 2)
-            base["break_prob_next"] = round(break_prob * 100.0, 1)  # percent display
+            base["break_prob_next"] = round(break_prob * 100.0, 1)  # percent
             base["pressure"] = round(pressure, 3)
             base["score"] = round(score * 100.0, 1)
 
-            # alias fields (preferred names for UI/GPT)
             base["hit_chance_pct"] = base["break_prob_next"]
             base["overdue_ratio"] = base["pressure"]
             base["ranking_score"] = base["score"]
@@ -888,6 +936,7 @@ def cold_candidates(
                     except Exception as e:
                         if debug_list is not None:
                             debug_list.append({"name": name, "error": f"{type(e).__name__}: {e}"})
+
                 return {"candidates": candidates}
 
             # league scan mode
@@ -982,7 +1031,7 @@ def cold_candidates(
         result = run_once_for_date(effective_date, ns_team_ids_today, slate_team_ids_today)
         base_items = result["candidates"]
 
-        # ---- bookmaker overlays (fail-soft stubs now; wire real data later) ----
+        # ---- bookmaker overlays (stubs now; wire real data later) ----
         names_for_lookup = [c.get("name") for c in base_items if c.get("name")]
         savant_map: Dict[str, Dict[str, Any]] = {}
         odds_map: Dict[str, Dict[str, Any]] = {}
@@ -1004,10 +1053,10 @@ def cold_candidates(
                     debug_list.append({"odds_error": str(e)})
                 odds_map = {}
 
-        # ---- aggregate triple-sort consensus + bookmaker composite; produce score_plus ----
+        # ---- enrich with bookmaker composite & compute composite_score/tier/summary ----
         enriched = _aggregate_and_score_bookmaker(base_items, savant=savant_map or None, odds=odds_map or None)
 
-        # ---- presentation (respect your grouping; within groups use score_plus) ----
+        # ---- presentation (respect grouping; within groups use score_plus) ----
         if group_mode == "streak":
             buckets: Dict[int, List[Dict]] = {}
             for c in enriched:
@@ -1021,10 +1070,18 @@ def cold_candidates(
             if sort_spec:
                 items = _apply_sort(enriched, sort_spec)[:limit]
             else:
-                # default flat sort: score_plus desc, then season_avg desc
-                items = sorted(enriched, key=lambda x: (float(x.get("score_plus") or x.get("score") or 0.0), float(x.get("season_avg") or 0.0)), reverse=True)[:limit]
+                items = sorted(
+                    enriched,
+                    key=lambda x: (float(x.get("score_plus") or x.get("score") or 0.0), float(x.get("season_avg") or 0.0)),
+                    reverse=True
+                )[:limit]
 
-        response: Dict = {"date": effective_date, "candidates": items}
+        # ---- shortlist (Tier S/A only), up to 10, sorted by composite_score ----
+        best_targets_all = [r for r in items if r.get("tier") in ("S", "A")]
+        best_targets_all.sort(key=lambda r: float(r.get("composite_score", 0.0)), reverse=True)
+        best_targets = best_targets_all[:10]  # do not force 10; if fewer qualify, list fewer
+
+        response: Dict = {"date": effective_date, "candidates": items, "best_targets": best_targets}
         if debug_list is not None:
             stamp = {
                 "requested_date": requested_date,
