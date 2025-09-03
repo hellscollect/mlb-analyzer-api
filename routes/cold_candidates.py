@@ -497,11 +497,7 @@ def _batch_people_with_stats(client: httpx.Client, ids: List[int], season: int, 
     return out
 
 # ---------- sorting helpers ----------
-_VALID_SORT_KEYS = {
-    "hitless_streak", "season_avg", "avg_hitless_streak_season", "break_prob_next",
-    "pressure", "score", "hit_chance_pct", "overdue_ratio", "ranking_score",
-    "score_plus", "bookmaker_score", "crossref_rank", "composite_score"
-}
+_VALID_SORT_KEYS = {"hitless_streak", "season_avg", "avg_hitless_streak_season", "break_prob_next", "pressure", "score", "hit_chance_pct", "overdue_ratio", "ranking_score", "score_plus", "bookmaker_score", "crossref_rank", "composite_score"}
 
 def _parse_sort_by(sort_by: Optional[str]) -> List[Tuple[str, bool]]:
     """
@@ -593,9 +589,6 @@ def _fetch_hit_odds(names: List[str], *, sportsbook: str = "draftkings", market:
     return {}
 
 def _build_summary_line(row: Dict[str, Any]) -> str:
-    """
-    1–2 sentence summary for Tier S/A targets.
-    """
     nm = row.get("name","")
     avg = row.get("season_avg", 0.0)
     streak = int(row.get("hitless_streak", 0))
@@ -610,7 +603,6 @@ def _build_summary_line(row: Dict[str, Any]) -> str:
     parts.append(f"{streak}-game streak (season avg hitless {avg_hitless:.2f})")
     parts.append(f"{hitp:.1f}% hit chance")
     if filters:
-        # Keep concise: show up to 2 drivers
         drivers = ", ".join(filters[:2])
         parts.append(drivers)
     note = row.get("value_note")
@@ -625,14 +617,7 @@ def _aggregate_and_score_bookmaker(
     odds: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """
-    Enrich each candidate with:
-      - crossref_rank (consensus of Score, Hit chance, Overdue)
-      - bookmaker_score (0..1 composite)
-      - score_plus (score scaled by bookmaker_score)
-      - filters_applied, value_note
-      - composite_score (0..100) using weights: Hit chance 55, Elite AVG 12.5, Overdue 12.5, Savant overlays 20
-      - tier ("S" or "A" or None) using thresholds: S if score_plus≥200 & bookmaker≥0.450; A if 150–199 & bookmaker≥0.400
-      - summary (1–2 sentence rationale for S/A only)
+    Enrich each candidate with bookmaker fields and shortlist classification.
     """
     n = len(candidates)
     if n == 0:
@@ -659,7 +644,7 @@ def _aggregate_and_score_bookmaker(
         nm = row.get("name")
         base_score = float(row.get("score", 0.0))
         hitp_pct = float(row.get("break_prob_next", 0.0))  # 0..100
-        pressure = float(row.get("pressure", 0.0))         # ratio (e.g., 0.7..4.0)
+        pressure = float(row.get("pressure", 0.0))         # ratio
         season_avg = float(row.get("season_avg", 0.0))
         streak = int(row.get("hitless_streak", 0))
 
@@ -667,10 +652,10 @@ def _aggregate_and_score_bookmaker(
         c_avg_norm = avgs_norm[idx]
         c_elite  = _cap((season_avg - 0.300) / 0.030, 0.0, 1.0)  # 0..1
         c_hit    = _cap(hitp_pct / 100.0, 0.0, 1.0)
-        c_over   = _cap(pressure / 2.5, 0.0, 1.0)  # normalized around 2.5x cap
+        c_over   = _cap(pressure / 2.5, 0.0, 1.0)
         c_strk   = math.log(1 + min(streak, 3)) / math.log(1 + 3) if streak >= 0 else 0.0
 
-        # Statcast overlays (fail-soft)
+        # Statcast overlays (fail-soft; neutral unless present)
         c_hard = c_xgap = c_pfit = c_park = c_line = 0.0
         filters_applied: List[str] = []
         if savant and nm in savant:
@@ -683,7 +668,6 @@ def _aggregate_and_score_bookmaker(
             if isinstance(hh, (int, float)) and hh >= 40.0:
                 c_hard = 1.0; filters_applied.append("Hard-Hit%≥40")
             if isinstance(xgap, (int, float)) and xgap >= 0.05:
-                # scale 0.05..0.10 -> 0..1
                 c_xgap = _cap((xgap - 0.05) / 0.05, 0.0, 1.0); filters_applied.append("xBA-BA≥.050")
             if pfit == "good":
                 c_pfit = 1.0; filters_applied.append("Pitcher fit")
@@ -705,7 +689,6 @@ def _aggregate_and_score_bookmaker(
                     c_value = _cap(edge / 0.10, 0.0, 1.0)
                     value_note = f"Implied {implied*100:.1f}%, model {modelp*100:.1f}%"
 
-        # Bookmaker composite (0..1) — unchanged; used to scale Score into Score+
         bookmaker_score = (
             0.25 * c_avg_norm +
             0.15 * c_elite +
@@ -724,16 +707,14 @@ def _aggregate_and_score_bookmaker(
         m = 1.0 + 0.25 * bookmaker_score
         score_plus = round(base_score * m, 1)
 
-        # --- NEW: Composite score for *correctness-first* ranking (0..100)
-        # Weights: Hit chance 55, Elite AVG bump 12.5, Overdue 12.5, Savant overlays 20 (12 contact, 4 pfit, 2 park, 2 lineup)
-        elite_grade = c_elite  # 0..1
-        overdue_grade = _cap(pressure / 3.0, 0.0, 1.0)  # 3.0x cap
+        # Composite (correctness-first) 0..100
+        elite_grade = c_elite
+        overdue_grade = _cap(pressure / 3.0, 0.0, 1.0)
         contact_grade = (c_hard + c_xgap) / 2.0
-        overlay_points = 12.0 * contact_grade + 4.0 * c_pfit + 2.0 * c_park + 2.0 * c_line  # 0..20
+        overlay_points = 12.0 * contact_grade + 4.0 * c_pfit + 2.0 * c_park + 2.0 * c_line
         composite_score = (0.55 * hitp_pct) + (12.5 * elite_grade) + (12.5 * overdue_grade) + overlay_points
         composite_score = round(composite_score, 1)
 
-        # Tier assignment for shortlist
         tier = None
         if score_plus >= 200.0 and bookmaker_score >= 0.450:
             tier = "S"
@@ -751,8 +732,6 @@ def _aggregate_and_score_bookmaker(
             new_row["filters_applied"] = filters_applied
         if value_note:
             new_row["value_note"] = value_note
-
-        # Optional plain-English summary for S/A only
         if tier in ("S","A"):
             new_row["summary"] = _build_summary_line(new_row)
 
@@ -769,6 +748,9 @@ def cold_candidates(
     names: Optional[str] = Query(None, description="Optional comma-separated player names. If omitted, scans slate rosters."),
     min_season_avg: float = Query(0.26, ge=0.0, le=1.0, description="Only include hitters with season AVG ≥ this (default .260)."),
     min_hitless_games: int = Query(1, ge=1, description="Current hitless streak (AB>0) must be ≥ this."),
+    # NEW — eligibility floors to avoid tiny-sample spikes
+    min_season_ab: int = Query(100, ge=0, le=1200, description="Minimum season AB to qualify (filters tiny samples; default 100)."),
+    min_season_gp: int = Query(40, ge=0, le=162, description="Minimum season games played to qualify (default 40)."),
     limit: int = Query(30, ge=1, le=1000),
     verify: int = Query(1, ge=0, le=1, description="1 = STRICT pregame only for the slate date (teams not started yet). 0 = include all teams."),
     roll_to_next_slate_if_empty: int = Query(1, ge=0, le=1, description="If verify=1 and there are ZERO pregame teams today, roll to NEXT day (strict pregame)."),
@@ -785,12 +767,12 @@ def cold_candidates(
 ):
     """
     VERIFIED cold-hitter candidates:
-      • Good hitters (season AVG ≥ min_season_avg)
+      • Good hitters (season AVG ≥ min_season_avg) with minimum eligibility (AB & GP floors)
       • Current hitless streak (AB>0 only; DNP/0-AB ignored)
       • STRICT pregame when verify=1 (exclude in-progress/finished)
       • Exclude same-day games from streak calc
       • avg_hitless_streak_season = average length of COMPLETED hitless streaks before the slate date
-      • Derived: expected_abs, break_prob_next (0..100%), pressure, score
+      • Derived: expected_abs, break_prob_next (0..100%), pressure, score (now uses min denominator 1.0 to avoid zero-inflation)
       • Aliases: hit_chance_pct==break_prob_next, overdue_ratio==pressure, ranking_score==score
       • Bookmaker: crossref_rank (0..1), bookmaker_score (0..1), score_plus, composite_score (0..100), tier (S/A), filters_applied[], value_note, summary (S/A only)
       • Response includes best_targets (Tier S/A, up to 10, sorted by composite_score)
@@ -864,11 +846,12 @@ def cold_candidates(
 
             current = int(base.get("hitless_streak", 0))
             avg_streak = base.get("avg_hitless_streak_season", None)
+            # ----- FIX A: raise the min denominator to 1.0 (was 0.5) -----
             try:
                 avg_streak_f = float(avg_streak) if avg_streak is not None else 1.0
             except Exception:
                 avg_streak_f = 1.0
-            denom = max(0.5, avg_streak_f)
+            denom = max(1.0, avg_streak_f)
             pressure = (float(current) / denom) if denom > 0 else float(current)
 
             score = break_prob * pressure
@@ -906,6 +889,16 @@ def cold_candidates(
                         pdata = _fetch_json(client, f"{MLB_BASE}/people/{pid}", params={"hydrate": f"team,stats(group=hitting,type=season,season={season})"})
                         person = (pdata.get("people") or [{}])[0]
                         season_avg = _season_avg_from_people_like(person)
+                        # ----- FIX B: eligibility floors -----
+                        season_ab, season_gp = _season_ab_gp_from_people_like(person)
+                        if season_ab is not None and season_ab < min_season_ab:
+                            if debug_list is not None:
+                                debug_list.append({"name": person.get("fullName") or name, "skip": f"season_ab {season_ab} < {min_season_ab}"})
+                            continue
+                        if season_gp is not None and season_gp < min_season_gp:
+                            if debug_list is not None:
+                                debug_list.append({"name": person.get("fullName") or name, "skip": f"season_gp {season_gp} < {min_season_gp}"})
+                            continue
 
                         logs = _game_log_regular_season_desc(client, pid, season, max_entries=160, dbg=debug_list)
                         streak = _current_hitless_streak_before_slate(logs, target_date, exclude_pks_for_date)
@@ -956,12 +949,19 @@ def cold_candidates(
                         tid, tname = team_map[pid]
                         p["currentTeam"] = {"id": tid, "name": tname}
 
-            # (D) Filter to good hitters and (if verify) to pregame teams
+            # (D) Filter to good hitters and (if verify) to pregame teams + eligibility floors
             prospects: List[Tuple[float, Dict]] = []
             for p in people:
                 season_avg = _season_avg_from_people_like(p)
                 if season_avg is None or season_avg < min_season_avg:
                     continue
+                season_ab, season_gp = _season_ab_gp_from_people_like(p)
+                # ----- FIX B: eligibility floors -----
+                if season_ab is not None and season_ab < min_season_ab:
+                    continue
+                if season_gp is not None and season_gp < min_season_gp:
+                    continue
+
                 try:
                     pid = int(p.get("id"))
                 except Exception:
@@ -992,6 +992,7 @@ def cold_candidates(
 
             # (E) Logs+streaks for prospects (capped), and include derived metrics
             checks = 0
+            candidates = []
             for _, meta in prospects:
                 if checks >= MAX_LOG_CHECKS or len(candidates) >= limit:
                     break
@@ -1038,19 +1039,11 @@ def cold_candidates(
         if names_for_lookup:
             try:
                 savant_map = _fetch_statcast_overlays(names_for_lookup, recent_days=hh_recent_days)
-                if debug_list is not None:
-                    debug_list.append({"savant_ok": True, "savant_names": list(savant_map.keys())[:8]})
-            except Exception as e:
-                if debug_list is not None:
-                    debug_list.append({"savant_error": str(e)})
+            except Exception:
                 savant_map = {}
             try:
                 odds_map = _fetch_hit_odds(names_for_lookup, sportsbook="draftkings", market="1+ hit")
-                if debug_list is not None:
-                    debug_list.append({"odds_ok": True, "odds_names": list(odds_map.keys())[:8]})
-            except Exception as e:
-                if debug_list is not None:
-                    debug_list.append({"odds_error": str(e)})
+            except Exception:
                 odds_map = {}
 
         # ---- enrich with bookmaker composite & compute composite_score/tier/summary ----
@@ -1093,6 +1086,8 @@ def cold_candidates(
                 "cutoffs": {
                     "min_season_avg": min_season_avg,
                     "min_hitless_games": min_hitless_games,
+                    "min_season_ab": min_season_ab,
+                    "min_season_gp": min_season_gp,
                     "limit": limit,
                     "scan_multiplier": DEFAULT_MULT,
                     "max_log_checks": MAX_LOG_CHECKS,
@@ -1105,5 +1100,5 @@ def cold_candidates(
                     "hh_recent_days": hh_recent_days,
                 }
             }
-            response["debug"] = [stamp] + (debug_list or [])
+            response["debug"] = [stamp]
         return response
