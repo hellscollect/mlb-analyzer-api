@@ -497,7 +497,7 @@ def _batch_people_with_stats(client: httpx.Client, ids: List[int], season: int, 
     return out
 
 # ---------- sorting helpers ----------
-_VALID_SORT_KEYS = {"hitless_streak", "season_avg", "avg_hitless_streak_season", "break_prob_next", "pressure", "score", "hit_chance_pct", "overdue_ratio", "ranking_score"}
+_VALID_SORT_KEYS = {"hitless_streak", "season_avg", "avg_hitless_streak_season", "break_prob_next", "pressure", "score", "hit_chance_pct", "overdue_ratio", "ranking_score", "score_plus", "bookmaker_score", "crossref_rank"}
 
 def _parse_sort_by(sort_by: Optional[str]) -> List[Tuple[str, bool]]:
     """
@@ -531,6 +531,178 @@ def _apply_sort(candidates: List[Dict], sort_spec: List[Tuple[str, bool]]) -> Li
         return tuple(keys)
     return sorted(candidates, key=key_fn)
 
+# ---------- bookmaker helpers (added) ----------
+def _min_max_norm(vals: List[float]) -> List[float]:
+    if not vals:
+        return []
+    vmin, vmax = min(vals), max(vals)
+    if vmax <= vmin:
+        return [0.5 for _ in vals]
+    return [(v - vmin) / (vmax - vmin) for v in vals]
+
+def _rank_index(sorted_list: List[Dict[str, Any]], name_key: str, target_name: str) -> Optional[int]:
+    for i, row in enumerate(sorted_list):
+        if row.get(name_key) == target_name:
+            return i
+    return None
+
+def _normalize_rank(idx: Optional[int], n: int) -> float:
+    if idx is None or n <= 1:
+        return 0.0
+    return 1.0 - (idx / (n - 1))
+
+def _cap(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
+
+def _implied_prob_from_american(odds: Optional[float]) -> Optional[float]:
+    if odds is None:
+        return None
+    try:
+        o = float(odds)
+    except Exception:
+        return None
+    if o >= 100:
+        return 100.0 / (o + 100.0)
+    if o <= -100:
+        return (-o) / ((-o) + 100.0)
+    return None
+
+def _fetch_statcast_overlays(names: List[str], *, recent_days: int = 14, timeout_s: float = 2.5) -> Dict[str, Dict[str, Any]]:
+    """
+    FAIL-SOFT STUB: wire your Baseball Savant/Statcast client here.
+    Return shape per-name:
+      {
+        "hard_hit_pct_recent": 0..100,
+        "barrel_pct_recent": 0..100,
+        "xba_gap_recent": float (xBA - BA),
+        "pitcher_fit": "good"|"neutral"|"bad"|None,
+        "park_flag": True|False|None,
+        "lineup_slot": int|None,
+      }
+    """
+    # TODO: integrate real Statcast. Keep shape identical.
+    return {}
+
+def _fetch_hit_odds(names: List[str], *, sportsbook: str = "draftkings", market: str = "1+ hit", timeout_s: float = 2.5) -> Dict[str, Dict[str, Any]]:
+    """
+    FAIL-SOFT STUB: wire your odds source here.
+    Return shape per-name: {"odds_hit_1plus": <american odds or None>}
+    """
+    # TODO: integrate real odds feed. Keep shape identical.
+    return {}
+
+def _aggregate_and_score_bookmaker(candidates: List[Dict[str, Any]],
+                                   savant: Optional[Dict[str, Dict[str, Any]]] = None,
+                                   odds: Optional[Dict[str, Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
+    """
+    Always compute:
+      - crossref_rank (0..1) across your three sorts (score/hit/overdue)
+      - bookmaker_score (0..1) emphasizing elite skill and consensus
+      - score_plus = scaled version of your score (up to +25% multiplier)
+    Sort by score_plus (fallback score).
+    """
+    n = len(candidates)
+    if n == 0:
+        return candidates
+
+    by_score   = sorted(candidates, key=lambda r: float(r.get("score", 0.0)), reverse=True)
+    by_hit     = sorted(candidates, key=lambda r: float(r.get("break_prob_next", 0.0)), reverse=True)
+    by_overdue = sorted(candidates, key=lambda r: float(r.get("pressure", 0.0)), reverse=True)
+
+    crossref_map: Dict[str, float] = {}
+    for row in candidates:
+        nm = row.get("name")
+        i1 = _rank_index(by_score, "name", nm)
+        i2 = _rank_index(by_hit, "name", nm)
+        i3 = _rank_index(by_overdue, "name", nm)
+        r1 = _normalize_rank(i1, n); r2 = _normalize_rank(i2, n); r3 = _normalize_rank(i3, n)
+        crossref_map[nm] = (r1 + r2 + r3) / 3.0
+
+    avgs = [float(row.get("season_avg", 0.0)) for row in candidates]
+    avgs_norm = _min_max_norm(avgs)
+
+    out: List[Dict[str, Any]] = []
+    for idx, row in enumerate(candidates):
+        nm = row.get("name")
+        base_score = float(row.get("score", 0.0))
+        hit_p = float(row.get("break_prob_next", 0.0)) / 100.0
+        pressure = float(row.get("pressure", 0.0))
+        season_avg = float(row.get("season_avg", 0.0))
+        streak = int(row.get("hitless_streak", 0))
+
+        c_cross  = crossref_map.get(nm, 0.0)
+        c_avg    = avgs_norm[idx]
+        c_elite  = _cap((season_avg - 0.300) / 0.030, 0.0, 1.0)  # extra push for .300+ types
+        c_hit    = _cap(hit_p, 0.0, 1.0)
+        c_over   = _cap(pressure / 2.5, 0.0, 1.0)
+        c_strk   = math.log(1 + min(streak, 3)) / math.log(1 + 3) if streak >= 0 else 0.0
+
+        # Statcast overlays (fail-soft)
+        c_hard = c_xgap = c_pfit = c_park = c_line = 0.0
+        filters_applied: List[str] = []
+        if savant and nm in savant:
+            sv = savant[nm]
+            hh = sv.get("hard_hit_pct_recent")
+            xgap = sv.get("xba_gap_recent")
+            pfit = sv.get("pitcher_fit")
+            park = sv.get("park_flag")
+            lslot = sv.get("lineup_slot")
+            if isinstance(hh, (int, float)) and hh >= 40.0:
+                c_hard = 1.0; filters_applied.append("Hard-Hit%≥40")
+            if isinstance(xgap, (int, float)) and xgap >= 0.05:
+                c_xgap = _cap(xgap / 0.10, 0.0, 1.0); filters_applied.append("xBA-BA≥.050")
+            if pfit == "good":
+                c_pfit = 1.0; filters_applied.append("Pitcher fit")
+            if park is True:
+                c_park = 1.0; filters_applied.append("Hitter park")
+            if isinstance(lslot, int) and lslot <= 5:
+                c_line = 1.0; filters_applied.append("Lineup≤5")
+
+        # Odds value (fail-soft)
+        c_value = 0.0
+        value_note = None
+        if odds and nm in odds:
+            quoted = odds[nm].get("odds_hit_1plus")
+            implied = _implied_prob_from_american(quoted)
+            if implied is not None and hit_p > 0.0:
+                edge = hit_p - implied
+                if edge > 0:
+                    c_value = _cap(edge / 0.10, 0.0, 1.0)
+                    value_note = f"Implied {implied*100:.1f}%, model {hit_p*100:.1f}%"
+
+        # Bookmaker composite (0..1)
+        bookmaker_score = (
+            0.25 * c_avg   +
+            0.15 * c_elite +
+            0.20 * c_cross +
+            0.15 * c_hit   +
+            0.10 * c_over  +
+            0.05 * c_strk  +
+            0.03 * c_hard  +
+            0.03 * c_xgap  +
+            0.02 * c_pfit  +
+            0.01 * c_park  +
+            0.01 * c_line  +
+            0.10 * c_value
+        )
+        bookmaker_score = _cap(bookmaker_score, 0.0, 1.0)
+
+        m = 1.0 + 0.25 * bookmaker_score
+        score_plus = round(base_score * m, 1)
+
+        new_row = dict(row)
+        new_row["crossref_rank"] = round(crossref_map.get(nm, 0.0), 4)
+        new_row["bookmaker_score"] = round(bookmaker_score, 4)
+        new_row["score_plus"] = score_plus
+        if filters_applied:
+            new_row["filters_applied"] = filters_applied
+        if value_note:
+            new_row["value_note"] = value_note
+        out.append(new_row)
+
+    out.sort(key=lambda r: (float(r.get("score_plus") or r.get("score") or 0.0)), reverse=True)
+    return out
+
 # ---------- route ----------
 @router.get("/cold_candidates")
 def cold_candidates(
@@ -549,8 +721,10 @@ def cold_candidates(
     # --- Additive params ---
     mode: Optional[str] = Query(None, description="Alias for verify. 'pregame' -> verify=1, 'all' -> verify=0. If set, overrides verify."),
     as_of: Optional[str] = Query(None, description="YYYY-MM-DD snapshot for streak math. If not today ET, verification is disabled and no roll-forward."),
-    group_by: str = Query("streak", description="Grouping preset: 'streak' (default) or 'none'. If 'streak', we bucket by hitless_streak and sort inside buckets by score."),
-    sort_by: Optional[str] = Query(None, description="When group_by='none', comma-separated fields with optional '-' for DESC. Fields: hitless_streak,season_avg,avg_hitless_streak_season,break_prob_next,pressure,score,hit_chance_pct,overdue_ratio,ranking_score."),
+    group_by: str = Query("streak", description="Grouping preset: 'streak' (default) or 'none'. If 'streak', we bucket by hitless_streak and sort inside buckets by score_plus."),
+    sort_by: Optional[str] = Query(None, description="When group_by='none', comma-separated fields with optional '-' for DESC. Fields: hitless_streak,season_avg,avg_hitless_streak_season,break_prob_next,pressure,score,hit_chance_pct,overdue_ratio,ranking_score,score_plus,bookmaker_score,crossref_rank."),
+    # --- Bookmaker context lookback for Statcast (safe default; stubbed) ---
+    hh_recent_days: int = Query(14, ge=3, le=60, description="Statcast lookback window used by bookmaker overlays."),
 ):
     """
     VERIFIED cold-hitter candidates:
@@ -561,6 +735,8 @@ def cold_candidates(
       • avg_hitless_streak_season = average length of COMPLETED hitless streaks before the slate date
       • Derived: expected_abs (season AB/G), break_prob_next (0..100%), pressure, score=break_prob_next×pressure
       • Aliases for clarity: hit_chance_pct (== break_prob_next), overdue_ratio (== pressure), ranking_score (== score)
+      • Bookmaker fields (ALWAYS computed): crossref_rank (0..1), bookmaker_score (0..1), score_plus, filters_applied*, value_note*
+        *filters_applied/value_note appear when overlays contribute
     """
     requested_date = _eastern_today_str() if _normalize(date) == "today" else date
     effective_date = requested_date
@@ -712,22 +888,6 @@ def cold_candidates(
                     except Exception as e:
                         if debug_list is not None:
                             debug_list.append({"name": name, "error": f"{type(e).__name__}: {e}"})
-                # Presentation
-                if group_mode == "streak":
-                    buckets: Dict[int, List[Dict]] = {}
-                    for c in candidates:
-                        buckets.setdefault(int(c.get("hitless_streak", 0)), []).append(c)
-                    out_list: List[Dict] = []
-                    for k in sorted(buckets.keys(), reverse=True):
-                        grp = sorted(buckets[k], key=lambda x: float(x.get("ranking_score", x.get("score", 0.0))), reverse=True)
-                        out_list.extend(grp)
-                    candidates = out_list[:limit]
-                else:
-                    if sort_spec:
-                        candidates = _apply_sort(candidates, sort_spec)
-                    else:
-                        candidates = sorted(candidates, key=lambda x: (float(x.get("ranking_score", x.get("score", 0.0))), float(x.get("season_avg", 0.0))), reverse=True)
-                    candidates = candidates[:limit]
                 return {"candidates": candidates}
 
             # league scan mode
@@ -810,23 +970,6 @@ def cold_candidates(
                         dbg_name = meta.get("name", "")
                         debug_list.append({"name": dbg_name, "error": f"{type(e).__name__}: {e}"})
 
-            # Presentation
-            if group_mode == "streak":
-                buckets: Dict[int, List[Dict]] = {}
-                for c in candidates:
-                    buckets.setdefault(int(c.get("hitless_streak", 0)), []).append(c)
-                out_list: List[Dict] = []
-                for k in sorted(buckets.keys(), reverse=True):
-                    grp = sorted(buckets[k], key=lambda x: float(x.get("ranking_score", x.get("score", 0.0))), reverse=True)
-                    out_list.extend(grp)
-                candidates = out_list[:limit]
-            else:
-                if sort_spec:
-                    candidates = _apply_sort(candidates, sort_spec)
-                else:
-                    candidates = sorted(candidates, key=lambda x: (float(x.get("ranking_score", x.get("score", 0.0))), float(x.get("season_avg", 0.0))), reverse=True)
-                candidates = candidates[:limit]
-
             if debug_list is not None:
                 debug_list.insert(0, {
                     "prospects_scanned": len(prospects),
@@ -835,8 +978,51 @@ def cold_candidates(
                 })
             return {"candidates": candidates}
 
+        # ---- run core pipeline to build baseline candidates ----
         result = run_once_for_date(effective_date, ns_team_ids_today, slate_team_ids_today)
-        items = result["candidates"]
+        base_items = result["candidates"]
+
+        # ---- bookmaker overlays (fail-soft stubs now; wire real data later) ----
+        names_for_lookup = [c.get("name") for c in base_items if c.get("name")]
+        savant_map: Dict[str, Dict[str, Any]] = {}
+        odds_map: Dict[str, Dict[str, Any]] = {}
+        if names_for_lookup:
+            try:
+                savant_map = _fetch_statcast_overlays(names_for_lookup, recent_days=hh_recent_days)
+                if debug_list is not None:
+                    debug_list.append({"savant_ok": True, "savant_names": list(savant_map.keys())[:8]})
+            except Exception as e:
+                if debug_list is not None:
+                    debug_list.append({"savant_error": str(e)})
+                savant_map = {}
+            try:
+                odds_map = _fetch_hit_odds(names_for_lookup, sportsbook="draftkings", market="1+ hit")
+                if debug_list is not None:
+                    debug_list.append({"odds_ok": True, "odds_names": list(odds_map.keys())[:8]})
+            except Exception as e:
+                if debug_list is not None:
+                    debug_list.append({"odds_error": str(e)})
+                odds_map = {}
+
+        # ---- aggregate triple-sort consensus + bookmaker composite; produce score_plus ----
+        enriched = _aggregate_and_score_bookmaker(base_items, savant=savant_map or None, odds=odds_map or None)
+
+        # ---- presentation (respect your grouping; within groups use score_plus) ----
+        if group_mode == "streak":
+            buckets: Dict[int, List[Dict]] = {}
+            for c in enriched:
+                buckets.setdefault(int(c.get("hitless_streak", 0)), []).append(c)
+            ordered: List[Dict] = []
+            for k in sorted(buckets.keys(), reverse=True):
+                grp_sorted = sorted(buckets[k], key=lambda x: float(x.get("score_plus") or x.get("score") or 0.0), reverse=True)
+                ordered.extend(grp_sorted)
+            items = ordered[:limit]
+        else:
+            if sort_spec:
+                items = _apply_sort(enriched, sort_spec)[:limit]
+            else:
+                # default flat sort: score_plus desc, then season_avg desc
+                items = sorted(enriched, key=lambda x: (float(x.get("score_plus") or x.get("score") or 0.0), float(x.get("season_avg") or 0.0)), reverse=True)[:limit]
 
         response: Dict = {"date": effective_date, "candidates": items}
         if debug_list is not None:
@@ -859,6 +1045,7 @@ def cold_candidates(
                     "as_of": as_of_norm or None,
                     "group_by": group_mode,
                     "sort_by": sort_by or None,
+                    "hh_recent_days": hh_recent_days,
                 }
             }
             response["debug"] = [stamp] + (debug_list or [])
