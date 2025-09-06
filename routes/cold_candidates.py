@@ -9,23 +9,13 @@ import httpx
 import pytz
 import math
 
-# Optional Statcast overlay (pybaseball)
-try:
-    from pybaseball import statcast_batter
-    _HAS_PYB = True
-except Exception:
-    _HAS_PYB = False
-
 router = APIRouter()
 MLB_BASE = "https://statsapi.mlb.com/api/v1"
 _EASTERN = pytz.timezone("US/Eastern")
 
 # ---------- time & utils ----------
-def _eastern_today() -> date_cls:
-    return datetime.now(_EASTERN).date()
-
 def _eastern_today_str() -> str:
-    return _eastern_today().isoformat()
+    return datetime.now(_EASTERN).date().isoformat()
 
 def _is_today_et(ymd: str) -> bool:
     try:
@@ -38,9 +28,6 @@ def _parse_ymd(s: str) -> date_cls:
 
 def _next_ymd_str(s: str) -> str:
     return (_parse_ymd(s) + timedelta(days=1)).isoformat()
-
-def _prev_ymd_str(s: str) -> str:
-    return (_parse_ymd(s) - timedelta(days=1)).isoformat()
 
 def _normalize(s: str) -> str:
     return unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii").lower().strip()
@@ -115,6 +102,23 @@ def _game_pks_for_date(schedule_json: Dict) -> Set[int]:
                 continue
     return pks
 
+def _schedule_footer(schedule_json: Dict) -> List[Dict]:
+    out: List[Dict] = []
+    for d in schedule_json.get("dates", []) or []:
+        for g in d.get("games", []) or []:
+            status = (g.get("status", {}) or {})
+            code = status.get("statusCode", "")
+            detailed = status.get("detailedState") or status.get("abstractGameState") or status.get("codedGameState") or ""
+            home = (((g.get("teams") or {}).get("home") or {}).get("team") or {}).get("name", "")
+            away = (((g.get("teams") or {}).get("away") or {}).get("team") or {}).get("name", "")
+            out.append({
+                "matchup": f"{away} @ {home}" if home and away else "",
+                "status": detailed,
+                "code": code,
+                "gamePk": g.get("gamePk")
+            })
+    return out
+
 def _all_mlb_team_ids(client: httpx.Client, season: int, dbg: Optional[List[Dict]]) -> List[int]:
     data = _fetch_json_safe(client, f"{MLB_BASE}/teams", {"sportId": 1, "season": season}, dbg, f"teams:{season}")
     teams = data.get("teams", []) or []
@@ -129,7 +133,7 @@ def _all_mlb_team_ids(client: httpx.Client, season: int, dbg: Optional[List[Dict
 # ---------- stats & logs ----------
 def _choose_best_mlb_season_split(splits: List[Dict]) -> Optional[Dict]:
     """
-    Pick MLB-level (AL=103/NL=104) with most AB; fallback to sportId=1; else most AB.
+    From season splits, pick MLB-level (AL=103/NL=104) with most AB; fallback to sportId=1; else most AB.
     """
     if not splits:
         return None
@@ -295,7 +299,8 @@ def _current_hitless_streak_before_slate(
 ) -> int:
     """
     Consecutive MOST-RECENT games with AB>0 and H==0 BEFORE the slate date (ET).
-    Ignores 0-AB games. Excludes same-day games and any game on the slate schedule.
+    Ignores 0-AB games. Excludes same-day games. Additionally skips any game
+    whose gamePk is on the slate's schedule (to avoid in-progress inclusion).
     """
     slate_date = _parse_ymd(slate_date_ymd)
     exclude_game_pks = exclude_game_pks or set()
@@ -508,7 +513,11 @@ def _batch_people_with_stats(client: httpx.Client, ids: List[int], season: int, 
     return out
 
 # ---------- sorting helpers ----------
-_VALID_SORT_KEYS = {"hitless_streak", "season_avg", "avg_hitless_streak_season", "break_prob_next", "pressure", "score", "hit_chance_pct", "overdue_ratio", "ranking_score"}
+_VALID_SORT_KEYS = {
+    "hitless_streak", "season_avg", "avg_hitless_streak_season", "break_prob_next",
+    "pressure", "score", "hit_chance_pct", "overdue_ratio", "ranking_score",
+    "score_plus", "composite"
+}
 
 def _parse_sort_by(sort_by: Optional[str]) -> List[Tuple[str, bool]]:
     """
@@ -542,116 +551,73 @@ def _apply_sort(candidates: List[Dict], sort_spec: List[Tuple[str, bool]]) -> Li
         return tuple(keys)
     return sorted(candidates, key=key_fn)
 
-# ---------- statcast enrichment ----------
-def _statcast_window_for_lookback(end_ymd: str, days: int) -> Tuple[str, str]:
-    end_d = _parse_ymd(end_ymd)
-    start_d = end_d - timedelta(days=days)
-    # pybaseball statcast needs inclusive dates; use YYYY-MM-DD
-    return (start_d.isoformat(), end_d.isoformat())
+# ---------- model helpers (bookmaker-style composite & tiers) ----------
+def _norm_overdue_to_100(overdue_ratio: float) -> float:
+    # Cap at 4.0 to avoid runaway influence; map 0..4 -> 0..100
+    x = max(0.0, min(4.0, float(overdue_ratio)))
+    return (x / 4.0) * 100.0
 
-def _compute_statcast_metrics_for_batter(pid: int, end_ymd: str, lookback_days: int, dbg: Optional[List[Dict]]) -> Dict[str, Any]:
-    """
-    Returns:
-      {
-        "hh_percent_14d": float or None,
-        "xba_delta_14d": float or None
-      }
-    """
-    if not _HAS_PYB or lookback_days <= 0:
-        return {"hh_percent_14d": None, "xba_delta_14d": None}
+def _elite_avg_component(season_avg: float) -> float:
+    # Map .260 -> 0, .350+ -> 100 (cap); linear in between
+    lo, hi = 0.260, 0.350
+    v = (float(season_avg) - lo) / max(1e-9, (hi - lo))
+    v = max(0.0, min(1.0, v))
+    return v * 100.0
 
-    try:
-        start, end = _statcast_window_for_lookback(end_ymd, lookback_days)
-        df = statcast_batter(start_dt=start, end_dt=end, player_id=int(pid))
-        if df is None or len(df) == 0:
-            return {"hh_percent_14d": None, "xba_delta_14d": None}
-
-        # Batted balls rows have launch_speed; hits = events in {'single','double','triple','home_run'}
-        batted = df.dropna(subset=["launch_speed"])
-        batted_count = int(batted.shape[0])
-
-        hard = batted[batted["launch_speed"] >= 95.0] if batted_count > 0 else batted
-        hh_percent = float(hard.shape[0]) / float(batted_count) * 100.0 if batted_count > 0 else None
-
-        # Compute BA and xBA from plate appearances with estimated_ba_using_speedangle (when present)
-        # Use any row that has estimated_ba_using_speedangle; hits counted by 'events'
-        est = df.dropna(subset=["estimated_ba_using_speedangle"])
-        if est.shape[0] == 0:
-            xba = None
-        else:
-            xba = float(est["estimated_ba_using_speedangle"].mean())
-
-        hits_mask = df["events"].isin(["single", "double", "triple", "home_run"])
-        ab_like = int(df.shape[0])  # approximation; statcast rows include non-AB; acceptable for relative delta
-        hits = int(df[hits_mask].shape[0])
-        ba = (float(hits) / float(ab_like)) if ab_like > 0 else None
-
-        xba_delta = None
-        if xba is not None and ba is not None:
-            xba_delta = float(xba) - float(ba)
-
-        out = {"hh_percent_14d": hh_percent, "xba_delta_14d": xba_delta}
-        if dbg is not None:
-            out_dbg = dict(out)
-            out_dbg["pid"] = pid
-            out_dbg["lookback_days"] = lookback_days
-            dbg.append({"statcast": out_dbg})
-        return out
-    except Exception as e:
-        if dbg is not None:
-            dbg.append({"statcast_error": {"pid": pid, "error": f"{type(e).__name__}: {e}"}})
-        return {"hh_percent_14d": None, "xba_delta_14d": None}
-
-# ---------- bookmaker/model scoring helpers ----------
-def _normalize_avg_component(season_avg: float, min_season_avg: float) -> float:
-    """
-    Map AVG into 0..100 with min_season_avg -> 0, (min+0.040) -> 100, clamped.
-    """
-    span = 0.040
-    return max(0.0, min(100.0, (season_avg - min_season_avg) / span * 100.0))
-
-def _normalize_overdue_component(pressure: float) -> float:
-    """
-    Map pressure (streak / avg_streak) into 0..100 using a gentle scale so typical 1.0-3.5 lives in ~25..90.
-    """
-    # 25 points per 1.0 pressure, cap 100
-    return max(0.0, min(100.0, 25.0 * float(pressure)))
-
-def _normalize_savant_component(hh_percent_14d: Optional[float], xba_delta_14d: Optional[float]) -> float:
-    """
-    Combine HH% and xBA delta into 0..100:
-      - HH%: scale 0..60% -> 0..100
-      - xBA delta: scale 0..+0.060 -> 0..100 (negatives -> 0)
-      - Average the two when present; if only one present, use that; if none, 0.
-    """
-    parts: List[float] = []
-    if hh_percent_14d is not None:
-        parts.append(max(0.0, min(100.0, (hh_percent_14d / 60.0) * 100.0)))
-    if xba_delta_14d is not None:
-        parts.append(max(0.0, min(100.0, (xba_delta_14d / 0.060) * 100.0)))
-    if not parts:
+def _statcast_component(hh_percent_14d: Optional[float], xba_delta_14d: Optional[float]) -> float:
+    # If absent, return 0; otherwise average normalized HH% and xBA delta (delta .00 -> 0, .10+ -> 100)
+    if hh_percent_14d is None and xba_delta_14d is None:
         return 0.0
-    return sum(parts) / len(parts)
+    hh_norm = 0.0 if hh_percent_14d is None else max(0.0, min(100.0, float(hh_percent_14d)))
+    if xba_delta_14d is None:
+        xba_norm = 0.0
+    else:
+        # Typical useful range 0..0.10; cap
+        xba_norm = max(0.0, min(100.0, (float(xba_delta_14d) / 0.10) * 100.0))
+    return (hh_norm + xba_norm) / 2.0
 
-def _composite_score(hit_chance_pct: float, avg_comp: float, overdue_comp: float, savant_comp: float) -> float:
+def _composite_score(hit_chance_pct: float, overdue_ratio: float, season_avg: float,
+                     hh_percent_14d: Optional[float], xba_delta_14d: Optional[float]) -> float:
     """
-    Weighted composite (0..100) with weights:
-      hit chance 55, elite avg bump 12.5, overdue 12.5, savant 20.
+    Composite = 50% Hit chance + 17.5% Overdue(→0..100) + 12.5% Elite AVG + 20% Statcast
     """
-    return (0.55 * hit_chance_pct) + (0.125 * avg_comp) + (0.125 * overdue_comp) + (0.20 * savant_comp)
+    hit_component = max(0.0, min(100.0, float(hit_chance_pct)))
+    overdue_component = _norm_overdue_to_100(overdue_ratio)
+    elite_component = _elite_avg_component(season_avg)
+    statcast_component = _statcast_component(hh_percent_14d, xba_delta_14d)
+    return (
+        0.50 * hit_component +
+        0.175 * overdue_component +
+        0.125 * elite_component +
+        0.20 * statcast_component
+    )
 
-def _tier_for_candidate(hit_chance_pct: float, pressure: float, composite: float) -> str:
-    """
-    S if composite >= 70 AND (hit_chance >= 67 OR pressure >= 2.0)
-    A if composite >= 55 AND hit_chance >= 62
-    else none
-    These are deliberately tighter so we don't collapse everything into S when bookmaker=0.
-    """
-    if composite >= 70.0 and (hit_chance_pct >= 67.0 or pressure >= 2.0):
+def _tier_for(composite: float, hit_chance_pct: float, overdue_ratio: float) -> str:
+    # Tier S: Composite ≥70 AND (Hit chance ≥67 OR Overdue ≥2.0)
+    # Tier A: Composite ≥55 AND Hit chance ≥62
+    if composite >= 70.0 and (hit_chance_pct >= 67.0 or overdue_ratio >= 2.0):
         return "S"
     if composite >= 55.0 and hit_chance_pct >= 62.0:
         return "A"
     return ""
+
+def _summary_line(name: str, team: str, season_avg: float, streak: int, avg_hitless: float,
+                  hit_chance_pct: float, hh_percent_14d: Optional[float], xba_delta_14d: Optional[float]) -> str:
+    # Example: ".288 AVG; 5-game streak (season avg hitless 1.57); 65.8% hit chance; HH% (14d) 45.0, xBA–BA (14d) +.040"
+    parts = [
+        f"{season_avg:.3f} AVG; {streak}-game streak (season avg hitless {avg_hitless:.2f}); {hit_chance_pct:.1f}% hit chance"
+    ]
+    if (hh_percent_14d is not None) or (xba_delta_14d is not None):
+        sc_parts = []
+        if hh_percent_14d is not None:
+            sc_parts.append(f"HH% (14d) {hh_percent_14d:.1f}")
+        if xba_delta_14d is not None:
+            sc_parts.append(f"xBA–BA (14d) {xba_delta_14d:+.3f}")
+        if sc_parts:
+            parts.append("; " + ", ".join(sc_parts))
+    else:
+        parts.append("; no recent Statcast signal")
+    return "".join(parts)
 
 # ---------- route ----------
 @router.get("/cold_candidates")
@@ -660,40 +626,35 @@ def cold_candidates(
     season: int = Query(2025, ge=1900, le=2100),
     names: Optional[str] = Query(None, description="Optional comma-separated player names. If omitted, scans slate rosters."),
     min_season_avg: float = Query(0.26, ge=0.0, le=1.0, description="Only include hitters with season AVG ≥ this (default .260)."),
+    min_season_ab: int = Query(100, ge=0, description="Only include hitters with season AB ≥ this (stability filter)."),
+    min_season_gp: int = Query(40, ge=0, description="Only include hitters with season GP ≥ this (stability filter)."),
     min_hitless_games: int = Query(1, ge=1, description="Current hitless streak (AB>0) must be ≥ this."),
     limit: int = Query(30, ge=1, le=1000),
     verify: int = Query(1, ge=0, le=1, description="1 = STRICT pregame only for the slate date (teams not started yet). 0 = include all teams."),
     roll_to_next_slate_if_empty: int = Query(1, ge=0, le=1, description="If verify=1 and there are ZERO pregame teams today, roll to NEXT day (strict pregame)."),
+    last_n: Optional[int] = Query(None, description="Ignored. Backward compatibility only."),
     scan_multiplier: int = Query(8, ge=1, le=40, description="How many logs to check: limit × scan_multiplier (cap applies)"),
     max_log_checks: Optional[int] = Query(None, ge=1, le=5000, description="Hard cap for log checks; overrides scan_multiplier."),
+    hh_recent_days: int = Query(14, ge=0, le=30, description="Lookback window for Statcast overlays; 0 disables."),
+    include_schedule_footer: int = Query(1, ge=0, le=1, description="1 = append schedule status footer."),
     debug: int = Query(0, ge=0, le=1),
-
     # --- Additive params ---
     mode: Optional[str] = Query(None, description="Alias for verify. 'pregame' -> verify=1, 'all' -> verify=0. If set, overrides verify."),
     as_of: Optional[str] = Query(None, description="YYYY-MM-DD snapshot for streak math. If not today ET, verification is disabled and no roll-forward."),
     group_by: str = Query("streak", description="Grouping preset: 'streak' (default) or 'none'. If 'streak', we bucket by hitless_streak and sort inside buckets by score."),
-    sort_by: Optional[str] = Query(None, description="When group_by='none', comma-separated fields with optional '-' for DESC. Fields: hitless_streak,season_avg,avg_hitless_streak_season,break_prob_next,pressure,score,hit_chance_pct,overdue_ratio,ranking_score."),
-
-    # --- Eligibility floors you asked for (now enforced) ---
-    min_season_ab: int = Query(100, ge=0, le=2000, description="Only include hitters with season AB ≥ this."),
-    min_season_gp: int = Query(40, ge=0, le=200, description="Only include hitters with season GP ≥ this."),
-
-    # --- Statcast lookback (days) for 14-day overlays; 0 disables pulls ---
-    hh_recent_days: int = Query(14, ge=0, le=30, description="Lookback window for Statcast overlays; 0 disables."),
-
-    # --- Presentation toggles ---
-    include_schedule_footer: int = Query(1, ge=0, le=1, description="1=append schedule status at the end of the payload."),
+    sort_by: Optional[str] = Query(None, description="When group_by='none', comma-separated fields with optional '-' for DESC. Fields: hitless_streak,season_avg,avg_hitless_streak_season,break_prob_next,pressure,score,hit_chance_pct,overdue_ratio,ranking_score,score_plus,composite."),
 ):
     """
     VERIFIED cold-hitter candidates:
-      • Good hitters (season AVG ≥ min_season_avg, season AB/GP floors)
+      • Good hitters (season AVG ≥ min_season_avg; AB≥min_season_ab; GP≥min_season_gp)
       • Current hitless streak (AB>0 only; DNP/0-AB ignored)
       • STRICT pregame when verify=1 (exclude in-progress/finished)
-      • Exclude same-day games from streak calc (previous games only)
+      • Exclude same-day games from streak calc (use previous games only)
       • avg_hitless_streak_season = average length of COMPLETED hitless streaks before the slate date
-      • Derived: expected_abs (season AB/G), break_prob_next (0..100%), pressure,
-                 score=break_prob_next×pressure (display scaled), hit_chance_pct, overdue_ratio, ranking_score
-      • New: Statcast overlays (14d HH%, xBA–BA) + composite bookmaker-style tiering (S/A) with summaries
+      • Derived: expected_abs (season AB/G), break_prob_next (0..100%), pressure, score=break_prob_next×pressure
+      • Composite (bookmaker-style): 50% Hit chance + 17.5% Overdue + 12.5% Elite AVG + 20% Statcast(14d HH% & xBA–BA)
+      • Tiers: S if (Composite≥70 and (HitChance≥67 or Overdue≥2.0)); A if (Composite≥55 and HitChance≥62)
+      • Optional schedule footer lists matchup and status/detailedState
     """
     requested_date = _eastern_today_str() if _normalize(date) == "today" else date
     effective_date = requested_date
@@ -736,19 +697,14 @@ def cold_candidates(
             MAX_LOG_CHECKS = min(MAX_LOG_CHECKS, 400)
         if "limit" in cold_candidates.__signature__.parameters:
             if limit > 30:
-                limit = 30  # avoid timeouts
+                limit = 30  # gentle cap to avoid timeouts
 
     # --- sort/group presets
     group_mode = (group_by or "").strip().lower()
     sort_spec = _parse_sort_by(sort_by) if group_mode == "none" else []
 
     with httpx.Client(timeout=45) as client:
-        # Use ET "today" when you asked for "today" to avoid early morning miscounts
-        if _normalize(date) == "today":
-            requested_date = _eastern_today_str()
-            effective_date = requested_date
-
-        # schedule & helpers for this date
+        # schedule & helpers for this date (fault tolerant)
         debug_list: Optional[List[Dict]] = [] if debug else None
         sched = _schedule_for_date(client, effective_date, debug_list)
         ns_team_ids_today = _not_started_team_ids_for_date(sched) if (verify_effective == 1) else set()
@@ -764,16 +720,27 @@ def cold_candidates(
             exclude_pks_for_date = _game_pks_for_date(sched)
             rolled = True
 
+        # --- Statcast enrichment placeholders ---
+        # NOTE: We leave these as placeholders because the live overlays may not be present on the provider feed.
+        # If absent, we return None so summary prints "no recent Statcast signal".
+        def _statcast_overlay_for(pid: int, days: int) -> Tuple[Optional[float], Optional[float]]:
+            # hh_percent_14d in [0,100], xba_delta_14d as decimal (e.g., +0.040)
+            # If not available, return (None, None).
+            # Hook here for future Baseball Savant integration.
+            _ = pid, days
+            return (None, None)
+
         def _decorate_candidate(base: Dict, logs: Optional[List[Dict]], as_of_date: str) -> Dict:
             """
-            Add expected_abs, break_prob_next, pressure, score and aliases; compute composite + tier; attach summary.
-            Also pulls Statcast overlay (14d) when enabled.
+            Add expected_abs, break_prob_next, pressure, score, composite, tier, and aliases to a candidate dict.
             """
             person_like = base.get("_person_like") or {}
+            pid = base.get("_pid")
             season_avg = float(base.get("season_avg", 0.0))
 
             expected_abs = _expected_abs_from_person(person_like)
             break_prob = _break_prob_from_avg_and_ab(season_avg, expected_abs)  # 0..1
+            hit_chance_pct = round(break_prob * 100.0, 1)
 
             current = int(base.get("hitless_streak", 0))
             avg_streak = base.get("avg_hitless_streak_season", None)
@@ -782,68 +749,54 @@ def cold_candidates(
             except Exception:
                 avg_streak_f = 1.0
             denom = max(0.5, avg_streak_f)
-            pressure = (float(current) / denom) if denom > 0 else float(current)
+            overdue = (float(current) / denom) if denom > 0 else float(current)
 
-            score = break_prob * pressure  # model score, 0..1 × ratio
+            score = break_prob * overdue * 100.0  # keep your display convention (percent×ratio)
 
-            # Statcast overlay (optional)
-            hh_pct_14d: Optional[float] = None
-            xba_delta_14d: Optional[float] = None
-            if hh_recent_days > 0 and base.get("pid") is not None:
-                ov = _compute_statcast_metrics_for_batter(int(base["pid"]), as_of_date, hh_recent_days, debug_list)
-                hh_pct_14d = ov.get("hh_percent_14d")
-                xba_delta_14d = ov.get("xba_delta_14d")
+            # Statcast overlays (if available)
+            hh_percent_14d, xba_delta_14d = (None, None)
+            if pid is not None and hh_recent_days > 0:
+                try:
+                    hh_percent_14d, xba_delta_14d = _statcast_overlay_for(int(pid), int(hh_recent_days))
+                except Exception:
+                    hh_percent_14d, xba_delta_14d = (None, None)
 
-            # composite components
-            hit_chance_pct = round(break_prob * 100.0, 1)
-            avg_comp = _normalize_avg_component(season_avg, float(min_season_avg))
-            overdue_comp = _normalize_overdue_component(pressure)
-            savant_comp = _normalize_savant_component(hh_pct_14d, xba_delta_14d)
-            composite = round(_composite_score(hit_chance_pct, avg_comp, overdue_comp, savant_comp), 1)
-
-            tier = _tier_for_candidate(hit_chance_pct, pressure, composite)
+            composite = _composite_score(hit_chance_pct, overdue, season_avg, hh_percent_14d, xba_delta_14d)
+            tier = _tier_for(composite, hit_chance_pct, overdue)
 
             # canonical fields
             base["expected_abs"] = round(expected_abs, 2)
             base["break_prob_next"] = hit_chance_pct  # percent display
-            base["pressure"] = round(pressure, 3)
-            base["score"] = round(score * 100.0, 1)
+            base["pressure"] = round(overdue, 3)
+            base["score"] = round(score, 1)
 
-            # alias fields (preferred names for UI/GPT)
+            # aliases
             base["hit_chance_pct"] = base["break_prob_next"]
             base["overdue_ratio"] = base["pressure"]
             base["ranking_score"] = base["score"]
 
-            # bookmaker proxy (0..1) not wired yet -> 0.0
+            # bookmaker/score_plus placeholders (until market overlays wired)
             base["bookmaker"] = 0.0
+            base["score_plus"] = base["ranking_score"]
 
-            # score_plus == score for now (no external market uplift yet)
-            base["score_plus"] = base["score"]
+            # statcast fields
+            base["hh_percent_14d"] = None if hh_percent_14d is None else round(float(hh_percent_14d), 1)
+            base["xba_delta_14d"] = None if xba_delta_14d is None else round(float(xba_delta_14d), 3)
 
-            # enrichment & tier
-            base["hh_percent_14d"] = round(hh_pct_14d, 1) if hh_pct_14d is not None else None
-            base["xba_delta_14d"] = round(xba_delta_14d, 3) if xba_delta_14d is not None else None
-            base["composite"] = composite
+            # composite/tier
+            base["composite"] = round(composite, 1)
             base["tier"] = tier
 
-            # human summary (bookmaker-style)
-            parts = [
-                f"{season_avg:.3f} AVG",
-                f"{current}-game streak vs season avg hitless {avg_streak_f:.2f}",
-                f"Hit chance {hit_chance_pct:.1f}%"
-            ]
-            if base["hh_percent_14d"] is not None and base["xba_delta_14d"] is not None:
-                parts.append(f"HH% (14d) {base['hh_percent_14d']:.1f}, xBA–BA (14d) {base['xba_delta_14d']:+.3f}")
-            elif base["hh_percent_14d"] is not None:
-                parts.append(f"HH% (14d) {base['hh_percent_14d']:.1f}")
-            elif base["xba_delta_14d"] is not None:
-                parts.append(f"xBA–BA (14d) {base['xba_delta_14d']:+.3f}")
-            else:
-                parts.append("no recent Statcast signal")
+            # summary
+            avg_hitless = float(base.get("avg_hitless_streak_season", 0.0))
+            base["summary"] = _summary_line(
+                base.get("name",""), base.get("team",""), float(season_avg), int(current),
+                avg_hitless, hit_chance_pct, base["hh_percent_14d"], base["xba_delta_14d"]
+            )
 
-            base["summary"] = "; ".join(parts)
-
+            # cleanup
             base.pop("_person_like", None)
+            base.pop("_pid", None)
             return base
 
         def run_once_for_date(target_date: str, ns_ids: Set[int], team_ids: List[int]) -> Dict:
@@ -867,36 +820,36 @@ def cold_candidates(
                         pdata = _fetch_json(client, f"{MLB_BASE}/people/{pid}", params={"hydrate": f"team,stats(group=hitting,type=season,season={season})"})
                         person = (pdata.get("people") or [{}])[0]
                         season_avg = _season_avg_from_people_like(person)
-                        sab, sgp = _season_ab_gp_from_people_like(person)
+                        ab, gp = _season_ab_gp_from_people_like(person)
 
                         logs = _game_log_regular_season_desc(client, pid, season, max_entries=160, dbg=debug_list)
                         streak = _current_hitless_streak_before_slate(logs, target_date, exclude_pks_for_date)
 
-                        # floors
-                        if season_avg is None or season_avg < min_season_avg:
+                        # filters
+                        if (season_avg is None) or (season_avg < min_season_avg) or (streak < min_hitless_games):
                             if debug_list is not None:
-                                debug_list.append({"name": person.get("fullName") or name, "skip": f"season_avg {season_avg} < {min_season_avg}"})
+                                why = []
+                                if season_avg is None: why.append("no season stats")
+                                elif season_avg < min_season_avg: why.append(f"season_avg {season_avg:.3f} < {min_season_avg:.3f}")
+                                if streak < min_hitless_games: why.append(f"hitless_streak {streak} < {min_hitless_games}")
+                                debug_list.append({"name": person.get("fullName") or name, "skip": ", ".join(why) or "filtered"})
                             continue
-                        if streak < min_hitless_games:
+                        if (ab is None or ab < min_season_ab) or (gp is None or gp < min_season_gp):
                             if debug_list is not None:
-                                debug_list.append({"name": person.get("fullName") or name, "skip": f"streak {streak} < {min_hitless_games}"})
-                            continue
-                        if (sab is not None and sab < min_season_ab) or (sgp is not None and sgp < min_season_gp):
-                            if debug_list is not None:
-                                debug_list.append({"name": person.get("fullName") or name, "skip": f"AB/GP floors: {sab}/{sgp}"})
+                                debug_list.append({"name": person.get("fullName") or name, "skip": f"AB/GP floors not met (AB={ab}, GP={gp})"})
                             continue
 
                         team_name = _extract_team_name_from_person_or_logs(person, None, pid, logs, target_date)
                         avg_season_hitless = _average_hitless_streak_before_slate(logs, target_date, exclude_pks_for_date)
 
                         cand = {
-                            "pid": pid,
                             "name": person.get("fullName") or name,
                             "team": team_name,
                             "season_avg": round(float(season_avg), 3),
                             "hitless_streak": streak,
                             "avg_hitless_streak_season": round(avg_season_hitless, 2) if avg_season_hitless is not None else 0.0,
                             "_person_like": person,
+                            "_pid": pid,
                         }
                         cand = _decorate_candidate(cand, logs, target_date)
                         candidates.append(cand)
@@ -940,21 +893,21 @@ def cold_candidates(
                         tid, tname = team_map[pid]
                         p["currentTeam"] = {"id": tid, "name": tname}
 
-            # (D) Filter to good hitters and (if verify) to pregame teams with AB/GP floors
+            # (D) Filter to good hitters and (if verify) to pregame teams + AB/GP floors
             prospects: List[Tuple[float, Dict]] = []
             for p in people:
                 season_avg = _season_avg_from_people_like(p)
                 if season_avg is None or season_avg < min_season_avg:
                     continue
-                sab, sgp = _season_ab_gp_from_people_like(p)
-                if (sab is not None and sab < min_season_ab) or (sgp is not None and sgp < min_season_gp):
-                    continue
-
                 try:
                     pid = int(p.get("id"))
                 except Exception:
                     pid = None
                 if pid is None:
+                    continue
+
+                ab, gp = _season_ab_gp_from_people_like(p)
+                if (ab is None or ab < min_season_ab) or (gp is None or gp < min_season_gp):
                     continue
 
                 if verify_effective == 1:
@@ -978,7 +931,7 @@ def cold_candidates(
 
             prospects.sort(key=lambda x: x[0], reverse=True)
 
-            # (E) Logs+streaks for prospects (capped), and include derived metrics + composite + tier
+            # (E) Logs+streaks for prospects (capped), and include derived metrics
             checks = 0
             for _, meta in prospects:
                 if checks >= MAX_LOG_CHECKS or len(candidates) >= limit:
@@ -993,13 +946,13 @@ def cold_candidates(
                             meta["person"], team_map, meta["pid"], logs, target_date
                         )
                         cand = {
-                            "pid": meta["pid"],
                             "name": meta["name"],
                             "team": team_name,
                             "season_avg": meta["season_avg"],
                             "hitless_streak": streak,
                             "avg_hitless_streak_season": round(avg_season_hitless, 2) if avg_season_hitless is not None else 0.0,
                             "_person_like": meta["person"],
+                            "_pid": meta["pid"],
                         }
                         cand = _decorate_candidate(cand, logs, target_date)
                         candidates.append(cand)
@@ -1008,7 +961,7 @@ def cold_candidates(
                         dbg_name = meta.get("name", "")
                         debug_list.append({"name": dbg_name, "error": f"{type(e).__name__}: {e}"})
 
-            # Presentation
+            # Presentation (grouping inside buckets by score already consistent with your UI)
             if group_mode == "streak":
                 buckets: Dict[int, List[Dict]] = {}
                 for c in candidates:
@@ -1031,43 +984,29 @@ def cold_candidates(
                     "log_checks": checks,
                     "max_log_checks": MAX_LOG_CHECKS
                 })
-            return {"candidates": candidates, "schedule": sched}
+            return {"candidates": candidates}
 
-        run = run_once_for_date(effective_date, ns_team_ids_today, slate_team_ids_today)
-        items = run["candidates"]
-        sched_json = run.get("schedule", {}) if include_schedule_footer else {}
+        result = run_once_for_date(effective_date, ns_team_ids_today, slate_team_ids_today)
+        items: List[Dict] = result["candidates"]
 
-        # Split into tiers for front-end GPT printing (S then A); keep full list as-is too
+        # Split tiers
         tier_S: List[Dict] = []
         tier_A: List[Dict] = []
         for c in items:
-            if c.get("tier") == "S":
+            t = c.get("tier", "")
+            if t == "S":
                 tier_S.append(c)
-            elif c.get("tier") == "A":
+            elif t == "A":
                 tier_A.append(c)
 
-        response: Dict = {
-            "date": effective_date,
-            "candidates": items,
-            "tier_S": tier_S,
-            "tier_A": tier_A
-        }
+        response: Dict = {"date": effective_date, "candidates": items}
+        if tier_S:
+            response["tier_S"] = tier_S
+        if tier_A:
+            response["tier_A"] = tier_A
 
-        if include_schedule_footer:
-            # minimal schedule status footer
-            footer: List[Dict] = []
-            for d in sched_json.get("dates", []) or []:
-                for g in d.get("games", []) or []:
-                    try:
-                        away = g.get("teams", {}).get("away", {}).get("team", {}).get("name") or ""
-                        home = g.get("teams", {}).get("home", {}).get("team", {}).get("name") or ""
-                        status = (g.get("status", {}) or {}).get("detailedState") or (g.get("status", {}) or {}).get("abstractGameState") or ""
-                        code = (g.get("status", {}) or {}).get("statusCode") or ""
-                        pk = int(g.get("gamePk"))
-                        footer.append({"matchup": f"{away} @ {home}", "status": status, "code": code, "gamePk": pk})
-                    except Exception:
-                        continue
-            response["schedule_footer"] = footer
+        if include_schedule_footer == 1 and sched:
+            response["schedule_footer"] = _schedule_footer(sched)
 
         if debug_list is not None:
             stamp = {
@@ -1092,6 +1031,7 @@ def cold_candidates(
                     "group_by": group_mode,
                     "sort_by": sort_by or None,
                     "hh_recent_days": hh_recent_days,
+                    "include_schedule_footer": include_schedule_footer,
                 }
             }
             response["debug"] = [stamp] + (debug_list or [])
