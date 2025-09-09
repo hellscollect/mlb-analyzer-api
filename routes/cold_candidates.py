@@ -9,6 +9,11 @@ import httpx
 import pytz
 import math
 
+# NEW: real Statcast overlays (Batch fetch from Baseball Savant)
+# Requires you to have services/statcast_enrichment.py in your tree (I provided a full version earlier).
+# If you didn’t add it yet, ask and I’ll paste that full file again here so you can drop it in.
+from services.statcast_enrichment import fetch_statcast_overlays  # <-- real Savant CSV enrichment
+
 router = APIRouter()
 MLB_BASE = "https://statsapi.mlb.com/api/v1"
 _EASTERN = pytz.timezone("US/Eastern")
@@ -87,20 +92,22 @@ def _team_ids_from_schedule(schedule_json: Dict) -> List[int]:
                 pass
     return sorted(ids)
 
-def _schedule_rows(schedule_json: Dict) -> List[Tuple[str,str,int]]:
+def _schedule_rows(schedule_json: Dict) -> List[Tuple[str,str,str,int]]:
     """
-    Returns (away@home, statusCode, gamePk) for footer.
+    Returns (away@home, statusCode, statusText, gamePk) for footer.
     """
-    out: List[Tuple[str,str,int]] = []
+    out: List[Tuple[str,str,str,int]] = []
     for d in schedule_json.get("dates", []) or []:
         for g in d.get("games", []) or []:
             home = (((g.get("teams") or {}).get("home") or {}).get("team") or {}).get("name") or "?"
             away = (((g.get("teams") or {}).get("away") or {}).get("team") or {}).get("name") or "?"
-            code = (g.get("status", {}) or {}).get("statusCode", "")
+            st = (g.get("status", {}) or {})
+            code = st.get("statusCode", "")
+            text = st.get("detailedState") or st.get("abstractGameState") or ""
             pk = g.get("gamePk") or 0
             try: pk = int(pk)
             except: pk = 0
-            out.append((f"{away} @ {home}", code, pk))
+            out.append((f"{away} @ {home}", code, text, pk))
     return out
 
 def _game_pks_for_date(schedule_json: Dict) -> Set[int]:
@@ -352,124 +359,12 @@ def _average_hitless_streak_before_slate(
         return None
     return sum(streaks) / len(streaks)
 
-# ----------------- roster collection -----------------
-def _team_roster_ids_multi(client: httpx.Client, team_id: int, season: int, dbg: Optional[List[Dict]]) -> List[int]:
-    attempts = [
-        ("Active", {"rosterType": "Active"}),
-        ("active", {"rosterType": "active"}),
-        ("40Man", {"rosterType": "40Man"}),
-        ("fullSeason", {"rosterType": "fullSeason", "season": season}),
-        ("season", {"season": season}),
-    ]
-    ids: List[int] = []
-    for label, params in attempts:
-        try:
-            data = _fetch_json(client, f"{MLB_BASE}/teams/{team_id}/roster", params=params)
-            roster = data.get("roster", []) or []
-            got = 0
-            for r in roster:
-                person = r.get("person") or {}
-                pid = person.get("id")
-                try:
-                    if pid is not None:
-                        ids.append(int(pid)); got += 1
-                except Exception:
-                    continue
-            if dbg is not None:
-                dbg.append({"team_id": team_id, "roster_source": label, "count": got})
-            if got > 0:
-                break
-        except Exception as e:
-            if dbg is not None:
-                dbg.append({"team_id": team_id, "roster_source": label, "error": f"{type(e).__name__}: {e}"})
-            continue
-    return ids
-
-def _hydrate_team_roster_people(client: httpx.Client, team_ids: List[int], season: int, dbg: Optional[List[Dict]]) -> Tuple[Set[int], Dict[int, Tuple[int, str]]]:
-    person_ids: Set[int] = set()
-    team_map: Dict[int, Tuple[int, str]] = {}
-    for i in range(0, len(team_ids), 8):
-        sub = team_ids[i:i+8]
-        params = {
-            "teamIds": ",".join(str(t) for t in sub),
-            "sportId": 1,
-            "season": season,
-            "hydrate": f"roster(person,person.stats(group=hitting,type=season,season={season}))"
-        }
-        try:
-            data = _fetch_json(client, f"{MLB_BASE}/teams", params=params)
-            added = 0
-            for t in data.get("teams", []) or []:
-                tid = t.get("id")
-                tname = t.get("name", "")
-                roster_container = t.get("roster")
-                entries = (roster_container.get("roster", []) if isinstance(roster_container, dict) else roster_container) or []
-                for entry in entries:
-                    person = entry.get("person") or {}
-                    pid = person.get("id")
-                    if pid is None:
-                        continue
-                    try:
-                        pid = int(pid)
-                    except Exception:
-                        continue
-                    person_ids.add(pid)
-                    team_map[pid] = (int(tid) if tid is not None else None, tname)
-                    added += 1
-            if dbg is not None:
-                dbg.append({"teams_hydrate_chunk": sub, "persons_added": added})
-        except Exception as e:
-            if dbg is not None:
-                dbg.append({"teams_hydrate_chunk": sub, "error": f"{type(e).__name__}: {e}"})
-    return person_ids, team_map
-
-def _collect_union_player_ids(
-    client: httpx.Client,
-    team_ids: List[int],
-    season: int,
-    dbg: Optional[List[Dict]]
-) -> Tuple[List[int], Dict[int, Tuple[int, str]]]:
-    ids: Set[int] = set()
-    team_map: Dict[int, Tuple[int, str]] = {}
-
-    for tid in team_ids:
-        got = _team_roster_ids_multi(client, tid, season, dbg)
-        for pid in got:
-            ids.add(pid)
-            team_map.setdefault(pid, (tid, ""))
-
-    hydrate_ids, hydrate_map = _hydrate_team_roster_people(client, team_ids, season, dbg)
-    for pid in hydrate_ids:
-        ids.add(pid)
-        if pid in hydrate_map:
-            team_map[pid] = hydrate_map[pid]
-
-    out_ids = sorted(ids)
-    if dbg is not None:
-        dbg.append({"union_player_ids": len(out_ids)})
-    return out_ids, team_map
-
-def _batch_people_with_stats(client: httpx.Client, ids: List[int], season: int, dbg: Optional[List[Dict]]) -> List[Dict]:
-    out: List[Dict] = []
-    for i in range(0, len(ids), 100):
-        sub = ids[i:i+100]
-        try:
-            params = {
-                "personIds": ",".join(str(x) for x in sub),
-                "hydrate": f"team,stats(group=hitting,type=season,season={season})"
-            }
-            data = _fetch_json(client, f"{MLB_BASE}/people", params=params)
-            ppl = data.get("people", []) or []
-            out.extend(ppl)
-            if dbg is not None:
-                dbg.append({"people_batch_chunk": len(sub), "returned": len(ppl)})
-        except Exception as e:
-            if dbg is not None:
-                dbg.append({"people_batch_chunk": len(sub), "error": f"{type(e).__name__}: {e}"})
-    return out
-
 # ----------------- sorting helpers -----------------
-_VALID_SORT_KEYS = {"hitless_streak", "season_avg", "avg_hitless_streak_season", "break_prob_next", "pressure", "score", "hit_chance_pct", "overdue_ratio", "ranking_score", "score_plus", "bookmaker", "composite"}
+_VALID_SORT_KEYS = {
+    "hitless_streak", "season_avg", "avg_hitless_streak_season",
+    "break_prob_next", "pressure", "score", "hit_chance_pct",
+    "overdue_ratio", "ranking_score", "score_plus", "composite"
+}
 
 def _parse_sort_by(sort_by: Optional[str]) -> List[Tuple[str, bool]]:
     default = [("hitless_streak", True), ("season_avg", True), ("avg_hitless_streak_season", True)]
@@ -499,44 +394,7 @@ def _apply_sort(candidates: List[Dict], sort_spec: List[Tuple[str, bool]]) -> Li
         return tuple(keys)
     return sorted(candidates, key=key_fn)
 
-# ----------------- Statcast proxy (placeholder) -----------------
-def _get_statcast_recent_stub(pid: int, lookback_days: int, dbg: Optional[List[Dict]]) -> Dict:
-    """
-    Placeholder Statcast fetcher:
-    Returns dict with keys:
-      hh_percent_14d (0..100), xba_delta_14d (e.g., +0.045), has_signal (bool)
-    If you wire a real source, replace this function to return real values.
-    """
-    # In production, replace with your internal Statcast sidecar or pybaseball-based job.
-    # Stub returns no signal (forces tiers off unless you wire real data).
-    if dbg is not None:
-        dbg.append({"statcast": {"pid": pid, "lookback_days": lookback_days, "wired": False}})
-    return {
-        "hh_percent_14d": None,
-        "xba_delta_14d": None,
-        "has_signal": False,
-    }
-
-def _statcast_signal(stat: Dict, min_hh: float, min_delta: float) -> Tuple[bool, str]:
-    hh = stat.get("hh_percent_14d")
-    dx = stat.get("xba_delta_14d")
-    has = False
-    reasons = []
-    try:
-        if hh is not None and float(hh) >= float(min_hh):
-            has = True
-            reasons.append(f"HH% (14d) {float(hh):.1f}")
-    except Exception:
-        pass
-    try:
-        if dx is not None and float(dx) >= float(min_delta):
-            has = True
-            reasons.append(f"xBA–BA (14d) +{float(dx):.3f}")
-    except Exception:
-        pass
-    return has, "; ".join(reasons) if reasons else "no recent Statcast signal"
-
-# ----------------- bookmaker scoring -----------------
+# ----------------- candidate scoring helpers -----------------
 def _decorate_candidate_with_scores(base: Dict, person_like: Dict) -> None:
     season_avg = float(base.get("season_avg", 0.0))
     expected_abs = _expected_abs_from_person(person_like)
@@ -563,6 +421,57 @@ def _decorate_candidate_with_scores(base: Dict, person_like: Dict) -> None:
     base["overdue_ratio"] = base["pressure"]
     base["ranking_score"] = base["score"]
 
+def _scale_overdue_for_composite(overdue_ratio: float) -> float:
+    # Scale ratio to 0..100 (3.0 ≈ 100, 2.0 ≈ 66.7)
+    return max(0.0, min(100.0, overdue_ratio * 33.33))
+
+def _scale_elite_avg_for_composite(avg: float) -> float:
+    # 0 @ .260, 100 @ .340+, linear in between
+    if avg <= 0.260: return 0.0
+    if avg >= 0.340: return 100.0
+    return (avg - 0.260) / (0.340 - 0.260) * 100.0
+
+def _scale_statcast_for_composite(hh_percent_14d: Optional[float], xba_delta_14d: Optional[float]) -> float:
+    # Combine HH% and xBA–BA to 0..100; if missing, treat as 0
+    contrib = []
+    if hh_percent_14d is not None:
+        # 30 → 0, 50 → 100 (linear)
+        if hh_percent_14d <= 30: hh_s = 0.0
+        elif hh_percent_14d >= 50: hh_s = 100.0
+        else: hh_s = (float(hh_percent_14d) - 30.0) / 20.0 * 100.0
+        contrib.append(hh_s)
+    if xba_delta_14d is not None:
+        # +.00 → 0, +.08 → 100
+        if xba_delta_14d <= 0.0: dx_s = 0.0
+        elif xba_delta_14d >= 0.08: dx_s = 100.0
+        else: dx_s = float(xba_delta_14d) / 0.08 * 100.0
+        contrib.append(dx_s)
+    if not contrib:
+        return 0.0
+    return sum(contrib) / len(contrib)
+
+def _recompute_composite_in_place(c: Dict, w_hit_chance: float, w_overdue: float, w_elite_avg: float, w_statcast: float) -> None:
+    hit_chance = float(c.get("hit_chance_pct", 0.0))          # 0..100
+    overdue_ratio = float(c.get("overdue_ratio", 0.0))        # ~0..many
+    avg = float(c.get("season_avg", 0.0))                     # 0..1
+    sc = c.get("_statcast", {}) or {}
+    hh = sc.get("hh_percent_14d")
+    dx = sc.get("xba_delta_14d")
+
+    overdue_scaled = _scale_overdue_for_composite(overdue_ratio)
+    elite_scaled = _scale_elite_avg_for_composite(avg)
+    stat_scaled = _scale_statcast_for_composite(hh, dx)
+
+    composite = (
+        w_hit_chance * (hit_chance / 100.0) +
+        w_overdue * (overdue_scaled / 100.0) +
+        w_elite_avg * (elite_scaled / 100.0) +
+        w_statcast * (stat_scaled / 100.0)
+    )
+
+    c["score_plus"] = round(float(c.get("score", 0.0)), 1)
+    c["composite"] = round(float(composite), 1)
+
 # ----------------- route -----------------
 @router.get("/cold_candidates")
 def cold_candidates(
@@ -586,19 +495,19 @@ def cold_candidates(
     group_by: str = Query("streak", description="Grouping preset: 'streak' (default) or 'none'."),
     sort_by: Optional[str] = Query(None, description="When group_by='none', comma-separated fields with optional '-' for DESC."),
 
-    # bookmaker composite knobs
+    # Statcast controls (strict gating default)
     require_statcast_for_tiers: int = Query(1, ge=0, le=1, description="If 1, Tier S/A only shown when Statcast signal exists."),
     hh_recent_days: int = Query(14, ge=7, le=28, description="Statcast lookback window in days."),
     statcast_min_hh_14d: float = Query(40.0, description="HH%% (14d) threshold to treat as positive Statcast."),
     statcast_min_xba_delta_14d: float = Query(0.03, description="xBA–BA (14d) threshold to treat as positive Statcast."),
 
-    # composite weights (fixed to your spec)
+    # composite weights (your spec)
     w_hit_chance: float = Query(50.0),
     w_overdue: float = Query(17.5),
     w_elite_avg: float = Query(12.5),
     w_statcast: float = Query(20.0),
 
-    # tier thresholds (fixed to your spec)
+    # tier thresholds (your spec)
     tier_s_min_composite: float = Query(70.0),
     tier_s_min_hit_chance: float = Query(67.0),
     tier_s_min_overdue: float = Query(2.0),
@@ -607,7 +516,8 @@ def cold_candidates(
     tier_a_min_hit_chance: float = Query(62.0),
 ):
     """
-    VERIFIED cold-hitter candidates with bookmaker tiering and Statcast gating.
+    VERIFIED cold-hitter candidates with **strict pregame verification**,
+    AB>0-only streak calculations, **bulk Statcast overlays**, and Statcast-gated Tier S/A.
     """
     requested_date = _eastern_today_str() if _normalize(date) == "today" else date
     effective_date = requested_date
@@ -703,59 +613,19 @@ def cold_candidates(
             }
             _decorate_candidate_with_scores(cand, person)
 
-            # Statcast overlay fetch + signal
-            stat = _get_statcast_recent_stub(pid, hh_recent_days, debug_list)  # replace stub when your sidecar is wired
-            has_sig, why = _statcast_signal(stat, statcast_min_hh_14d, statcast_min_xba_delta_14d)
-
-            # bookmaker composite (your weights)
-            hit_chance = float(cand["hit_chance_pct"])  # already in 0..100
-            overdue = float(cand["overdue_ratio"])      # ~0.0.. many; scale to 0..100 for composite
-            overdue_scaled = max(0.0, min(100.0, overdue * 33.33))  # 3.0 overdue ≈ 100, 2.0 ≈ 66.7
-
-            # elite avg bump (scale: 0 @ .260, 100 @ .340+)
-            avg = float(cand["season_avg"])
-            if avg <= 0.260: elite_scaled = 0.0
-            elif avg >= 0.340: elite_scaled = 100.0
-            else: elite_scaled = (avg - 0.260) / (0.340 - 0.260) * 100.0
-
-            # statcast scaled (if no values, 0)
-            hh = stat.get("hh_percent_14d")
-            dx = stat.get("xba_delta_14d")
-            stat_scaled = 0.0
-            try:
-                contrib = []
-                if hh is not None:
-                    # 40% = 70/100 scale; 50% = 100
-                    if hh <= 30: hh_s = 0.0
-                    elif hh >= 50: hh_s = 100.0
-                    else: hh_s = (float(hh) - 30.0) / 20.0 * 100.0
-                    contrib.append(hh_s)
-                if dx is not None:
-                    # +.00 = 0, +.08 = 100
-                    if dx <= 0.0: dx_s = 0.0
-                    elif dx >= 0.08: dx_s = 100.0
-                    else: dx_s = float(dx) / 0.08 * 100.0
-                    contrib.append(dx_s)
-                if contrib:
-                    stat_scaled = sum(contrib) / len(contrib)
-            except Exception:
-                stat_scaled = 0.0
-
-            composite = (
-                w_hit_chance * (hit_chance / 100.0) +
-                w_overdue * (overdue_scaled / 100.0) +
-                w_elite_avg * (elite_scaled / 100.0) +
-                w_statcast * (stat_scaled / 100.0)
-            )
-            cand["score_plus"] = round(float(cand["score"]), 1)  # keep equal to base unless you add market adj
-            cand["bookmaker"] = 0.0  # leave 0.0 until you wire odds
-            cand["composite"] = round(composite, 1)
+            # Placeholder for Statcast (real fill happens in a bulk pass later)
             cand["_statcast"] = {
-                "has_signal": has_sig,
-                "why": why,
-                "hh_percent_14d": hh,
-                "xba_delta_14d": dx,
+                "has_signal": False,
+                "why": "",
+                "hh_percent_14d": None,
+                "xba_delta_14d": None,
             }
+
+            # Initial composite without Statcast (will be recomputed later after enrichment)
+            _recompute_composite_in_place(
+                cand, w_hit_chance=w_hit_chance, w_overdue=w_overdue, w_elite_avg=w_elite_avg, w_statcast=w_statcast
+            )
+
             candidates.append(cand)
 
         # league mode or explicit names
@@ -842,24 +712,73 @@ def cold_candidates(
                         dbg_name = (meta["person"] or {}).get("fullName","")
                         debug_list.append({"name": dbg_name, "error": f"{type(e).__name__}: {e}"})
 
-        # group/sort
+        # -------- Statcast enrichment pass (BULK) --------
+        # Enrich all candidates in bulk via Baseball Savant, then recompute composite & re-sort/group.
+        try:
+            name_list = [c.get("name","") for c in candidates if c.get("name")]
+            overlays = fetch_statcast_overlays(
+                name_list,
+                recent_days=hh_recent_days,
+                statcast_min_hh_14d=statcast_min_hh_14d,
+                statcast_min_xba_delta_14d=statcast_min_xba_delta_14d,
+            )
+        except Exception as e:
+            overlays = {}
+            if debug_list is not None:
+                debug_list.append({"statcast_bulk_error": f"{type(e).__name__}: {e}"})
+
+        for c in candidates:
+            nm = c.get("name","")
+            sc = overlays.get(nm, {}) if nm else {}
+            has_signal = bool(sc.get("has_signal"))
+            why = sc.get("why") or ""
+            hh = sc.get("hh_percent_14d")
+            dx = sc.get("xba_delta_14d")
+            c["_statcast"] = {
+                "has_signal": has_signal,
+                "why": why,
+                "hh_percent_14d": hh,
+                "xba_delta_14d": dx,
+            }
+            # recompute composite with true Statcast
+            _recompute_composite_in_place(
+                c, w_hit_chance=w_hit_chance, w_overdue=w_overdue, w_elite_avg=w_elite_avg, w_statcast=w_statcast
+            )
+
+        # -------- group/sort after Statcast recompute --------
         if group_mode == "streak":
             buckets: Dict[int, List[Dict]] = {}
             for c in candidates:
                 buckets.setdefault(int(c.get("hitless_streak", 0)), []).append(c)
             out_list: List[Dict] = []
             for k in sorted(buckets.keys(), reverse=True):
-                grp = sorted(buckets[k], key=lambda x: float(x.get("ranking_score", x.get("score", 0.0))), reverse=True)
+                grp = sorted(
+                    buckets[k],
+                    key=lambda x: (
+                        float(x.get("composite", 0.0)),
+                        float(x.get("ranking_score", x.get("score", 0.0))),
+                        float(x.get("season_avg", 0.0)),
+                    ),
+                    reverse=True
+                )
                 out_list.extend(grp)
             candidates = out_list[:limit]
         else:
             if sort_spec:
                 candidates = _apply_sort(candidates, sort_spec)
             else:
-                candidates = sorted(candidates, key=lambda x: (float(x.get("ranking_score", x.get("score", 0.0))), float(x.get("season_avg", 0.0))), reverse=True)
+                candidates = sorted(
+                    candidates,
+                    key=lambda x: (
+                        float(x.get("composite", 0.0)),
+                        float(x.get("ranking_score", x.get("score", 0.0))),
+                        float(x.get("season_avg", 0.0)),
+                    ),
+                    reverse=True
+                )
             candidates = candidates[:limit]
 
-        # Build Tier S / A (bookmaker mindset) — Statcast gate enforced if require_statcast_for_tiers=1
+        # -------- Build Tier S / A (Statcast gate enforced if require_statcast_for_tiers=1) --------
         best_targets_s: List[Dict] = []
         best_targets_a: List[Dict] = []
         for c in candidates:
@@ -878,10 +797,14 @@ def cold_candidates(
             elif comp >= tier_a_min_composite and hit_ch >= tier_a_min_hit_chance:
                 best_targets_a.append(c)
 
+        # -------- Response --------
         response: Dict[str, Any] = {"date": effective_date, "candidates": candidates}
 
-        # attach footer info so the GPT can print schedule status
-        response["schedule"] = [{"matchup": row[0], "statusCode": row[1], "gamePk": row[2]} for row in sched_rows]
+        # attach footer info so the GPT can print schedule status (now with statusText)
+        response["schedule"] = [
+            {"matchup": row[0], "statusCode": row[1], "statusText": row[2], "gamePk": row[3]}
+            for row in sched_rows
+        ]
         response["pregame_counts"] = {
             "pregame_teams": len(ns_team_ids_today),
             "slate_teams": len(slate_team_ids_today),
