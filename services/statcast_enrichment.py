@@ -11,7 +11,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import requests
 
 try:
-    # pybaseball is the most reliable MLBAM id source; keep as optional
+    # Best MLBAM id source; keep optional if not installed.
     from pybaseball import playerid_lookup  # type: ignore
 except Exception:  # pragma: no cover
     playerid_lookup = None  # type: ignore
@@ -24,13 +24,13 @@ except Exception:  # pragma: no cover
 STATCAST_DAYS_DEFAULT = 14
 STATCAST_SEARCH_CSV_URL = "https://baseballsavant.mlb.com/statcast_search/csv"
 
-# Politely identify ourselves; Cloudflare often blocks default UA on PaaS.
+# Identify ourselves; helps avoid 403 from CF.
 _UA = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 ProblemChildAI/1.0"
 )
 
-# Simple in-memory cache (per-process). If you’re scaling horizontally, swap to redis.
+# Simple in-memory cache (per-process). If horizontally scaled, use Redis.
 _CACHE: Dict[str, Dict[str, Any]] = {}
 _CACHE_TTL_SEC = 600  # 10 minutes
 
@@ -40,7 +40,7 @@ class StatcastSignal:
     hard_hit_pct: Optional[float]  # 0..100
     xba_gap: Optional[float]       # xBA − BA
     has_signal: bool               # meets thresholds
-    why: str                       # human summary, brief
+    why: str                       # human summary
 
 
 # ---------------------------
@@ -80,7 +80,7 @@ def _split_name(nm: str) -> Tuple[str, str]:
     return parts[-1], " ".join(parts[:-1])
 
 def _lookup_bamid(name: str) -> Optional[int]:
-    """Best-effort MLBAM id via pybaseball."""
+    """Resolve MLBAM id via pybaseball."""
     if playerid_lookup is None:
         return None
     try:
@@ -88,7 +88,6 @@ def _lookup_bamid(name: str) -> Optional[int]:
         df = playerid_lookup(last, first)  # type: ignore
         if df is None or df.empty:
             return None
-        # Prefer the first row with a valid key_mlbam
         for _, row in df.iterrows():
             bam = row.get("key_mlbam")
             if bam and str(bam).strip().isdigit():
@@ -113,34 +112,18 @@ def _fetch_statcast_csv(
 ) -> List[Dict[str, str]]:
     """
     Fetch raw Statcast rows for a given batter over [start_dt, end_dt] from Baseball Savant CSV.
-    We filter to batted ball/PA fields we need; CSV keeps a stable schema.
     """
     params = {
-        # Required entity/date filters
         "player_type": "batter",
         "player_lookup": "true",
-        "hfPT": "",  # pitch types (all)
-        "hfAB": "",  # count
-        "hfBBT": "", # batted ball type
-        "hfPR": "",
-        "hfZ": "",
-        "stadium": "",
-        "hfBBL": "",
-        "hfNewZones": "",
-        "hfGT": "",
-        "hfC": "",
-        "hfSea": "",
-        "hfSit": "",
-        "hfOuts": "",
-        "opponent": "",
-        "pitcher_throws": "",
-        "batter_stands": "",
-        "metric_1": "",
-        "rehab": "",
         "type": "details",
         "player": str(mbam),
         "start_date": start_dt,
         "end_date": end_dt,
+        # Everything else left blank intentionally (all pitch types, counts, etc.)
+        "hfPT": "", "hfAB": "", "hfBBT": "", "hfPR": "", "hfZ": "", "stadium": "", "hfBBL": "",
+        "hfNewZones": "", "hfGT": "", "hfC": "", "hfSea": "", "hfSit": "", "hfOuts": "",
+        "opponent": "", "pitcher_throws": "", "batter_stands": "", "metric_1": "", "rehab": "",
     }
 
     headers = {"User-Agent": _UA, "Accept": "text/csv"}
@@ -153,7 +136,7 @@ def _fetch_statcast_csv(
             r.raise_for_status()
             buff = io.StringIO(r.text)
             reader = csv.DictReader(buff)
-            return list(reader)  # list[dict]
+            return list(reader)
         except Exception:
             if attempt <= max_retries:
                 time.sleep(retry_backoff * attempt)
@@ -167,27 +150,20 @@ def _calc_signal(rows: Iterable[Dict[str, str]]) -> Tuple[Optional[float], Optio
     - hard_hit_pct: EV >= 95 mph over batted balls
     - xba_gap: mean(estimated_ba_using_speedangle) − BA (hits/AB)
     """
-    batted = []
-    evs = []
-    las = []
-    xbas = []
-    events = []
+    evs: List[float] = []
+    xbas: List[float] = []
+    events: List[str] = []
 
     for row in rows:
-        # Batted ball if launch_speed exists
+        # batted ball speed
         ls = row.get("launch_speed")
         if ls:
             try:
-                ev = float(ls)
-                evs.append(ev)
-                la_str = row.get("launch_angle")
-                if la_str:
-                    las.append(float(la_str))
-                batted.append(1)
+                evs.append(float(ls))
             except Exception:
                 pass
 
-        # Estimated BA field
+        # estimated BA per batted ball
         xba_str = row.get("estimated_ba_using_speedangle")
         if xba_str:
             try:
@@ -230,7 +206,7 @@ def _meets_thresholds(
     hh_min: float,
     xba_delta_min: float,
 ) -> Tuple[bool, str]:
-    reasons = []
+    reasons: List[str] = []
     ok = False
     if hard_hit_pct is not None and hard_hit_pct >= hh_min:
         ok = True
@@ -238,8 +214,7 @@ def _meets_thresholds(
     if xba_gap is not None and xba_gap >= xba_delta_min:
         ok = True
         reasons.append(f"xBA–BA +{xba_gap:.3f}≥+{xba_delta_min:.3f}")
-    why = "; ".join(reasons) if reasons else ""
-    return ok, why
+    return ok, "; ".join(reasons)
 
 
 # ---------------------------
@@ -254,17 +229,8 @@ def fetch_statcast_overlays(
     statcast_min_xba_delta_14d: float = 0.030,
 ) -> Dict[str, Dict[str, Any]]:
     """
-    Return a dict keyed by player name:
-      {
-        "<Name>": {
-          "has_signal": bool,
-          "why": "HH% 46.2≥40; xBA–BA +0.041≥+0.030",
-          "hh_percent_14d": 46.2,
-          "xba_delta_14d": 0.041
-        },
-        ...
-      }
-    Fail-soft per player (empty on errors).
+    Return { name: { has_signal, why, hh_percent_14d, xba_delta_14d } }
+    Fail-soft per player on errors/missing data.
     """
     out: Dict[str, Dict[str, Any]] = {}
     if not names:
@@ -286,7 +252,6 @@ def fetch_statcast_overlays(
 
             rows = _fetch_statcast_csv(bam, start, end)
             if not rows:
-                # cache a negative result briefly to avoid hammering
                 miss = {"has_signal": False, "why": "", "hh_percent_14d": None, "xba_delta_14d": None}
                 _to_cache(ck, miss)
                 out[nm] = miss
@@ -304,7 +269,7 @@ def fetch_statcast_overlays(
             _to_cache(ck, result)
             out[nm] = result
 
-            # polite pacing: Baseball Savant may throttle bursts
+            # polite pacing
             time.sleep(0.08)
 
         except Exception:
