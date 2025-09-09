@@ -1,21 +1,74 @@
 # services/statcast_enrichment.py
 from __future__ import annotations
 
-from typing import Dict, Any, List, Optional, Tuple
+import csv
+import io
+import time
+from dataclasses import dataclass
 from datetime import date, timedelta
-import pandas as pd
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-# pybaseball imports (already in requirements.txt)
-from pybaseball import statcast_batter, playerid_lookup
+import requests
 
-# Basic mapping from string "events" to whether it's an official AB and whether it's a hit
-# This is a simplification but works well for recent windows
-_AB_EVENTS = {
-    "single", "double", "triple", "home_run", "strikeout", "field_out", "grounded_into_double_play",
-    "force_out", "field_error", "double_play", "fielders_choice", "fielders_choice_out", "pop_out",
-    "flyout", "lineout", "strikeout_double_play", "caught_stealing_2b", "other_out"
-}
-_HIT_EVENTS = {"single", "double", "triple", "home_run"}
+try:
+    # pybaseball is the most reliable MLBAM id source; keep as optional
+    from pybaseball import playerid_lookup  # type: ignore
+except Exception:  # pragma: no cover
+    playerid_lookup = None  # type: ignore
+
+
+# ---------------------------
+# Config
+# ---------------------------
+
+STATCAST_DAYS_DEFAULT = 14
+STATCAST_SEARCH_CSV_URL = "https://baseballsavant.mlb.com/statcast_search/csv"
+
+# Politely identify ourselves; Cloudflare often blocks default UA on PaaS.
+_UA = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 ProblemChildAI/1.0"
+)
+
+# Simple in-memory cache (per-process). If you’re scaling horizontally, swap to redis.
+_CACHE: Dict[str, Dict[str, Any]] = {}
+_CACHE_TTL_SEC = 600  # 10 minutes
+
+
+@dataclass
+class StatcastSignal:
+    hard_hit_pct: Optional[float]  # 0..100
+    xba_gap: Optional[float]       # xBA − BA
+    has_signal: bool               # meets thresholds
+    why: str                       # human summary, brief
+
+
+# ---------------------------
+# Utilities
+# ---------------------------
+
+def _cache_key(mbam: int, start: str, end: str) -> str:
+    return f"bam:{mbam}:{start}:{end}"
+
+def _now_sec() -> float:
+    return time.time()
+
+def _from_cache(key: str) -> Optional[Dict[str, Any]]:
+    item = _CACHE.get(key)
+    if not item:
+        return None
+    if _now_sec() - item["t"] > _CACHE_TTL_SEC:
+        _CACHE.pop(key, None)
+        return None
+    return item["v"]
+
+def _to_cache(key: str, value: Dict[str, Any]) -> None:
+    _CACHE[key] = {"v": value, "t": _now_sec()}
+
+def _daterange_recent(days: int) -> Tuple[str, str]:
+    end = date.today()
+    start = end - timedelta(days=max(1, int(days)))
+    return start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
 
 def _split_name(nm: str) -> Tuple[str, str]:
     nm = (nm or "").strip()
@@ -24,125 +77,237 @@ def _split_name(nm: str) -> Tuple[str, str]:
     parts = nm.split()
     if len(parts) == 1:
         return parts[0], ""
-    # best-effort: last token as last name
     return parts[-1], " ".join(parts[:-1])
 
 def _lookup_bamid(name: str) -> Optional[int]:
-    last, first = _split_name(name)
+    """Best-effort MLBAM id via pybaseball."""
+    if playerid_lookup is None:
+        return None
     try:
-        df = playerid_lookup(last, first)  # returns DataFrame with "key_mlbam"
+        last, first = _split_name(name)
+        df = playerid_lookup(last, first)  # type: ignore
         if df is None or df.empty:
             return None
-        # Prefer currently active / most recent id
-        # playerid_lookup may return multiple rows; take the first with a key_mlbam
+        # Prefer the first row with a valid key_mlbam
         for _, row in df.iterrows():
             bam = row.get("key_mlbam")
-            if pd.notna(bam):
-                try:
-                    return int(bam)
-                except Exception:
-                    continue
+            if bam and str(bam).strip().isdigit():
+                return int(bam)
     except Exception:
         return None
     return None
 
-def _daterange_recent(days: int) -> Tuple[str, str]:
-    end = date.today()
-    start = end - timedelta(days=max(1, int(days)))
-    return start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
 
-def _calc_rates(df: pd.DataFrame) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+# ---------------------------
+# Statcast Fetch
+# ---------------------------
+
+def _fetch_statcast_csv(
+    mbam: int,
+    start_dt: str,
+    end_dt: str,
+    *,
+    timeout: float = 8.0,
+    max_retries: int = 2,
+    retry_backoff: float = 0.6,
+) -> List[Dict[str, str]]:
     """
-    Returns (hard_hit_pct, barrel_pct, xba_gap) for the dataframe window.
-    - hard_hit_pct: % of batted balls with launch_speed >= 95 mph
-    - barrel_pct: naive: % with "barreled" flag if present else high EV + sweet spot proxy
-    - xba_gap: mean(estimated_ba_using_speedangle) - recent BA (hits/AB)
+    Fetch raw Statcast rows for a given batter over [start_dt, end_dt] from Baseball Savant CSV.
+    We filter to batted ball/PA fields we need; CSV keeps a stable schema.
     """
-    if df is None or df.empty:
-        return None, None, None
+    params = {
+        # Required entity/date filters
+        "player_type": "batter",
+        "player_lookup": "true",
+        "hfPT": "",  # pitch types (all)
+        "hfAB": "",  # count
+        "hfBBT": "", # batted ball type
+        "hfPR": "",
+        "hfZ": "",
+        "stadium": "",
+        "hfBBL": "",
+        "hfNewZones": "",
+        "hfGT": "",
+        "hfC": "",
+        "hfSea": "",
+        "hfSit": "",
+        "hfOuts": "",
+        "opponent": "",
+        "pitcher_throws": "",
+        "batter_stands": "",
+        "metric_1": "",
+        "rehab": "",
+        "type": "details",
+        "player": str(mbam),
+        "start_date": start_dt,
+        "end_date": end_dt,
+    }
 
-    # Batted balls subset
-    batted = df[df["launch_speed"].notna()]
-    hard_hit_pct = None
-    if not batted.empty:
-        hard = (batted["launch_speed"] >= 95).sum()
-        hard_hit_pct = 100.0 * float(hard) / float(len(batted))
+    headers = {"User-Agent": _UA, "Accept": "text/csv"}
 
-    # Barrel pct (pybaseball has "barrel" column in some versions; fallback proxy)
-    barrel_pct = None
-    if "barrel" in df.columns:
+    attempt = 0
+    while True:
+        attempt += 1
         try:
-            barrel_pct = 100.0 * float((df["barrel"] == 1).sum()) / float(len(df))
+            r = requests.get(STATCAST_SEARCH_CSV_URL, params=params, headers=headers, timeout=timeout)
+            r.raise_for_status()
+            buff = io.StringIO(r.text)
+            reader = csv.DictReader(buff)
+            return list(reader)  # list[dict]
         except Exception:
-            barrel_pct = None
-    if barrel_pct is None and not batted.empty:
-        # proxy: EV>=98 and 26<=LA<=30-ish sweet-spot window
-        proxy = batted[(batted["launch_speed"] >= 98) & (batted["launch_angle"].between(26, 30, inclusive="both"))]
-        barrel_pct = 100.0 * float(len(proxy)) / float(len(batted))
+            if attempt <= max_retries:
+                time.sleep(retry_backoff * attempt)
+                continue
+            return []
 
-    # BA
-    ev = df["events"].astype(str).str.lower().fillna("")
-    ab_mask = ev.isin(_AB_EVENTS)
-    ab = int(ab_mask.sum())
-    hits = int(ev.isin(_HIT_EVENTS).sum())
+
+def _calc_signal(rows: Iterable[Dict[str, str]]) -> Tuple[Optional[float], Optional[float]]:
+    """
+    Compute (Hard-Hit %, xBA gap) over the window.
+    - hard_hit_pct: EV >= 95 mph over batted balls
+    - xba_gap: mean(estimated_ba_using_speedangle) − BA (hits/AB)
+    """
+    batted = []
+    evs = []
+    las = []
+    xbas = []
+    events = []
+
+    for row in rows:
+        # Batted ball if launch_speed exists
+        ls = row.get("launch_speed")
+        if ls:
+            try:
+                ev = float(ls)
+                evs.append(ev)
+                la_str = row.get("launch_angle")
+                if la_str:
+                    las.append(float(la_str))
+                batted.append(1)
+            except Exception:
+                pass
+
+        # Estimated BA field
+        xba_str = row.get("estimated_ba_using_speedangle")
+        if xba_str:
+            try:
+                xbas.append(float(xba_str))
+            except Exception:
+                pass
+
+        evname = (row.get("events") or "").strip().lower()
+        events.append(evname)
+
+    # Hard-Hit%
+    hard_hit_pct = None
+    if evs:
+        hard = sum(1 for ev in evs if ev >= 95.0)
+        hard_hit_pct = 100.0 * hard / len(evs)
+
+    # BA from events (AB subset)
+    AB_EVENTS = {
+        "single", "double", "triple", "home_run",
+        "strikeout", "field_out", "grounded_into_double_play", "force_out",
+        "field_error", "double_play", "fielders_choice", "fielders_choice_out",
+        "pop_out", "flyout", "lineout", "strikeout_double_play", "other_out"
+    }
+    HIT_EVENTS = {"single", "double", "triple", "home_run"}
+
+    ab = sum(1 for e in events if e in AB_EVENTS)
+    hits = sum(1 for e in events if e in HIT_EVENTS)
     ba = (hits / ab) if ab > 0 else 0.0
 
-    # xBA
-    xba_col = "estimated_ba_using_speedangle"
-    if xba_col in df.columns:
-        xba_vals = df[xba_col].dropna()
-        xba = float(xba_vals.mean()) if not xba_vals.empty else None
-    else:
-        xba = None
-
+    xba = (sum(xbas) / len(xbas)) if xbas else None
     xba_gap = (xba - ba) if (xba is not None) else None
-    return hard_hit_pct, barrel_pct, xba_gap
+
+    return hard_hit_pct, xba_gap
+
+
+def _meets_thresholds(
+    hard_hit_pct: Optional[float],
+    xba_gap: Optional[float],
+    *,
+    hh_min: float,
+    xba_delta_min: float,
+) -> Tuple[bool, str]:
+    reasons = []
+    ok = False
+    if hard_hit_pct is not None and hard_hit_pct >= hh_min:
+        ok = True
+        reasons.append(f"HH% {hard_hit_pct:.1f}≥{hh_min:.0f}")
+    if xba_gap is not None and xba_gap >= xba_delta_min:
+        ok = True
+        reasons.append(f"xBA–BA +{xba_gap:.3f}≥+{xba_delta_min:.3f}")
+    why = "; ".join(reasons) if reasons else ""
+    return ok, why
+
+
+# ---------------------------
+# Public API
+# ---------------------------
 
 def fetch_statcast_overlays(
     names: List[str],
     *,
-    recent_days: int = 14,
-    timeout_s: float = 2.5,  # retained for signature compatibility; not used by pybaseball
+    recent_days: int = STATCAST_DAYS_DEFAULT,
+    statcast_min_hh_14d: float = 40.0,
+    statcast_min_xba_delta_14d: float = 0.030,
 ) -> Dict[str, Dict[str, Any]]:
     """
-    Return a dict keyed by player name with optional fields:
-      hard_hit_pct_recent (0..100), barrel_pct_recent (0..100),
-      xba_gap_recent (xBA - BA as decimal), pitcher_fit ('good'/'neutral'/'bad'),
-      park_flag (True if hitter-friendly), lineup_slot (int if known).
-
-    Fail-soft: if data unavailable, return {} or omit keys.
+    Return a dict keyed by player name:
+      {
+        "<Name>": {
+          "has_signal": bool,
+          "why": "HH% 46.2≥40; xBA–BA +0.041≥+0.030",
+          "hh_percent_14d": 46.2,
+          "xba_delta_14d": 0.041
+        },
+        ...
+      }
+    Fail-soft per player (empty on errors).
     """
     out: Dict[str, Dict[str, Any]] = {}
     if not names:
         return out
 
-    start, end = _daterange_recent(int(recent_days))
+    start, end = _daterange_recent(recent_days)
 
     for nm in names:
         try:
-            pid = _lookup_bamid(nm)
-            if not pid:
+            bam = _lookup_bamid(nm)
+            if not bam:
                 continue
-            df = statcast_batter(start_dt=start, end_dt=end, player_id=pid)
-            if df is None or df.empty:
+
+            ck = _cache_key(bam, start, end)
+            cached = _from_cache(ck)
+            if cached is not None:
+                out[nm] = cached
                 continue
-            hard, barrel, xgap = _calc_rates(df)
-            row: Dict[str, Any] = {}
-            if hard is not None:
-                row["hard_hit_pct_recent"] = float(round(hard, 2))
-            if barrel is not None:
-                row["barrel_pct_recent"] = float(round(barrel, 2))
-            if xgap is not None:
-                row["xba_gap_recent"] = float(round(xgap, 4))
 
-            # Placeholders for future enrichments (kept for stability with the existing code)
-            row["pitcher_fit"] = "neutral"
-            row["park_flag"] = False
-            row["lineup_slot"] = None
+            rows = _fetch_statcast_csv(bam, start, end)
+            if not rows:
+                # cache a negative result briefly to avoid hammering
+                miss = {"has_signal": False, "why": "", "hh_percent_14d": None, "xba_delta_14d": None}
+                _to_cache(ck, miss)
+                out[nm] = miss
+                continue
 
-            out[nm] = row
+            hh, xgap = _calc_signal(rows)
+            has, why = _meets_thresholds(hh, xgap, hh_min=statcast_min_hh_14d, xba_delta_min=statcast_min_xba_delta_14d)
+
+            result = {
+                "has_signal": bool(has),
+                "why": why,
+                "hh_percent_14d": round(hh, 1) if hh is not None else None,
+                "xba_delta_14d": round(xgap, 3) if xgap is not None else None,
+            }
+            _to_cache(ck, result)
+            out[nm] = result
+
+            # polite pacing: Baseball Savant may throttle bursts
+            time.sleep(0.08)
+
         except Exception:
-            # fail-soft per player
-            continue
+            out[nm] = {"has_signal": False, "why": "", "hh_percent_14d": None, "xba_delta_14d": None}
 
     return out
