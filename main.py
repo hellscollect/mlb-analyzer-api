@@ -16,7 +16,7 @@ import pytz
 from services.dates import parse_date
 
 APP_NAME = "MLB Analyzer API"
-APP_VERSION = "1.4.0"  # bumped
+APP_VERSION = "1.6.3"  # bumped
 
 class UTF8JSONResponse(JSONResponse):
     media_type = "application/json; charset=utf-8"
@@ -29,7 +29,7 @@ EXTERNAL_URL = (
 app = FastAPI(
     title=APP_NAME,
     version=APP_VERSION,
-    description="Custom GPT + API for MLB streak analysis",
+    description="Custom GPT + API for MLB streak analysis with Statcast enrichment (pybaseball) and bookmaker-aware ranking.",
     servers=[{"url": EXTERNAL_URL}],
     openapi_url="/openapi.json",
     default_response_class=UTF8JSONResponse,
