@@ -1,130 +1,260 @@
-# services/value_ranker.py
+# services/statcast_enrichment.py
 from __future__ import annotations
 
+import csv
+import io
+import time
 from dataclasses import dataclass
-from typing import Dict, Any, Optional
+from datetime import date, timedelta
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+import requests
+
+try:
+    # Optional but best way to resolve MLBAM ids.
+    from pybaseball import playerid_lookup  # type: ignore
+except Exception:  # pragma: no cover
+    playerid_lookup = None  # type: ignore
+
+
+STATCAST_DAYS_DEFAULT = 14
+STATCAST_SEARCH_CSV_URL = "https://baseballsavant.mlb.com/statcast_search/csv"
+
+_UA = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 ProblemChildAI/1.0"
+)
+
+_CACHE: Dict[str, Dict[str, Any]] = {}
+_CACHE_TTL_SEC = 600  # 10 minutes
 
 
 @dataclass
-class RankWeights:
+class StatcastSignal:
+    hard_hit_pct: Optional[float]  # 0..100
+    xba_gap: Optional[float]       # xBA − BA
+    has_signal: bool               # meets thresholds
+    why: str                       # human summary
+
+
+def _cache_key(mbam: int, start: str, end: str) -> str:
+    return f"bam:{mbam}:{start}:{end}"
+
+def _now_sec() -> float:
+    return time.time()
+
+def _from_cache(key: str) -> Optional[Dict[str, Any]]:
+    item = _CACHE.get(key)
+    if not item:
+        return None
+    if _now_sec() - item["t"] > _CACHE_TTL_SEC:
+        _CACHE.pop(key, None)
+        return None
+    return item["v"]
+
+def _to_cache(key: str, value: Dict[str, Any]) -> None:
+    _CACHE[key] = {"v": value, "t": _now_sec()}
+
+def _daterange_recent(days: int) -> Tuple[str, str]:
+    end = date.today()
+    start = end - timedelta(days=max(1, int(days)))
+    return start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
+
+def _split_name(nm: str) -> Tuple[str, str]:
+    nm = (nm or "").strip()
+    if not nm:
+        return "", ""
+    parts = nm.split()
+    if len(parts) == 1:
+        return parts[0], ""
+    return parts[-1], " ".join(parts[:-1])
+
+def _lookup_bamid(name: str) -> Optional[int]:
+    """Resolve MLBAM id via pybaseball if available."""
+    if playerid_lookup is None:
+        return None
+    try:
+        last, first = _split_name(name)
+        df = playerid_lookup(last, first)  # type: ignore
+        if df is None or df.empty:
+            return None
+        for _, row in df.iterrows():
+            bam = row.get("key_mlbam")
+            if bam and str(bam).strip().isdigit():
+                return int(bam)
+    except Exception:
+        return None
+    return None
+
+
+def _fetch_statcast_csv(
+    mbam: int,
+    start_dt: str,
+    end_dt: str,
+    *,
+    timeout: float = 8.0,
+    max_retries: int = 2,
+    retry_backoff: float = 0.6,
+) -> List[Dict[str, str]]:
     """
-    Runtime weight knobs (normalized internally). Matches query params.
+    Fetch raw Statcast rows for a given batter over [start_dt, end_dt] from Baseball Savant CSV.
     """
-    w_hit_chance: float = 50.0
-    w_overdue: float   = 17.5
-    w_elite_avg: float = 12.5
-    w_statcast: float  = 20.0
+    params = {
+        "player_type": "batter",
+        "player_lookup": "true",
+        "type": "details",
+        "player": str(mbam),
+        "start_date": start_dt,
+        "end_date": end_dt,
+        # Everything else left blank intentionally (all pitch types, counts, etc.)
+        "hfPT": "", "hfAB": "", "hfBBT": "", "hfPR": "", "hfZ": "", "stadium": "", "hfBBL": "",
+        "hfNewZones": "", "hfGT": "", "hfC": "", "hfSea": "", "hfSit": "", "hfOuts": "",
+        "opponent": "", "pitcher_throws": "", "batter_stands": "", "metric_1": "", "rehab": "",
+    }
 
-    def normalized(self) -> "RankWeights":
-        total = max(1e-9, self.w_hit_chance + self.w_overdue + self.w_elite_avg + self.w_statcast)
-        return RankWeights(
-            w_hit_chance=self.w_hit_chance / total,
-            w_overdue=self.w_overdue / total,
-            w_elite_avg=self.w_elite_avg / total,
-            w_statcast=self.w_statcast / total,
-        )
+    headers = {"User-Agent": _UA, "Accept": "text/csv"}
 
-
-@dataclass
-class RankInputs:
-    season_avg: Optional[float] = None          # e.g. .321
-    break_prob_next: Optional[float] = None     # 0..1
-    pressure: Optional[float] = None            # continuous overdue metric
-    hard_hit_pct_recent: Optional[float] = None # 0..100
-    xba_gap_recent: Optional[float] = None      # decimal
-
-
-class ValueRanker:
-    """
-    Computes 'score' and 'composite' from components under runtime weights.
-    """
-    elite_avg_anchor: float = 0.300
-
-    def __init__(self, weights: RankWeights):
-        self.w = weights.normalized()
-
-    @staticmethod
-    def _safe_float(x: Optional[float], default: float = 0.0) -> float:
+    attempt = 0
+    while True:
+        attempt += 1
         try:
-            if x is None:
-                return default
-            return float(x)
+            r = requests.get(STATCAST_SEARCH_CSV_URL, params=params, headers=headers, timeout=timeout)
+            r.raise_for_status()
+            buff = io.StringIO(r.text)
+            reader = csv.DictReader(buff)
+            return list(reader)
         except Exception:
-            return default
-
-    @staticmethod
-    def _clamp(x: float, lo: float, hi: float) -> float:
-        return max(lo, min(hi, x))
-
-    def _score_hit_chance(self, p: Optional[float]) -> float:
-        p = self._clamp(self._safe_float(p, 0.0), 0.0, 1.0)
-        return 100.0 * p
-
-    def _score_overdue(self, pressure: Optional[float]) -> float:
-        x = self._safe_float(pressure, 0.0)
-        if x <= 0.5:
-            return 0.0
-        if x >= 3.0:
-            return 100.0
-        return (x - 0.5) / (3.0 - 0.5) * 100.0
-
-    def _score_elite_avg(self, avg: Optional[float]) -> float:
-        a = self._safe_float(avg, 0.0)
-        if a <= 0.240:
-            base = 0.0
-        elif a >= 0.340:
-            base = 100.0
-        else:
-            base = (a - 0.240) / (0.340 - 0.240) * 100.0
-        bonus = 0.0
-        if a >= self.elite_avg_anchor:
-            bonus = min(10.0, (a - self.elite_avg_anchor) * 1000.0)
-        return self._clamp(base + bonus, 0.0, 110.0)
-
-    def _score_statcast(self, hard_hit_pct: Optional[float], xba_gap: Optional[float]) -> float:
-        hh = self._clamp(self._safe_float(hard_hit_pct, 0.0), 0.0, 100.0)
-        xgap = self._safe_float(xba_gap, 0.0)
-        xgap = self._clamp(xgap, -0.10, 0.10)
-        xgap_score = (xgap + 0.10) / 0.20 * 100.0  # -0.10→0 ; +0.10→100 ; 0→50
-        return 0.70 * hh + 0.30 * xgap_score
-
-    def score_row(self, ri: RankInputs) -> Dict[str, float]:
-        s_hit = self._score_hit_chance(ri.break_prob_next)
-        s_ovr = self._score_overdue(ri.pressure)
-        s_avg = self._score_elite_avg(ri.season_avg)
-        s_stat = self._score_statcast(ri.hard_hit_pct_recent, ri.xba_gap_recent)
-
-        w = self.w
-        composite = (
-            w.w_hit_chance * s_hit +
-            w.w_overdue   * s_ovr +
-            w.w_elite_avg * s_avg +
-            w.w_statcast  * s_stat
-        )
-        return {
-            "score": composite,
-            "score_plus": composite,
-            "components_hit": s_hit,
-            "components_overdue": s_ovr,
-            "components_avg": s_avg,
-            "components_statcast": s_stat,
-        }
+            if attempt <= max_retries:
+                time.sleep(retry_backoff * attempt)
+                continue
+            return []
 
 
-def compute_scores(row: Dict[str, Any], weights: RankWeights) -> Dict[str, float]:
-    stat = row.get("_statcast") or {}
-    hard = stat.get("hh_percent_14d")
-    if hard is None:
-        hard = stat.get("hard_hit_pct_recent")
-    xgap = stat.get("xba_delta_14d")
-    if xgap is None:
-        xgap = stat.get("xba_gap_recent")
+def _calc_signal(rows: Iterable[Dict[str, str]]) -> Tuple[Optional[float], Optional[float]]:
+    """
+    Compute (Hard-Hit %, xBA gap) over the window.
+    - hard_hit_pct: EV >= 95 mph over batted balls
+    - xba_gap: mean(estimated_ba_using_speedangle) − BA (hits/AB)
+    """
+    evs: List[float] = []
+    xbas: List[float] = []
+    events: List[str] = []
 
-    ri = RankInputs(
-        season_avg=row.get("season_avg"),
-        break_prob_next=row.get("break_prob_next"),
-        pressure=row.get("pressure"),
-        hard_hit_pct_recent=hard,
-        xba_gap_recent=xgap,
-    )
-    return ValueRanker(weights).score_row(ri)
+    for row in rows:
+        # batted ball speed
+        ls = row.get("launch_speed")
+        if ls:
+            try:
+                evs.append(float(ls))
+            except Exception:
+                pass
+
+        # estimated BA per batted ball
+        xba_str = row.get("estimated_ba_using_speedangle")
+        if xba_str:
+            try:
+                xbas.append(float(xba_str))
+            except Exception:
+                pass
+
+        evname = (row.get("events") or "").strip().lower()
+        events.append(evname)
+
+    # Hard-Hit%
+    hard_hit_pct = None
+    if evs:
+        hard = sum(1 for ev in evs if ev >= 95.0)
+        hard_hit_pct = 100.0 * hard / len(evs)
+
+    # BA from events (AB subset)
+    AB_EVENTS = {
+        "single", "double", "triple", "home_run",
+        "strikeout", "field_out", "grounded_into_double_play", "force_out",
+        "field_error", "double_play", "fielders_choice", "fielders_choice_out",
+        "pop_out", "flyout", "lineout", "strikeout_double_play", "other_out"
+    }
+    HIT_EVENTS = {"single", "double", "triple", "home_run"}
+
+    ab = sum(1 for e in events if e in AB_EVENTS)
+    hits = sum(1 for e in events if e in HIT_EVENTS)
+    ba = (hits / ab) if ab > 0 else 0.0
+
+    xba = (sum(xbas) / len(xbas)) if xbas else None
+    xba_gap = (xba - ba) if (xba is not None) else None
+
+    return hard_hit_pct, xba_gap
+
+
+def _meets_thresholds(
+    hard_hit_pct: Optional[float],
+    xba_gap: Optional[float],
+    *,
+    hh_min: float,
+    xba_delta_min: float,
+) -> Tuple[bool, str]:
+    reasons: List[str] = []
+    ok = False
+    if hard_hit_pct is not None and hard_hit_pct >= hh_min:
+        ok = True
+        reasons.append(f"HH% {hard_hit_pct:.1f}≥{hh_min:.0f}")
+    if xba_gap is not None and xba_gap >= xba_delta_min:
+        ok = True
+        reasons.append(f"xBA–BA +{xba_gap:.3f}≥+{xba_delta_min:.3f}")
+    return ok, "; ".join(reasons)
+
+
+def fetch_statcast_overlays(
+    names: List[str],
+    *,
+    recent_days: int = STATCAST_DAYS_DEFAULT,
+    statcast_min_hh_14d: float = 40.0,
+    statcast_min_xba_delta_14d: float = 0.030,
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Return { name: { has_signal, why, hh_percent_14d, xba_delta_14d } }.
+    Fail-soft per player on errors/missing data.
+    """
+    out: Dict[str, Dict[str, Any]] = {}
+    if not names:
+        return out
+
+    start, end = _daterange_recent(recent_days)
+
+    for nm in names:
+        try:
+            bam = _lookup_bamid(nm)
+            if not bam:
+                continue
+
+            ck = _cache_key(bam, start, end)
+            cached = _from_cache(ck)
+            if cached is not None:
+                out[nm] = cached
+                continue
+
+            rows = _fetch_statcast_csv(bam, start, end)
+            if not rows:
+                miss = {"has_signal": False, "why": "", "hh_percent_14d": None, "xba_delta_14d": None}
+                _to_cache(ck, miss)
+                out[nm] = miss
+                continue
+
+            hh, xgap = _calc_signal(rows)
+            has, why = _meets_thresholds(hh, xgap, hh_min=statcast_min_hh_14d, xba_delta_min=statcast_min_xba_delta_14d)
+
+            result = {
+                "has_signal": bool(has),
+                "why": why,
+                "hh_percent_14d": round(hh, 1) if hh is not None else None,
+                "xba_delta_14d": round(xgap, 3) if xgap is not None else None,
+            }
+            _to_cache(ck, result)
+            out[nm] = result
+
+            # polite pacing
+            time.sleep(0.08)
+
+        except Exception:
+            out[nm] = {"has_signal": False, "why": "", "hh_percent_14d": None, "xba_delta_14d": None}
+
+    return out
